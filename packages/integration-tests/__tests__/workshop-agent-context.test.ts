@@ -175,6 +175,9 @@ it.concurrent("a pasted link becomes a binding for that chat only", async () => 
   const [envNames] = codeOutputs(await history(ws, otherChat));
   expect(envNames).toContain("TEST_AMBIENT");
   expect(envNames).not.toContain("TEST_THING");
+  // The agent's executeCode env never holds env.ATTENTION: only an accepted gadget's own code may
+  // ask for attention (FAC-237).
+  expect(envNames).not.toContain("ATTENTION");
 
   expect(await app.listBindings()).toEqual([]);
   expect(await app.listBindings(chatId)).toEqual([]);
