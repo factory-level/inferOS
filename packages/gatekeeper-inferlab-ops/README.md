@@ -40,6 +40,7 @@ Signing in to InferOS is `gatekeeper-inferlab` (FAC-214). Sign-in grants nothing
 - **`visible(subject, targets)`:** whether the person can read each target now. No connection means false. Only `project/project` and `project/location` targets are checked; other kinds are false.
 - **`eligible(intent, candidates)`:** the candidates who hold `audience.permission` in `audience.workspaceId` (`GET /auth/permissions`) and can see the target.
 - **`approves(workspace, intent)`:** the target is this deployment's company, and the owner holds a grant in the audience workspace and can see the target.
+- **`verifyEvent(workspace, intent)`:** whether `intent.sourceEventId` is an event InferOps really committed, read with the workspace owner's own connection (`GET /project/locations/<id>/events/<eventId>`, inferops#2686). True only when it exists and matches the intent: its resource is the target, its type is the one for the reason (`review_requested` is `project.location.review_requested`), its workspace is the audience's and its company is this deployment's. Not found, any mismatch, an owner with no connection or no grant: false.
 - **Indeterminate answers throw**, so nothing is delivered on a guess.
 
 ## Sign-out and revocation
@@ -87,4 +88,4 @@ The donor is the archived fork at `archive/main-2026-11-14` (`24f5d885`), specif
 - the review action (simulation, idempotency, stale revision, rejection);
 - observers (own connection, revoked, outage, foreign ids);
 - revoke and expiry;
-- the attention authority, including a revoked recipient.
+- the attention authority, including a revoked recipient, and `verifyEvent` on every match point.

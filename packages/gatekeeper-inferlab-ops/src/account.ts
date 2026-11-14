@@ -111,6 +111,20 @@ export class OperationsAccount extends DurableObject<Cloudflare.Env> {
     }
   }
 
+  /**
+   * GET `path` in `workspaceId` with this person's own token: InferOps' answer, or `null` when it
+   * definitely refuses (403/404). Anything else (an outage, an ended session) throws.
+   */
+  async readIfVisible(path: string, workspaceId: string): Promise<unknown> {
+    const { creds } = await this.getCredentials();
+    try {
+      return await apiRequest(originOrThrow(this.env), creds.token, path, { workspaceId });
+    } catch (error) {
+      if (isDefiniteNo(error)) return null;
+      throw error;
+    }
+  }
+
   /** Whether this person holds `permission` in `workspaceId` now, as InferOps' guard decides it. */
   async holds(permission: string, workspaceId: string): Promise<boolean> {
     const { creds } = await this.getCredentials();

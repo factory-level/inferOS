@@ -17,6 +17,7 @@ const OTHER_PROJECT = "00000000-0000-4000-8000-00000000a202";
 const LOC = "00000000-0000-4000-8000-00000000a211";
 const LOC_ELSEWHERE = "00000000-0000-4000-8000-00000000a212";
 const ADDRESS = `inferops://acme.operations/project/project/${PROJECT}`;
+const EVENT = "00000000-0000-4000-8000-0000000000e1";
 
 type Who = "owner" | "observer" | "nomember" | "other";
 const PRINCIPAL: Record<Who, string> = {
@@ -40,6 +41,8 @@ let revision = 3;
 let minted = 0;
 /** An answer the fake gives instead of a normal one, for outage tests. */
 let outage = false;
+/** Changes to the committed event the fake answers, for mismatch tests (`null`: malformed). */
+let eventEdit: Record<string, unknown> | null = {};
 
 const jwt = (exp: number) => `h.${btoa(JSON.stringify({ exp })).replace(/=+$/, "")}.s`;
 
@@ -116,6 +119,16 @@ function answer(method: string, path: string, query: URLSearchParams, who: Who |
   if (path === `/project/locations/${LOC_ELSEWHERE}` && method === "GET") {
     return allowed ? Response.json(location(LOC_ELSEWHERE, OTHER_PROJECT)) : Response.json({ error: { code: "NOT_FOUND" } }, { status: 404 });
   }
+  if (path === `/project/locations/${LOC}/events/${EVENT}` && method === "GET") {
+    if (!allowed) return Response.json({ error: { code: "NOT_FOUND" } }, { status: 404 });
+    if (eventEdit === null) return Response.json({ v: 1, eventId: EVENT });
+    return Response.json({
+      v: 1, eventId: EVENT, type: "project.location.review_requested", occurredAt: "2026-11-14T20:00:00.000Z",
+      tenantId: COMPANY, workspaceId: WS, resource: ref("project/location", LOC), resourceRevision: "4",
+      actor: { type: "user", subject: { issuer: ORIGIN, subject: PRINCIPAL.owner } }, causationKey: "k_test0001",
+      ...eventEdit,
+    });
+  }
   if (path === `/project/locations/${LOC}/review-request` && method === "POST") {
     if (!allowed) return Response.json({ error: { code: "NOT_FOUND" } }, { status: 404 });
     if (who !== "owner") return Response.json({ error: { code: "FORBIDDEN" } }, { status: 403 });
@@ -131,7 +144,7 @@ function answer(method: string, path: string, query: URLSearchParams, who: Who |
 
 beforeEach(() => {
   seen = []; tokens = new Map(); refreshes = new Map(); grantRevoked = new Set();
-  reviewStatus = "none"; revision = 3; outage = false;
+  reviewStatus = "none"; revision = 3; outage = false; eventEdit = {};
   vi.stubGlobal("fetch", async (input: RequestInfo, init?: RequestInit) => {
     const url = new URL(typeof input === "string" ? input : input.url);
     if (url.origin !== ORIGIN) throw new Error(`unexpected fetch to ${url.origin}`);
@@ -158,7 +171,7 @@ const hooks = () => env.TEST_HOOKS.getByName("hooks");
 type Outcome = { value?: any; error?: string };
 const call = (key: string, method: string, ...args: unknown[]) =>
   hooks().call(key, method, ...args) as unknown as Promise<Outcome>;
-const attention = (method: "approves" | "eligible" | "visible", ...args: unknown[]) =>
+const attention = (method: "approves" | "eligible" | "visible" | "verifyEvent", ...args: unknown[]) =>
   hooks().attention(method, ...args) as unknown as Promise<any>;
 
 let counter = 0;
@@ -381,7 +394,7 @@ describe("revoking", () => {
 describe("attention authority", () => {
   const target = { v: 1, tenantId: COMPANY, kind: "project/location", id: LOC };
   const intent = {
-    v: 1, sourceEventId: "00000000-0000-4000-8000-0000000000e1", reason: "review_requested", target,
+    v: 1, sourceEventId: EVENT, reason: "review_requested", target,
     audience: { kind: "permission-holders", workspaceId: WS, permission: "location:read" },
   };
 
@@ -412,6 +425,52 @@ describe("attention authority", () => {
     await hooks().revoke(observer.label);
     expect(await attention("visible", observerS, [target])).toEqual([false]);
     void owner;
+  });
+
+  it("verifyEvent: true only for a committed event the OWNER can read that matches the intent", async () => {
+    const owner = await connect("owner");
+    const ws = { workspaceId: "w", owner: (await hooks().subjectOf(owner.label))! };
+    expect(await attention("verifyEvent", ws, intent)).toBe(true);
+    // The request went to the event read, with the audience workspace, on the owner's own token.
+    const read = seen.find(r => r.path === `/project/locations/${LOC}/events/${EVENT}`)!;
+    expect(read.headers["x-workspace-id"]).toBe(WS);
+    expect(read.headers.authorization).toMatch(/\.owner\./);
+
+    // Not found, or another reason, kind, company or workspace: false.
+    expect(await attention("verifyEvent", ws, { ...intent, sourceEventId: "00000000-0000-4000-8000-0000000000e2" })).toBe(false);
+    expect(await attention("verifyEvent", ws, { ...intent, reason: "mentioned" })).toBe(false);
+    expect(await attention("verifyEvent", ws, { ...intent, target: { ...target, kind: "project/project", id: PROJECT } })).toBe(false);
+    expect(await attention("verifyEvent", ws, { ...intent, target: { ...target, tenantId: OTHER_COMPANY } })).toBe(false);
+    expect(await attention("verifyEvent", ws, { ...intent, audience: { ...intent.audience, workspaceId: "00000000-0000-4000-8000-0000000000ff" } })).toBe(false);
+    // InferOps' event disagreeing with the intent on any point: false.
+    for (const edit of [
+      { type: "project.location.renamed" },
+      { workspaceId: "00000000-0000-4000-8000-0000000000ff" },
+      { tenantId: OTHER_COMPANY },
+      { resource: ref("project/location", LOC_ELSEWHERE) },
+      { resource: { ...ref("project/location", LOC), tenantId: OTHER_COMPANY } },
+      { resource: ref("project/project", LOC) },
+      { eventId: "00000000-0000-4000-8000-0000000000e2" },
+    ]) {
+      eventEdit = edit;
+      expect(await attention("verifyEvent", ws, intent), JSON.stringify(edit)).toBe(false);
+    }
+    eventEdit = {};
+    // An owner with no connection, or whose grant is gone, can cite nothing.
+    const stranger = { issuer: ORIGIN, subject: "00000000-0000-4000-8000-0000000000aa" };
+    expect(await attention("verifyEvent", { workspaceId: "w", owner: stranger }, intent)).toBe(false);
+    grantRevoked.add("owner");
+    expect(await attention("verifyEvent", ws, intent)).toBe(false);
+  });
+
+  it("verifyEvent: an outage or an unreadable answer throws", async () => {
+    const owner = await connect("owner");
+    const ws = { workspaceId: "w", owner: (await hooks().subjectOf(owner.label))! };
+    eventEdit = null;
+    expect(await attention("verifyEvent", ws, intent)).toEqual({ thrown: expect.stringMatching(/unreadable/) });
+    eventEdit = {};
+    outage = true;
+    expect(await attention("verifyEvent", ws, intent)).toEqual({ thrown: expect.stringMatching(/503/) });
   });
 
   it("an answer InferOps can't give throws, so nothing is delivered on a guess", async () => {

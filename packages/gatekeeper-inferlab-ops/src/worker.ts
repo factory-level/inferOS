@@ -631,7 +631,31 @@ type AttentionTarget = { v: 1; tenantId: string; kind: string; id: string };
 type AttentionIntent = {
   target: AttentionTarget;
   audience: { kind: "permission-holders"; workspaceId: string; permission: string };
+  reason: string;
+  sourceEventId: string;
 };
+
+/** The committed event InferOps records for each attention reason this authority can confirm. */
+const EVENT_TYPE_FOR_REASON: Record<string, string> = {
+  review_requested: "project.location.review_requested",
+};
+
+/** The committed-event fields verifyEvent compares, read field by field from InferOps' answer. */
+function committedEventOf(body: unknown): {
+  eventId: string; type: string; tenantId: string; workspaceId: string;
+  resource: { tenantId: string; kind: string; id: string };
+} {
+  const e = body as Record<string, unknown> | null;
+  const r = e?.resource as Record<string, unknown> | undefined;
+  const fields = [e?.eventId, e?.type, e?.tenantId, e?.workspaceId, r?.tenantId, r?.kind, r?.id];
+  // A malformed answer is not a "no": InferOps said something this can't read, so it throws.
+  if (!fields.every(f => typeof f === "string")) throw new Error("InferOps answered an unreadable event");
+  return {
+    eventId: e!.eventId as string, type: e!.type as string, tenantId: e!.tenantId as string,
+    workspaceId: e!.workspaceId as string,
+    resource: { tenantId: r!.tenantId as string, kind: r!.kind as string, id: r!.id as string },
+  };
+}
 
 /**
  * Who may see an attention target, answered with each person's OWN connection, live. A person
@@ -664,6 +688,37 @@ export class InferLabAttentionAuthority extends WorkerEntrypoint<Cloudflare.Env>
     const company = await owner.company();
     if (!company.workspaces.some(w => w.id === intent.audience.workspaceId.toLowerCase())) return false;
     return this.#sees(owner, intent.target, intent.audience.workspaceId.toLowerCase());
+  }
+
+  /**
+   * Whether `intent.sourceEventId` is a COMMITTED InferOps event that matches the intent: read with
+   * the workspace OWNER's own connection, so a workspace can cite only events its owner may see.
+   * True only when it exists and its resource is `intent.target`, its type is the one for
+   * `intent.reason`, its workspace is the audience's and its company is this deployment's. Not
+   * found or any mismatch is false; an answer InferOps can't give throws.
+   */
+  @skipRpcValidation()
+  async verifyEvent(workspace: { workspaceId: string; owner: GatekeeperSubject }, intent: AttentionIntent): Promise<boolean> {
+    const config = configOrThrow(this.env);
+    const target = intent.target;
+    const expectedType = EVENT_TYPE_FOR_REASON[intent.reason];
+    const workspaceId = intent.audience.workspaceId.toLowerCase();
+    const eventId = intent.sourceEventId.toLowerCase();
+    if (!expectedType || target.kind !== "project/location") return false;
+    if (target.tenantId.toLowerCase() !== config.tenantId) return false;
+    if (!UUID.test(target.id.toLowerCase()) || !UUID.test(eventId) || !UUID.test(workspaceId)) return false;
+    const owner = await this.#account(workspace.owner);
+    if (!owner) return false;
+    const body = await owner.readIfVisible(`/project/locations/${target.id.toLowerCase()}/events/${eventId}`, workspaceId);
+    if (body === null) return false;
+    const event = committedEventOf(body);
+    return event.eventId.toLowerCase() === eventId
+      && event.type === expectedType
+      && event.tenantId.toLowerCase() === config.tenantId
+      && event.workspaceId.toLowerCase() === workspaceId
+      && event.resource.tenantId.toLowerCase() === target.tenantId.toLowerCase()
+      && event.resource.kind === target.kind
+      && event.resource.id.toLowerCase() === target.id.toLowerCase();
   }
 
   @skipRpcValidation()
