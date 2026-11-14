@@ -279,6 +279,50 @@ export type ChatTimelineHead = {
 };
 
 /**
+ * What an attention item is about: a reference to one InferLab record (`inferlab.resource-ref` v1),
+ * never its URL, title or excerpt. A viewer's own rights decide what is shown for it.
+ */
+export type AttentionTarget = {
+  /** The contract version. */
+  v: 1;
+  /** The InferLab company the record belongs to. */
+  tenantId: string;
+  /** The kind of record. */
+  kind: "project/project" | "project/location" | "knowledge/page" | "inferos/gadget" | "inferos/blueprint";
+  /** The record's id within its kind. */
+  id: string;
+};
+
+/**
+ * A person's own state for one attention item. It is theirs alone and changes nothing about the
+ * record itself.
+ */
+export type AttentionPersonalState = "unread" | "read" | "dismissed";
+
+/**
+ * One entry in a person's "Needs Attention" list (`inferlab.attention-item` v1). Returned by
+ * `AuthenticatedApi.getAttentionItems()`. It holds a reference and a reason, never a preview.
+ */
+export type AttentionItem = {
+  /** The contract version. */
+  v: 1;
+  /** One item per recipient, source event and reason, whichever Gadget asked. */
+  itemKey: string;
+  /** Whose item this is, by InferLab stable subject. */
+  recipient: {issuer: string; subject: string};
+  /** The InferLab committed event the attention is about. */
+  sourceEventId: string;
+  /** Why attention is asked for. */
+  reason: "review_requested";
+  /** The record it is about. */
+  target: AttentionTarget;
+  /** The recipient's own state for it. */
+  personal: AttentionPersonalState;
+  /** When the item was first stored, as an ISO 8601 UTC instant. */
+  createdAt: string;
+};
+
+/**
  * One row of the user's unread inbox: a chat with unread messages, plus what's needed to display it.
  * Returned by `AuthenticatedApi.getUnreadThreads()`.
  */
@@ -765,6 +809,20 @@ export interface AuthenticatedApi extends RpcTarget {
 
   /** Mark every chat in all of the user's workspaces read. Works like `markWorkspaceRead()`. */
   markAllRead(): Promise<void>;
+
+  /**
+   * Get the user's attention items, newest first, from their own stored list. Only items whose
+   * target they can still see are returned (InferLab decides, at each read), so someone who lost
+   * access sees nothing for it. Dismissed items are included, marked so. Empty when the deployment
+   * has no attention authority.
+   */
+  getAttentionItems(): Promise<AttentionItem[]>;
+
+  /**
+   * Set the user's own state for one of their attention items. Changes nothing about the record it
+   * refers to. An unknown key is ignored.
+   */
+  setAttentionState(itemKey: string, personal: AttentionPersonalState): Promise<void>;
 
   /**
    * Mute a workspace in the user's list, so its finished tasks notify no tab or device, or unmute

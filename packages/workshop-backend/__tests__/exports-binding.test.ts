@@ -74,6 +74,7 @@ describe("gadget bindings in the agent's env", () => {
     expect(impl.getEnvForLoader(100, { from: "gadget", gadgetId: 100 })).toEqual({
       GADGET: { type: "gadget", id: 100 },
       GIT: { type: "git" },
+      ATTENTION: { type: "attention" },
       DB: { type: "gatekeeper", id: 5 },
     });
   }));
