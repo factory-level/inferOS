@@ -2,8 +2,8 @@
 // this account's own Durable Object storage and nowhere else. Tokens never cross the account's RPC
 // boundary except as a short-lived access token for one InferOps call.
 //
-// Ported from the archived fork's custom-gatekeepers/gatekeeper-inferops/src/inferops-credentials.ts
-// (24f5d885): the CredentialCoordinator wiring, the once-only expiry notice and the revoke. Left
+// Ported from the archived fork's data-connection gatekeeper (archive/main-2026-11-14, 24f5d885,
+// inferops-credentials.ts): the CredentialCoordinator wiring, the once-only expiry notice and the revoke. Left
 // behind: the wiki search budget, the stored workspace list (resolved live here instead), staged
 // reconnects (v1 reconnects by disconnecting and connecting again) and the system credential lane.
 

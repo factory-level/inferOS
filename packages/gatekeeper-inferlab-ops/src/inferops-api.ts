@@ -3,8 +3,8 @@
 // authority is cached here, and a refused call is reported as the refusal it is.
 //
 // The request core (bearer plus X-Workspace-Id and X-Idempotency-Key, `redirect: "manual"`, capped
-// bodies, field-by-field parsing) is ported from the archived fork's
-// custom-gatekeepers/gatekeeper-inferops/src/http-inferops.ts (24f5d885); see README.md.
+// bodies, field-by-field parsing) is ported from the archived fork's data-connection gatekeeper
+// (archive/main-2026-11-14, 24f5d885, http-inferops.ts); see README.md.
 
 import { CredentialsExpiredError } from "@gadgets/gatekeeper-kit/credentials";
 import { readTextCapped } from "@gadgets/gatekeeper-kit/response-body";

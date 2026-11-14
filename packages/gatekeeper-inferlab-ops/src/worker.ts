@@ -15,8 +15,8 @@
 // - The attention authority (FAC-237) answers who may see an attention target with each person's
 //   own connection, live.
 //
-// Ported in part from the archived fork's custom-gatekeepers/gatekeeper-inferops (24f5d885) and
-// from gatekeeper-inferlab (FAC-214); see README.md for the ledger.
+// Ported in part from the archived fork (archive/main-2026-11-14, 24f5d885) and from
+// gatekeeper-inferlab (FAC-214); README.md is the ledger of what was taken and what was left.
 
 import { DurableObject, type RpcStub, RpcTarget, WorkerEntrypoint } from "cloudflare:workers";
 import { skipRpcValidation, validateRpc } from "capnweb-validate";
