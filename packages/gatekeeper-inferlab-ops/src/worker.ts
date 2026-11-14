@@ -30,7 +30,7 @@ import {
 import { CredentialSource, isCredentialsExpired } from "@gadgets/gatekeeper-kit/credentials";
 import { createPkce } from "@gadgets/gatekeeper-kit/oauth-client";
 import { observerAccessVerifier } from "@gadgets/gatekeeper-kit/observers";
-import { formatSubresourceId } from "@gadgets/gatekeeper-kit/subresource-ids";
+import { GLOBAL_SUBRESOURCE_ID, formatSubresourceId, parseSubresourceId } from "@gadgets/gatekeeper-kit/subresource-ids";
 import { createLogger } from "@gadgets/observability/logger";
 import type {
   AccountDescription, ActionKind, ApprovalQueue, ConnectHandoff, Gatekeeper, GatekeeperConnectCallback,
@@ -318,9 +318,6 @@ type Reported =
   | { kind: "project"; tenantId: string; workspaceId: string; id: string }
   | { kind: "location"; tenantId: string; workspaceId: string; id: string };
 
-const PROJECT_ID = /^tenant:([0-9a-f-]{36})\/workspace:([0-9a-f-]{36})\/project:([0-9a-f-]{36})$/;
-const LOCATION_ID = /^tenant:([0-9a-f-]{36})\/workspace:([0-9a-f-]{36})\/location:([0-9a-f-]{36})$/;
-
 function projectSubresource(p: { tenantId: string; workspaceId: string; projectId: string }): string {
   return formatSubresourceId({ fragments: [
     { name: "tenant", id: p.tenantId }, { name: "workspace", id: p.workspaceId }, { name: "project", id: p.projectId },
@@ -335,14 +332,19 @@ function locationSubresource(p: { tenantId: string; workspaceId: string }, locat
 
 /** Decodes an id this gatekeeper reported; refuses anything else rather than guessing. */
 export function parseReported(id: string): Reported {
-  const decoded = decodeURIComponent(id);
-  for (const [kind, pattern] of [["project", PROJECT_ID], ["location", LOCATION_ID]] as const) {
-    const m = pattern.exec(decoded);
-    if (m && UUID.test(m[1]!) && UUID.test(m[2]!) && UUID.test(m[3]!)) {
-      return { kind, tenantId: m[1]!, workspaceId: m[2]!, id: m[3]! };
-    }
+  const refused = () => new Error("This connection was asked about a resource it never reports.");
+  if (id === GLOBAL_SUBRESOURCE_ID) throw refused();
+  let parsed: ReturnType<typeof parseSubresourceId>;
+  try {
+    parsed = parseSubresourceId(id);
+  } catch {
+    throw refused();
   }
-  throw new Error("This connection was asked about a resource it never reports.");
+  const [tenant, workspace, item, extra] = parsed.fragments;
+  if (parsed.namespace !== undefined || extra || tenant?.name !== "tenant" || workspace?.name !== "workspace" ||
+      (item?.name !== "project" && item?.name !== "location") ||
+      !UUID.test(tenant.id) || !UUID.test(workspace.id) || !UUID.test(item.id)) throw refused();
+  return { kind: item.name, tenantId: tenant.id, workspaceId: workspace.id, id: item.id };
 }
 
 type VerifierProps = { accountId: string };
@@ -457,7 +459,8 @@ export class ProjectGatekeeper extends DurableObject<Cloudflare.Env, ProjectProp
     return actionId;
   }
 
-  async applyAction(actionId: number): Promise<void> {
+  @skipRpcValidation()
+  async applyAction(actionId: number, _cache?: unknown): Promise<void> {
     const pending = this.ctx.storage.kv.get<PendingReview>(`${PENDING_PREFIX}${actionId}`);
     if (!pending) throw new Error(`Unknown action: ${actionId}`);
     await this.#call(`/project/locations/${pending.locationId}/review-request`, value => value, {
