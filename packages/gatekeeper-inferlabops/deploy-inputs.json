@@ -8,7 +8,7 @@
       "In InferOps, register this deployment's origin for the inferos client (auth.sso.inferosOrigins) and name its company (auth.sso.inferosCompanies).",
       "InferOps accepts the redirect URI below exactly."
     ],
-    "redirectUriTemplate": "{PUBLIC_BASE_URL}/gatekeeper/inferlab-ops/oauth"
+    "redirectUriTemplate": "{PUBLIC_BASE_URL}/gatekeeper/inferlabops/oauth"
   },
   {
     "name": "INFEROPS_COMPANY",

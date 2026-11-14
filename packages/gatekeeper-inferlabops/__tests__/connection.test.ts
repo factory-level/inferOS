@@ -41,6 +41,14 @@ let revision = 3;
 let minted = 0;
 /** An answer the fake gives instead of a normal one, for outage tests. */
 let outage = false;
+/** Idempotency keys InferOps has committed, with the request each was for. */
+let usedKeys = new Map<string, string>();
+/** Fail the next review request with a 503, after nothing was committed. */
+let failNextReview = false;
+/** Make `/auth/logout` fail. */
+let logoutFails = false;
+/** A company id `/auth/company` answers instead of the person's own. */
+let companyAnswer: string | null = null;
 /** Changes to the committed event the fake answers, for mismatch tests (`null`: malformed). */
 let eventEdit: Record<string, unknown> | null = {};
 
@@ -79,6 +87,7 @@ function answer(method: string, path: string, query: URLSearchParams, who: Who |
     refreshes.delete(rt);
     return Response.json(mint(person));
   }
+  if (path === "/auth/logout" && logoutFails) return new Response("down", { status: 500 });
   if (path === "/auth/logout") {
     const rt = (body as { refreshToken?: string }).refreshToken ?? "";
     const person = refreshes.get(rt);
@@ -90,7 +99,7 @@ function answer(method: string, path: string, query: URLSearchParams, who: Who |
   if (!who) return Response.json({ error: { code: "UNAUTHORIZED" } }, { status: 401 });
   const member = who !== "nomember";
   if (path === "/auth/company") {
-    return Response.json({ tenantId: COMPANY, slug: "acme", principalId: PRINCIPAL[who],
+    return Response.json({ tenantId: companyAnswer ?? COMPANY, slug: "acme", principalId: PRINCIPAL[who],
       workspaces: member ? [{ workspaceId: WS, workspaceName: "Operations", product: "inferops", role: who === "owner" ? "member" : "viewer" }] : [] });
   }
   if (path === "/workspaces") return Response.json([{ id: WS, tenant_id: COMPANY, product: "inferops", name: "Operations", slug: "operations" }]);
@@ -132,9 +141,20 @@ function answer(method: string, path: string, query: URLSearchParams, who: Who |
   if (path === `/project/locations/${LOC}/review-request` && method === "POST") {
     if (!allowed) return Response.json({ error: { code: "NOT_FOUND" } }, { status: 404 });
     if (who !== "owner") return Response.json({ error: { code: "FORBIDDEN" } }, { status: 403 });
+    if (failNextReview) {
+      failNextReview = false;
+      return new Response("down", { status: 503 });
+    }
+    // InferOps' idempotency: the same key for the same request replays; for another, it refuses.
+    const key = headers["x-idempotency-key"] ?? "";
+    const request = `${LOC}@${(body as { expectedRevision?: string }).expectedRevision}`;
+    const prior = usedKeys.get(key);
+    if (prior === request) return Response.json({ v: 1, revision: String(revision) });
+    if (prior !== undefined) return Response.json({ error: { code: "IDEMPOTENCY_CONFLICT" } }, { status: 409 });
     if ((body as { expectedRevision?: string }).expectedRevision !== String(revision)) {
       return Response.json({ error: { code: "STALE_REVISION" } }, { status: 409 });
     }
+    usedKeys.set(key, request);
     reviewStatus = "requested";
     revision += 1;
     return Response.json({ v: 1, revision: String(revision) });
@@ -145,6 +165,7 @@ function answer(method: string, path: string, query: URLSearchParams, who: Who |
 beforeEach(() => {
   seen = []; tokens = new Map(); refreshes = new Map(); grantRevoked = new Set();
   reviewStatus = "none"; revision = 3; outage = false; eventEdit = {};
+  usedKeys = new Map(); failNextReview = false; logoutFails = false; companyAnswer = null;
   vi.stubGlobal("fetch", async (input: RequestInfo, init?: RequestInit) => {
     const url = new URL(typeof input === "string" ? input : input.url);
     if (url.origin !== ORIGIN) throw new Error(`unexpected fetch to ${url.origin}`);
@@ -204,7 +225,7 @@ describe("configuration", () => {
     expect(readConfig({ ...ok, INFERLAB_AUTH_ORIGIN: "http://evil.example" })).toEqual({ off: NOT_CONFIGURED.origin });
     expect(readConfig({ ...ok, INFEROPS_COMPANY: "acme" })).toEqual({ off: NOT_CONFIGURED.company });
     expect(readConfig({ ...ok, BASE_URL: "http://localhost:8787/gatekeeper/inferlab" })).toEqual({ off: NOT_CONFIGURED.baseUrl });
-    expect(OPERATIONS_CALLBACK_PATH).toBe("/gatekeeper/inferlab-ops/oauth");
+    expect(OPERATIONS_CALLBACK_PATH).toBe("/gatekeeper/inferlabops/oauth");
   });
 });
 
@@ -239,6 +260,12 @@ describe("connecting", () => {
 
 // ── Binding one Project ────────────────────────────────────────────────────────────────────────
 describe("binding a Project", () => {
+  it("refuses when InferOps' live company isn't the one this connection was made in", async () => {
+    const { label } = await connect("owner");
+    companyAnswer = OTHER_COMPANY;
+    expect((await hooks().bind(label, ADDRESS)).error).toMatch(/^Forbidden/);
+  });
+
   it("binds the person's own Project, and refuses another company, an unheld workspace or an unreadable Project", async () => {
     const { label } = await connect("owner");
     expect((await hooks().bind(label, ADDRESS)).props?.url).toBe(ADDRESS);
@@ -309,7 +336,7 @@ describe("requestReview", () => {
     expect(await hooks().apply("a1", log.actions[0]!.id)).toBeNull();
     const post = seen.find(s => s.method === "POST" && s.path.endsWith("/review-request"))!;
     expect(post.body).toEqual({ expectedRevision: "3" });
-    expect(post.headers["x-idempotency-key"]).toMatch(/^inferos-[0-9a-f]{16}-1$/);
+    expect(post.headers["x-idempotency-key"]).toMatch(/^inferos-[0-9a-f]{32}-1$/);
     expect(reviewStatus).toBe("requested");
   });
 
@@ -323,6 +350,44 @@ describe("requestReview", () => {
     await hooks().open(owner.label, ADDRESS, "a3");
     await call("a3", "requestReview", LOC, "2");
     expect(await hooks().apply("a3", (await hooks().log("a3")).actions[0]!.id)).toMatch(/^StaleRevision/);
+  });
+
+  it("two bindings in one workspace never send the same key; a retried action sends its own again", async () => {
+    // Both facets live in one parent, as the overseer's do, so they share its id.
+    const { label } = await connect("owner");
+    await hooks().open(label, ADDRESS, "k1");
+    await hooks().open(label, ADDRESS, "k2");
+    await call("k1", "requestReview", LOC, "3");
+    await call("k2", "requestReview", LOC, "3");
+    const keys = () => seen.filter(s => s.method === "POST" && s.path.endsWith("/review-request"))
+      .map(s => s.headers["x-idempotency-key"]!);
+
+    // The first apply hits an outage after nothing committed; its retry sends the same key.
+    failNextReview = true;
+    const first = (await hooks().log("k1")).actions[0]!.id;
+    expect(await hooks().apply("k1", first)).toMatch(/503/);
+    expect(await hooks().apply("k1", first)).toBeNull();
+    expect(keys()[0]).toBe(keys()[1]);
+
+    // The other binding's request is its own, with its own key: InferOps sees no reuse.
+    revision = 3; reviewStatus = "none";
+    expect(await hooks().apply("k2", (await hooks().log("k2")).actions[0]!.id)).toBeNull();
+    expect(new Set(keys()).size).toBe(2);
+    expect(keys().every(k => /^inferos-[0-9a-f]{32}-1$/.test(k))).toBe(true);
+  });
+
+  it("a key InferOps already used for another request is IdempotencyConflict, in its own words", async () => {
+    const { label } = await connect("owner");
+    await hooks().open(label, ADDRESS, "k3");
+    await call("k3", "requestReview", LOC, "3");
+    const id = (await hooks().log("k3")).actions[0]!.id;
+    // Make InferOps hold this binding's next key for a different request.
+    failNextReview = true;
+    expect(await hooks().apply("k3", id)).toMatch(/503/);
+    const sent = seen.filter(s => s.path.endsWith("/review-request")).at(-1)!.headers["x-idempotency-key"]!;
+    usedKeys.set(sent, `${LOC}@99`);
+    expect(await hooks().apply("k3", id)).toBe(
+      "IdempotencyConflict: InferOps already used this request's key for a different request, so it changed nothing.");
   });
 
   it("a rejected request leaves no simulated state behind", async () => {
@@ -377,6 +442,18 @@ describe("revoking", () => {
     const after = await call("v1", "getProject");
     expect(after.value).toBeUndefined();
     expect(after.error).toMatch(/^ConnectionExpired|not connected/);
+  });
+
+  it("still forgets the connection and deletes the tokens when the logout fails, and says so", async () => {
+    const { label } = await connect("owner");
+    const subject = (await hooks().subjectOf(label))!;
+    await hooks().open(label, ADDRESS, "v3");
+    logoutFails = true;
+    await expect((async () => { await hooks().revoke(label); })()).rejects.toThrow(/didn't confirm signing this connection out/);
+    // Forgotten: the attention authority no longer finds a connection for this person.
+    expect(await attention("visible", subject, [{ v: 1, tenantId: COMPANY, kind: "project/location", id: LOC }]))
+      .toEqual([false]);
+    expect((await call("v3", "getProject")).error).toMatch(/^ConnectionExpired|not connected/);
   });
 
   it("a session InferLab ended (refresh refused) reads as ConnectionExpired and tells the Workshop once", async () => {

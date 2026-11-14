@@ -20,7 +20,7 @@ import {
   logout, refreshGrant,
 } from "./inferops-api";
 
-export const VENDOR_ID = "inferlab-ops";
+export const VENDOR_ID = "inferlabops";
 const CALLBACK_KEY = "callback";
 const IDENTITY_KEY = "identity";
 
@@ -92,7 +92,12 @@ export class OperationsAccount extends DurableObject<Cloudflare.Env> {
   /** The person's company and workspaces, read live with their own token. */
   async company(): Promise<Company> {
     const { creds } = await this.getCredentials();
-    return companyOf(originOrThrow(this.env), creds.token);
+    const company = await companyOf(originOrThrow(this.env), creds.token);
+    // The live answer must be the company this connection was made in (and so this deployment's).
+    if (company.tenantId !== this.#ownCompany().tenantId.toLowerCase()) {
+      throw Object.assign(new Error(OTHER_COMPANY), { name: "Forbidden" });
+    }
+    return company;
   }
 
   /**
@@ -149,12 +154,30 @@ export class OperationsAccount extends DurableObject<Cloudflare.Env> {
     const identity = this.ctx.storage.kv.get<Identity>(IDENTITY_KEY);
     this.#coordinator.clear();
     await this.ctx.storage.deleteAll();
-    if (identity) {
-      const index = this.ctx.exports.SubjectIndex.get(this.ctx.exports.SubjectIndex.idFromName(subjectIndexName(identity)));
-      await index.forget(this.ctx.id.toString());
-    }
+    // Both steps are always attempted, logout first, so a failure in one never skips the other;
+    // any failure is then reported, with both when both failed.
+    const failures: unknown[] = [];
     const config = readConfig(this.env);
-    if (current && !("off" in config)) await logout(config.origin, current.refreshToken);
+    if (current && !("off" in config)) {
+      try {
+        if (!await logout(config.origin, current.refreshToken)) {
+          failures.push(new Error(
+            "InferLab didn't confirm signing this connection out; its session may stay live until it expires."));
+        }
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    if (identity) {
+      try {
+        const index = this.ctx.exports.SubjectIndex.get(this.ctx.exports.SubjectIndex.idFromName(subjectIndexName(identity)));
+        await index.forget(this.ctx.id.toString());
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    if (failures.length === 1) throw failures[0];
+    if (failures.length > 1) throw new AggregateError(failures, "Disconnecting failed to log out and to forget the connection.");
   }
 
   /** The identity, refusing one of another company than this deployment's. */

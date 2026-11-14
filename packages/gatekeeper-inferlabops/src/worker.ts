@@ -50,7 +50,7 @@ import TYPES_CODE from "./types.txt";
 
 export { OperationsAccount, SubjectIndex };
 
-const logger = createLogger<{ vendorId: string }>({ component: "gatekeeper.inferlab-ops", vendorId: VENDOR_ID });
+const logger = createLogger<{ vendorId: string }>({ component: "gatekeeper.inferlabops", vendorId: VENDOR_ID });
 
 const CALLBACK_KEY = "callback";
 const HEX_64 = /^[0-9a-f]{64}$/;
@@ -78,7 +78,7 @@ type OAuthExtra = { codeVerifier: string; redirectUri: string };
 function configOrThrow(env: Cloudflare.Env): OperationsConfig {
   const config = readConfig(env);
   if ("off" in config) {
-    logger.error("InferLab operations is not configured", { event: "inferlab-ops.not_configured" });
+    logger.error("InferLab operations is not configured", { event: "inferlabops.not_configured" });
     throw new Error(config.off);
   }
   return config;
@@ -88,7 +88,7 @@ const accountStub = (ctx: { exports: Cloudflare.Exports }, accountId: string) =>
   ctx.exports.OperationsAccount.get(ctx.exports.OperationsAccount.idFromString(accountId));
 
 /** A gadget-facing error with one of the documented names (types.d.ts). */
-function named(name: "NotFound" | "Forbidden" | "StaleRevision" | "Conflict" | "ConnectionExpired",
+function named(name: "NotFound" | "Forbidden" | "StaleRevision" | "Conflict" | "IdempotencyConflict" | "ConnectionExpired",
                message: string): Error {
   const error = new Error(message);
   error.name = name;
@@ -103,6 +103,10 @@ function toGadgetError(error: unknown): Error {
     if (error.status === 403) return named("Forbidden", "Your InferOps access doesn't allow this.");
     if (error.status === 409 && error.code === "STALE_REVISION") {
       return named("StaleRevision", "The Location changed since you read it. Read it again and retry.");
+    }
+    if (error.status === 409 && error.code === "IDEMPOTENCY_CONFLICT") {
+      return named("IdempotencyConflict",
+        "InferOps already used this request's key for a different request, so it changed nothing.");
     }
     if (error.status === 409) return named("Conflict", "A review is already waiting for this Location.");
   }
@@ -158,7 +162,7 @@ export class ConnectAttempt extends DurableObject<Cloudflare.Env> {
       if (identity.tenantId !== config.tenantId) {
         // InferOps already refuses this (ADR 0009 T6); a second check costs nothing.
         await logout(config.origin, grant.refreshToken);
-        logger.warn("InferLab session from another company refused", { event: "inferlab-ops.other_company" });
+        logger.warn("InferLab session from another company refused", { event: "inferlabops.other_company" });
         throw new ConnectFailure(OTHER_COMPANY);
       }
       const accountId = this.ctx.exports.OperationsAccount.newUniqueId();
@@ -170,7 +174,7 @@ export class ConnectAttempt extends DurableObject<Cloudflare.Env> {
       return { handoff: await callback.complete(user) };
     } catch (error) {
       if (error instanceof ConnectFailure) return { error: error.message };
-      logger.error("InferLab operations connect failed", { event: "inferlab-ops.connect_failed", error });
+      logger.error("InferLab operations connect failed", { event: "inferlabops.connect_failed", error });
       return { error: "Connecting InferLab operations failed. Close this window and try again." };
     } finally {
       await this.#forget();
@@ -400,6 +404,12 @@ type PendingReview = { locationId: string; expectedRevision: string; idempotency
 
 const PENDING_PREFIX = "pending-review:";
 const NEXT_ACTION_KEY = "next-action";
+/**
+ * This binding's own random id, made on first use and kept in the facet's own storage. Facets get
+ * no id of their own (they carry the workspace's), so two bindings in one workspace would
+ * otherwise derive the same idempotency keys.
+ */
+const BINDING_ID_KEY = "binding-id";
 
 @validateRpc()
 export class ProjectGatekeeper extends DurableObject<Cloudflare.Env, ProjectProps> implements Gatekeeper<ProjectSession> {
@@ -464,12 +474,23 @@ export class ProjectGatekeeper extends DurableObject<Cloudflare.Env, ProjectProp
     return pending;
   }
 
+  /** This binding's random id (32 hex), made once and kept in its own storage. */
+  #bindingId(): string {
+    const existing = this.ctx.storage.kv.get<string>(BINDING_ID_KEY);
+    if (existing) return existing;
+    const bytes = crypto.getRandomValues(new Uint8Array(16));
+    const id = Array.from(bytes, b => b.toString(16).padStart(2, "0")).join("");
+    this.ctx.storage.kv.put(BINDING_ID_KEY, id);
+    return id;
+  }
+
   /** Records a review request and returns its action id. */
   #queueReview(locationId: string, expectedRevision: string): number {
     const actionId = (this.ctx.storage.kv.get<number>(NEXT_ACTION_KEY) ?? 0) + 1;
     this.ctx.storage.kv.put(NEXT_ACTION_KEY, actionId);
-    // Derived from the action, so a retried apply replays InferOps' committed receipt.
-    const idempotencyKey = `inferos-${this.ctx.id.toString().slice(0, 16)}-${actionId}`;
+    // Derived from this binding and the action, so a retried apply of the same action replays
+    // InferOps' committed receipt, and two bindings never send the same key.
+    const idempotencyKey = `inferos-${this.#bindingId()}-${actionId}`;
     this.ctx.storage.kv.put(`${PENDING_PREFIX}${actionId}`, { locationId, expectedRevision, idempotencyKey });
     return actionId;
   }

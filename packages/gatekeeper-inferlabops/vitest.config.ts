@@ -31,7 +31,7 @@ export default defineConfig({
         bindings: {
           INFERLAB_AUTH_ORIGIN: "http://localhost:23380",
           INFEROPS_COMPANY: "00000000-0000-4000-8000-000000000001",
-          BASE_URL: "http://localhost:8787/gatekeeper/inferlab-ops",
+          BASE_URL: "http://localhost:8787/gatekeeper/inferlabops",
         },
       },
     }),

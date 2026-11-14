@@ -1,5 +1,5 @@
 {
-  "name": "@gadgets/gatekeeper-inferlab-ops",
+  "name": "@gadgets/gatekeeper-inferlabops",
   "version": "1.0.0",
   "type": "module",
   "scripts": {

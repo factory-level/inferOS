@@ -50,6 +50,8 @@ export interface LocationPage {
  * - `Forbidden`: the connected person may not do this (for example, an observer requesting a review).
  * - `StaleRevision`: the Location changed since you read it. Read it again and retry.
  * - `Conflict`: a review is already waiting for this Location.
+ * - `IdempotencyConflict`: InferOps already used this request's key for a different request, so it
+ *   changed nothing.
  * - `ConnectionExpired`: the connection was revoked or expired; the person must reconnect.
  */
 export type InferLabOperationsErrorName =
@@ -57,6 +59,7 @@ export type InferLabOperationsErrorName =
   | "Forbidden"
   | "StaleRevision"
   | "Conflict"
+  | "IdempotencyConflict"
   | "ConnectionExpired";
 
 /** One Project, as the connected person sees it. */

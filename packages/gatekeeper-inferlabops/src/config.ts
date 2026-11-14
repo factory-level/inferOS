@@ -20,7 +20,7 @@ const TENANT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}
  * Workshop routes a gatekeeper at `/gatekeeper/<name>`, so BASE_URL must end in this package's
  * route for the redirect to be it.
  */
-export const GATEKEEPER_PATH = "/gatekeeper/inferlab-ops";
+export const GATEKEEPER_PATH = "/gatekeeper/inferlabops";
 export const OPERATIONS_CALLBACK_PATH = `${GATEKEEPER_PATH}/oauth`;
 
 /** The settings this file reads. */

@@ -533,7 +533,7 @@ const PASSTHROUGH_GATEKEEPER_VARS: Record<string, string[]> = {
   "gatekeeper-inferlab": ["INFERLAB_AUTH_ORIGIN", "INFEROPS_COMPANY"],
   // InferLab operations (FAC-235): the same origin and company, for each person's own InferOps
   // connection. Unset, the gatekeeper connects nobody and says which is missing.
-  "gatekeeper-inferlab-ops": ["INFERLAB_AUTH_ORIGIN", "INFEROPS_COMPANY"],
+  "gatekeeper-inferlabops": ["INFERLAB_AUTH_ORIGIN", "INFEROPS_COMPANY"],
   "gatekeeper-microsoft": ["MICROSOFT_TENANT_ID", "MICROSOFT_ALLOWED_TENANT_IDS", "MICROSOFT_SHAREPOINT_ACCESS", "MICROSOFT_SHAREPOINT_SITES", "MICROSOFT_OUTLOOK_ACCESS", "MICROSOFT_CALENDAR_ACCESS"],
 };
 
@@ -639,7 +639,7 @@ for (const gk of gatekeepers) {
     // The attention authority (FAC-237) is InferLab operations' (FAC-235): who may see an attention
     // target, answered with each person's own InferOps connection. Without this binding, attention
     // is refused (packages/workshop-backend/src/attention.ts).
-    if (gk.name === "gatekeeper-inferlab-ops") {
+    if (gk.name === "gatekeeper-inferlabops") {
       config.services.push({
         binding: "ATTENTION_AUTHORITY",
         service: gk.name,

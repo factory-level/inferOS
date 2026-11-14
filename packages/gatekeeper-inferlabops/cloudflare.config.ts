@@ -7,7 +7,7 @@ import {
  * and INFEROPS_COMPANY are set per deployment, and without both the vendor connects nobody.
  */
 export default defineGadgetsWorker({
-  name: "gatekeeper-inferlab-ops",
+  name: "gatekeeper-inferlabops",
   entrypoint: ".wrangler/validate/src/worker.ts",
   compatibilityFlags: ["allow_irrevocable_stub_storage"],
   observability: OBSERVABILITY,

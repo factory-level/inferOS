@@ -1,4 +1,4 @@
-# gatekeeper-inferlab-ops
+# gatekeeper-inferlabops
 
 InferLab operations (FAC-235) is a person's own, explicit connection to their InferOps records. It lets their Gadgets read one Project and its Locations, and request reviews, with exactly that person's InferOps authority.
 
@@ -7,18 +7,18 @@ Signing in to InferOS is `gatekeeper-inferlab` (FAC-214). Sign-in grants nothing
 ## What it does
 
 - **Connect.** It runs an authorization code + PKCE flow at `INFERLAB_AUTH_ORIGIN` for the `inferos` client, with the account chooser kept (`prompt=select_account`).
-  - It returns to `<BASE_URL>/oauth` = `/gatekeeper/inferlab-ops/oauth`. That is inferops `INFEROS_OPERATIONS_CALLBACK_PATH` (inferops#2686), which carries the same whole-URL match and company binding as sign-in.
+  - It returns to `<BASE_URL>/oauth` = `/gatekeeper/inferlabops/oauth`. That is inferops `INFEROS_OPERATIONS_CALLBACK_PATH` (inferops#2686), which carries the same whole-URL match and company binding as sign-in.
   - InferOps refuses a session in another company than the one the InferOS origin names (ADR 0009 T6). The gatekeeper also re-checks the company against `INFEROPS_COMPANY`.
 - **Tokens.** The person's own access and refresh tokens live only in their `OperationsAccount` Durable Object, under the kit's `CredentialCoordinator`.
   - A token is never put in a URL, a log or the Workshop. A facet gets a short-lived access token for one call.
   - Refresh rotates both tokens (`POST /auth/refresh`). A 401 there means InferLab ended the session; the Workshop is told once (`credentialsExpired`) and reads answer `ConnectionExpired`.
 - **Binding.** One binding is one Project: `inferops://<company>.<workspace>/project/project/<id>`. The address names, but grants nothing. Checked live with the person's token:
-  - the company must be theirs (`GET /auth/company`);
+  - the company must be theirs (`GET /auth/company`), and the one this connection was made in;
   - the workspace must be one they hold a grant in;
   - the Project must be one they can read.
 - **Session** (`types.d.ts`):
   - `getProject` (`project.read`), `listLocations` (`location.list`) and `getLocation` (`location.read`) are observations. A Location outside the bound Project is `NotFound`.
-  - `requestReview` is an approved action (`location.request_review`). It carries the expected revision and an `X-Idempotency-Key` derived from the action id. While it is pending, reads show the Location as `requested`.
+  - `requestReview` is an approved action (`location.request_review`). It carries the expected revision and an `X-Idempotency-Key` made from this binding's own random id and the action id, so a retried action replays and two bindings never share a key. A key InferOps already used for a different request is `IdempotencyConflict`. While it is pending, reads show the Location as `requested`.
 - **Live validation.** Nothing is cached. Every call is InferOps' own decision for that person's token now, so a revoked grant stops the next read.
 
 ## Access model (observers)
@@ -47,7 +47,7 @@ Signing in to InferOS is `gatekeeper-inferlab` (FAC-214). Sign-in grants nothing
 
 | What | Effect |
 | --- | --- |
-| Disconnect in the Workshop (`revoke`) | Signs this connection's own InferLab session out (`POST /auth/logout` with its refresh token) and deletes every token at once. The next read fails. |
+| Disconnect in the Workshop (`revoke`) | Deletes every token at once, then always tries both: signing this connection's own InferLab session out (`POST /auth/logout` with its refresh token), and forgetting the connection for the attention authority. A step that fails is reported, both if both fail; the tokens are gone either way, so the next read fails. |
 | An InferOps grant revoked | The next call is refused by InferOps (`Forbidden`/`NotFound`). A collaborator who lost access is no longer admitted. |
 | InferLab "sign out everywhere", or the session expiring | The next refresh is refused. Reads answer `ConnectionExpired` and the Workshop asks for a reconnect. |
 
@@ -57,7 +57,7 @@ Reconnecting is "disconnect, then connect again". There is no staged reconnect i
 
 - `INFERLAB_AUTH_ORIGIN`: required. The central-auth origin, which also serves the InferOps API.
 - `INFEROPS_COMPANY`: required. The one company's tenant id.
-- `BASE_URL`: set by the dev server and the deployer. It must end in `/gatekeeper/inferlab-ops`.
+- `BASE_URL`: set by the dev server and the deployer. It must end in `/gatekeeper/inferlabops`.
 
 Each setting fails closed with a reason that names it. There is no default origin or company, no demo company and no password path. `scripts/run-dev-server.ts` passes the first two through.
 
@@ -77,7 +77,7 @@ The donor is the archived fork at `archive/main-2026-11-14` (`24f5d885`), specif
 
 ## Tests
 
-`pnpm --filter @gadgets/gatekeeper-inferlab-ops test:run` runs the workerd suite in `__tests__/connection.test.ts`. It uses a fake InferOps faked at `fetch` (mock mode, no network) and covers:
+`pnpm --filter @gadgets/gatekeeper-inferlabops test:run` runs the workerd suite in `__tests__/connection.test.ts`. It uses a fake InferOps faked at `fetch` (mock mode, no network) and covers:
 
 - configuration;
 - connecting (no sign-in, PKCE, company refusal);
