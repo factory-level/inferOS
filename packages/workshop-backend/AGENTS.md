@@ -117,3 +117,11 @@ Workspace DO to User DO: individual read commands use an authorized open workspa
 bulk read actions and unread queries use only local User DO state. Never add a User DO callback
 to the workspace for unread state or metadata. The workspace checks existing observer admission
 locally before fanout, without re-enrolling observers or calling gatekeeper verifiers per message.
+
+## Host attention
+
+`env.ATTENTION` lets an accepted gadget's own code ask for attention by rule, never by name or URL;
+the deployment's `AttentionAuthority` (InferLab) decides who may see what, and each recipient's User
+DO keeps one item per event with their own read state, re-checking visibility at every read. Read
+[docs/attention.md](../../docs/attention.md) before changing `src/attention.ts`, the `"attention"`
+loopback target, or `attentionItems`.

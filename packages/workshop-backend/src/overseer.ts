@@ -49,6 +49,7 @@ import {
 import { AgentGadgetInfo, AgentHooks, SeedBindingInfo, agentCodeChangeShape, alwaysAvailableResources, formatMissingBlueprintBindings, runAgent, summarizeArgs, type AgentStepChange, type AiChatMessageBodyWithModelData, type ChatHistory, type WorktreeTurnAccess, GIT_BINDING_NAME } from "./agent";
 import { WorktreeSessionImpl } from "./worktree-session";
 import { GitImpl } from "./git-binding";
+import { ATTENTION_BINDING_NAME, AttentionImpl, attentionAuthorityFrom, type AttentionAuthority } from "./attention";
 import type { WorktreeGitPullHints, WorktreeReplicator } from "@gadgets/workshop-shared/worktree-replica";
 import { worktreeGitPull } from "./worktree-git";
 import { WorktreeReplicas, WorktreeReplicatorImpl } from "./worktree-replica";
@@ -3036,6 +3037,8 @@ class OverseerImpl implements AgentHooks {
     // shadows it (see bindWorkpiece). The agent's describeBinding tool mirrors this order when
     // describing a gadget's bindings (see describeBinding in agent.ts).
     env[GIT_BINDING_NAME] = this.makeBindingLoopback({type: "git"}, caller);
+    // Likewise before the named bindings: an existing edge named ATTENTION keeps shadowing it.
+    env[ATTENTION_BINDING_NAME] = this.makeBindingLoopback({type: "attention"}, caller);
     for (let [name, edge] of this.visibleBindings(gadget, forChatId)) {
       env[name] = this.makeBindingLoopback({type: "gatekeeper", id: edge.target}, caller);
     }
@@ -5774,10 +5777,44 @@ class OverseerImpl implements AgentHooks {
       case "git":
         return Promise.resolve(new GitImpl(this, () => this.#gitAuthorFor(caller)));
 
+      case "attention": {
+        // Only a gadget's accepted code may ask for attention: not the agent, not a chat's
+        // proposed code, not a gadget still pending. What it may raise is the authority's call.
+        let gadgetId = caller.from === "gadget" || caller.from === "hook" ? caller.gadgetId : undefined;
+        let proposed = caller.from === "gadget" && caller.chatId !== undefined;
+        let gadget = gadgetId === undefined || proposed ? undefined : this.storage.gadgets.get(gadgetId);
+        if (!gadget || gadget.pending) {
+          throw new Error("Attention is only available to an accepted gadget's own code.");
+        }
+        return Promise.resolve(new AttentionImpl({
+          workspaceId: this.ctx.id.toString(),
+          attentionAuthority: () => this.attentionAuthority(),
+          attentionMembers: () => this.#attentionMembers(),
+          deliverAttention: (name, item) => boundedUserUpdate(
+              this.users.get(this.users.idFromName(name)).attentionRaised(this.ctx.id.toString(), item)),
+        }));
+      }
+
       default:
         target satisfies never;
         throw new TypeError("Unknown binding target type.");
     }
+  }
+
+  // The deployment's attention authority (attention.ts), or null; a method so tests can stub it.
+  attentionAuthority(): AttentionAuthority | null {
+    return attentionAuthorityFrom(this.env);
+  }
+
+  // Who env.ATTENTION may consider: the owner, then build collaborators, by profile id (which is
+  // also their User DO name). The authority narrows this to the audience; it never widens it.
+  async #attentionMembers(): Promise<string[]> {
+    let owner = await this.getOwnerProfileId();
+    let sharing = await this.getSharingManager();
+    return [owner, ...sharing.listCollaborators()
+        .filter(reader => reader.access.role === "build")
+        .map(reader => reader.profile.id)
+        .filter(id => id !== owner)];
   }
 
   // Who commits made through `caller`'s env.GIT are attributed to: for the agent, its turn's
@@ -11852,6 +11889,9 @@ type BindingLoopbackTarget = {
 } | {
   // The `env.GIT` binding (see git-binding.ts).
   type: "git";
+} | {
+  // The `env.ATTENTION` binding (see attention.ts).
+  type: "attention";
 } | {
   // A gadget binding's `exports` in the agent's executeCode env (see exports-session.ts).
   type: "exports";

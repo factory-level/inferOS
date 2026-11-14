@@ -341,6 +341,7 @@ describe("env.GIT presence", () => {
     expect(impl.getEnvForLoader(100, { from: "gadget", gadgetId: 100 })).toEqual({
       GADGET: { type: "gadget", id: 100 },
       GIT: { type: "git" },
+      ATTENTION: { type: "attention" },
     });
 
     // A binding named GIT from before the name was reserved still wins.

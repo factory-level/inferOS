@@ -7,7 +7,7 @@
 import { createTypedStorage, collection } from "@gadgets/typed-storage";
 import type {
   AiChatAuthorInfo, AiModelConfig, BlueprintMetadata, BlueprintOutput,
-  WorkspaceMetadata, WorkpieceId, UserNotification, ChatTimelineHead,
+  WorkspaceMetadata, WorkpieceId, UserNotification, ChatTimelineHead, AttentionItem,
 } from "@gadgets/workshop-shared/api";
 import { chatKey } from "./overseer-storage.js";
 import type { AccountDescription, GatekeeperUser } from "@gadgets/workshop-shared/gatekeeper";
@@ -184,6 +184,13 @@ export type ChatReadCursor = {
  * open client if there is one or else by push. It is removed once it has been delivered,
  * deliberately skipped (e.g. because the workspace is muted), or has expired.
  */
+/**
+ * One attention item the user received (FAC-237, see attention.ts), with the InferOS workspaces
+ * that raised it, so removing a workspace removes only what it alone raised. `personal` is the
+ * user's own state; the record it refers to is never copied here.
+ */
+export type AttentionItemRecord = AttentionItem & {workspaceIds: string[]};
+
 export type QueuedChatNotification = UserNotification & {
   /** Sequence of the timeline record where the notification's event happened. */
   sequence: number;
@@ -245,6 +252,11 @@ export function makeUserStorage(storage: DurableObjectStorage) {
         nonUniqueIndexes: {
           byWorkspace(record: ChatReadCursor) { return record.workspaceId; },
         },
+      }),
+      // Attention items (see AttentionItemRecord), one per item key. A new collection, so no
+      // migration: existing users simply have none.
+      attentionItems: collection<AttentionItemRecord>()({
+        primaryKey: "itemKey",
       }),
       aiModels: collection<UserAiModelRecord>()({
         primaryKey: record => record.profile.id,
