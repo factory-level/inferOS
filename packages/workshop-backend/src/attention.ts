@@ -9,7 +9,9 @@
 //   1. parses the intent strictly (an extra key, such as `recipients`, `url` or `preview`, is
 //      refused, not dropped);
 //   2. asks the deployment's AttentionAuthority whether this workspace may raise it at all
-//      (the target's company, and the audience's InferLab workspace, for this workspace's owner);
+//      (the target's company, and the audience's InferLab workspace, for this workspace's owner),
+//      and whether its source event is a real committed event matching it (verifyEvent): a Gadget
+//      can't make a new item by inventing an event id;
 //   3. offers the authority this workspace's own members (owner and build collaborators, by their
 //      stable subjects), and keeps only those it says are in the audience and can see the target
 //      now;
@@ -110,6 +112,21 @@ export interface AttentionAuthority {
    */
   approves(workspace: {workspaceId: string; owner: GatekeeperSubject}, intent: AttentionIntent): Promise<boolean>;
 
+  /**
+   * Whether `intent` is about a real committed InferLab event. **Every authority must implement
+   * this strictly**: true only when a committed event (`inferlab.committed-event`) with eventId
+   * `intent.sourceEventId` exists in this deployment's company, its `resource` is `intent.target`
+   * (the same tenant, kind and id), its `type` is the event the reason names (`review_requested`:
+   * `project.location.review_requested`), and its `workspaceId` is `intent.audience.workspaceId`.
+   * False when there is no such event or anything differs; throw when it can't tell. Read with
+   * `workspace.owner`'s own InferLab rights, the same as `approves`: a workspace can cite only an
+   * event its owner may see.
+   *
+   * It is what bounds attention: items are keyed by event, so a Gadget can't make a new one by
+   * inventing an event id, only by a real committed change, which InferLab guards.
+   */
+  verifyEvent(workspace: {workspaceId: string; owner: GatekeeperSubject}, intent: AttentionIntent): Promise<boolean>;
+
   /** Which of `candidates` are in `intent`'s audience and can see its target now. */
   eligible(intent: AttentionIntent, candidates: GatekeeperSubject[]): Promise<GatekeeperSubject[]>;
 
@@ -149,8 +166,13 @@ export class AttentionImpl extends RpcTarget implements Attention {
     let [ownerName, ...others] = await this.host.attentionMembers();
     let owner = ownerName === undefined ? undefined : accountSubject(ownerName);
     if (!owner) throw new Error("Attention is unavailable: this workspace's owner has no InferLab identity.");
-    if (!await authority.approves({workspaceId: this.host.workspaceId, owner}, parsed)) {
+    let workspace = {workspaceId: this.host.workspaceId, owner};
+    if (!await authority.approves(workspace, parsed)) {
       throw new Error("Attention refused: this workspace may not raise attention for that target.");
+    }
+    // A made-up or mismatched event id is refused, so every item stands for a real committed change.
+    if (!await authority.verifyEvent(workspace, parsed)) {
+      throw new Error("Attention refused: no committed event matches that intent.");
     }
     let members = new Map<string, GatekeeperSubject>();
     for (let name of [ownerName!, ...others]) {

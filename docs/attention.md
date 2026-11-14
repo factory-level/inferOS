@@ -9,7 +9,7 @@ and `inferlab.attention-item` v1 (pinned in `scripts/inferlab-contracts`).
 ```mermaid
 flowchart LR
   Gadget[Gadget code: env.ATTENTION.raise intent] --> Overseer[Workspace DO]
-  Overseer -->|approves? eligible members?| Authority[AttentionAuthority: InferLab]
+  Overseer -->|approves? real event? eligible members?| Authority[AttentionAuthority: InferLab]
   Overseer -->|one item per recipient, keyed| User[User DO: attentionItems]
   User -->|visible? at every read| Authority
   User --> Reader[AuthenticatedApi.getAttentionItems / setAttentionState]
@@ -37,6 +37,11 @@ binding named `ATTENTION` still shadows it. The agent's executeCode env has none
 5. **The authority approves** this workspace raising this intent: `approves({workspaceId, owner},
    intent)`. It checks the target's company and that the audience's InferLab workspace is one this
    workspace is bound to.
+6. **The source event is real**: `verifyEvent({workspaceId, owner}, intent)`. It checks that a
+   committed InferLab event with that id exists, read with the owner's own rights. Its resource must
+   be the intent's target (tenant, kind and id), its type the reason's event
+   (`review_requested`: `project.location.review_requested`), and its workspace the audience's.
+   False or a throw refuses the raise.
 
 The host then offers the authority the workspace's **owner and build collaborators** (by stable
 subject; use-only collaborators and password accounts are not offered), and the authority returns
@@ -53,6 +58,16 @@ The item key is the contract's `attentionItemKey`: the recipient's subject key, 
 the reason. It ignores which gadget asked, so every gadget observing the same event, and every
 repeat, yields the same key. The User DO keeps the first item for a key and its read state; a
 repeat only records the raising workspace too.
+
+## Why there is no rate limit
+
+The host applies no per-gadget cap or rate limit. Event verification bounds attention instead.
+An item is keyed by its source event, and `verifyEvent` admits only a real committed InferLab event
+for that very target, type and workspace. So a gadget can't make a new item by inventing an event
+id, and replaying a real one changes nothing. The most a gadget can cause is one item per recipient
+per committed change. A committed change is an InferLab write that InferLab itself guards: the
+writer's permission, an expected revision and an idempotency key (FAC-221). So the rate of
+attention is the rate of real, authorized changes.
 
 ## The projection
 
@@ -87,6 +102,8 @@ holds what in InferLab, or who can see a record. Until that binding exists, atte
 - caller refusals (agent, user, proposed code, pending and unknown gadgets);
 - intent refusals (extra keys, the contract's invalid fixtures, no value echoed);
 - the authority's approval;
+- event verification: invented ids; a real id for another tenant, kind, record, type or
+  workspace; replays; a throwing authority; reading as the owner;
 - candidate selection and the dropping of non-members;
 - one item per recipient across gadgets and hooks, with read state kept;
 - contract-only fields;

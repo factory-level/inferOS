@@ -32,15 +32,41 @@ const ISSUER = "http://localhost:8080";
 const subject = (id: string): GatekeeperSubject => ({issuer: ISSUER, subject: id});
 const INTENT: AttentionIntent = intentFixtures.valid[0]!.value as AttentionIntent;
 
-/** A fake InferLab authority: who holds the audience permission, and what each person can see. */
+/** A committed InferLab event, as the fake authority knows it. */
+type FakeEvent = {tenantId: string; kind: string; id: string; type: string; workspaceId: string};
+const REVIEW_EVENT_TYPE = "project.location.review_requested";
+const eventOf = (intent: AttentionIntent): FakeEvent => ({tenantId: intent.target.tenantId,
+  kind: intent.target.kind, id: intent.target.id, type: REVIEW_EVENT_TYPE,
+  workspaceId: intent.audience.workspaceId});
+const LATER_EVENT = "6f1c2a8e-4b1d-4c55-9a3e-2f6d8b1e0a02";
+
+/**
+ * A fake InferLab authority: which committed events exist, who holds the audience permission, and
+ * what each person can see. Its verifyEvent is the strict contract the interface documents.
+ */
 class FakeAuthority implements AttentionAuthority {
   approved = true;
+  events = new Map<string, FakeEvent>([[INTENT.sourceEventId, eventOf(INTENT)],
+    [LATER_EVENT, eventOf(INTENT)]]);
+  failEvents = false;
+  verified: string[] = [];
+  verifiedAs: string[] = [];
   holders = new Set<string>();      // account names in the audience
   hidden = new Set<string>();       // `${accountName}|${targetId}` the person can't see
   candidatesSeen: string[][] = [];
   failVisible = false;
 
   async approves() { return this.approved; }
+  async verifyEvent(workspace: {workspaceId: string; owner: GatekeeperSubject}, intent: AttentionIntent) {
+    if (this.failEvents) throw new Error("InferOps unavailable");
+    this.verified.push(intent.sourceEventId);
+    this.verifiedAs.push(subjectAccountName(workspace.owner));
+    let event = this.events.get(intent.sourceEventId);
+    return event !== undefined && event.tenantId === intent.target.tenantId &&
+      event.kind === intent.target.kind && event.id === intent.target.id &&
+      event.type === REVIEW_EVENT_TYPE && intent.reason === "review_requested" &&
+      event.workspaceId === intent.audience.workspaceId;
+  }
   async eligible(_intent: AttentionIntent, candidates: GatekeeperSubject[]) {
     this.candidatesSeen.push(candidates.map(subjectAccountName));
     return [...candidates.filter(c => this.holders.has(subjectAccountName(c))),
@@ -136,8 +162,8 @@ describe("env.ATTENTION: no unrestricted notify(user, url)", () => {
       impl.storage.gatekeepers.put({id: 1, resourceTitle: "Conn", class: {} as never});
       impl.storage.gadgets.put({type: "gadget", id: 103, title: "Legacy", created: new Date(0),
         bindingName: "LEGACY", bindings: {ATTENTION: {target: 1}}});
-      expect((impl.getEnvForLoader(103, {from: "gadget", gadgetId: 103}) as Record<string, unknown>)
-          [ATTENTION_BINDING_NAME]).toEqual({type: "gatekeeper", id: 1});
+      let legacyEnv = impl.getEnvForLoader(103, {from: "gadget", gadgetId: 103}) as Record<string, unknown>;
+      expect(legacyEnv[ATTENTION_BINDING_NAME]).toEqual({type: "gatekeeper", id: 1});
     });
   });
 
@@ -211,6 +237,61 @@ describe("env.ATTENTION: no unrestricted notify(user, url)", () => {
   });
 });
 
+describe("every item stands for a real committed event (r2, round 1)", () => {
+  it("refuses an invented event id, and offers nobody", async () => {
+    let authority = new FakeAuthority();
+    let fixture = await setup(authority);
+    for (let i = 0; i < 5; i++) {
+      let invented = {...INTENT, sourceEventId: crypto.randomUUID()};
+      expect(await refusal(raise(fixture, authority, invented)))
+        .toBe("Attention refused: no committed event matches that intent.");
+    }
+    expect(authority.candidatesSeen).toEqual([]);
+    expect(await stored(fixture.owner)).toEqual([]);
+    expect(await stored(fixture.builder)).toEqual([]);
+  });
+
+  it("refuses a real event id raised for another target, type or workspace", async () => {
+    let authority = new FakeAuthority();
+    let fixture = await setup(authority);
+    let real = eventOf(INTENT);
+    let cases: [string, FakeEvent][] = [
+      ["another tenant", {...real, tenantId: "00000000-0000-4000-8000-0000000000a1"}],
+      ["another kind", {...real, kind: "project/project"}],
+      ["another record", {...real, id: "00000000-0000-4000-8000-0000000002b2"}],
+      ["another event type", {...real, type: "project.issue.transitioned"}],
+      ["another workspace", {...real, workspaceId: "00000000-0000-4000-8000-000000000012"}],
+    ];
+    for (let [why, event] of cases) {
+      authority.events.set(INTENT.sourceEventId, event);
+      expect(await refusal(raise(fixture, authority, INTENT)), why)
+        .toBe("Attention refused: no committed event matches that intent.");
+    }
+    expect(await stored(fixture.owner)).toEqual([]);
+  });
+
+  it("keeps a real event replayed many times, by any gadget, to one item per recipient", async () => {
+    let authority = new FakeAuthority();
+    let fixture = await setup(authority);
+    for (let i = 0; i < 6; i++) {
+      await raise(fixture, authority, INTENT, {from: "gadget", gadgetId: i % 2 === 0 ? 100 : 101});
+    }
+    expect(authority.verified).toHaveLength(6);
+    // Verified with the workspace owner's rights, every time.
+    expect(new Set(authority.verifiedAs)).toEqual(new Set([fixture.ownerName]));
+    expect(await stored(fixture.owner)).toHaveLength(1);
+    expect(await stored(fixture.builder)).toHaveLength(1);
+  });
+
+  it("refuses visibly when the authority can't tell", async () => {
+    let authority = new FakeAuthority();
+    let fixture = await setup(authority);
+    authority.failEvents = true;
+    expect(await refusal(raise(fixture, authority, INTENT))).toBe("InferOps unavailable");
+    expect(await stored(fixture.owner)).toEqual([]);
+  });
+});
+
 describe("recipients are resolved server-side", () => {
   it("offers the authority only the owner and build collaborators, and keeps only members it returns", async () => {
     let authority = new FakeAuthority();
@@ -251,7 +332,7 @@ describe("one semantic item per recipient", () => {
     expect(items).toEqual([{...first, personal: "read"}]);
     expect(await read(fixture.builder, authority)).toHaveLength(1);
     // Another reason or event is another item.
-    await raise(fixture, authority, {...INTENT, sourceEventId: "6f1c2a8e-4b1d-4c55-9a3e-2f6d8b1e0a02"});
+    await raise(fixture, authority, {...INTENT, sourceEventId: LATER_EVENT});
     expect(await read(fixture.owner, authority)).toHaveLength(2);
   });
 
