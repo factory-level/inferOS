@@ -531,6 +531,9 @@ const PASSTHROUGH_GATEKEEPER_VARS: Record<string, string[]> = {
   // InferLab sign-in (FAC-214): the central-auth origin people sign in through, and the one company
   // this instance serves. Unset, the gatekeeper refuses every sign-in and says which is missing.
   "gatekeeper-inferlab": ["INFERLAB_AUTH_ORIGIN", "INFEROPS_COMPANY"],
+  // InferLab operations (FAC-235): the same origin and company, for each person's own InferOps
+  // connection. Unset, the gatekeeper connects nobody and says which is missing.
+  "gatekeeper-inferlab-ops": ["INFERLAB_AUTH_ORIGIN", "INFEROPS_COMPANY"],
   "gatekeeper-microsoft": ["MICROSOFT_TENANT_ID", "MICROSOFT_ALLOWED_TENANT_IDS", "MICROSOFT_SHAREPOINT_ACCESS", "MICROSOFT_SHAREPOINT_SITES", "MICROSOFT_OUTLOOK_ACCESS", "MICROSOFT_CALENDAR_ACCESS"],
 };
 
