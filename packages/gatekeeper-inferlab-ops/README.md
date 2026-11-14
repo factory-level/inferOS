@@ -73,7 +73,7 @@ The donor is the archived fork at `archive/main-2026-11-14` (`24f5d885`), specif
 | `src/worker.ts` (connect attempt, browser legs) | gatekeeper-inferlab `src/worker.ts` (FAC-214) | The same handshake, nonces and PKCE. | Own path and DO names. Refuses `scopes: "auth"`. |
 | `src/config.ts` | gatekeeper-inferlab `src/config.ts` | Fail-closed settings. | Own route. The issuer rule is copied, and a test asserts it is identical. |
 
-**Left behind deliberately:** Dot and its relay, host boards, board discovery, the coding workbench, the wiki, tables, members, workflow policy, the mock provider, system credentials, the auth proxy and edge header, the fork's seven facet classes and its legacy observer roster, and every fixture. No Console, Dot or widget-kind code is imported; `scripts/inferlab-g0/fence-audit.sh` stays clean.
+**Left behind deliberately:** Dot and its relay, host boards, board discovery, the coding workbench, the wiki, tables, members, workflow policy, the mock provider, system credentials, the auth proxy and edge header, the fork's seven facet classes and its legacy observer roster, and every fixture. No Console, Dot or widget kind code is imported; `scripts/inferlab-g0/fence-audit.sh` stays clean.
 
 ## Tests
 
