@@ -2,11 +2,31 @@
   "extends": "../../tsconfig.json",
   "compilerOptions": {
     "target": "ES2022",
-    "lib": ["ESNext"],
+    "lib": [
+      "ESNext"
+    ],
     "module": "ESNext",
     "moduleResolution": "bundler",
-    "types": ["./worker-configuration.d.ts"]
+    "types": [
+      "./worker-configuration.d.ts"
+    ],
+    "jsx": "react",
+    "jsxFactory": "h",
+    "paths": {
+      "@gadgets/configurator-ui": [
+        "../configurator-ui/src/index.ts"
+      ],
+      "@gadgets/workshop-shared/*": [
+        "../workshop-shared/src/*"
+      ]
+    }
   },
-  "include": ["src", "__tests__"],
-  "exclude": ["node_modules", ".wrangler"]
+  "include": [
+    "src",
+    "__tests__"
+  ],
+  "exclude": [
+    "node_modules",
+    ".wrangler"
+  ]
 }

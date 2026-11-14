@@ -421,3 +421,19 @@ describe("attention authority", () => {
     expect(await attention("visible", observerS, [target])).toEqual({ thrown: expect.stringMatching(/503/) });
   });
 });
+
+// ── The configurator's copy of the address grammar matches the server's ─────────────────────────
+describe("Project picker", () => {
+  it("accepts exactly the addresses the server binds", async () => {
+    const { parseProjectAddress } = await import("../src/worker.js");
+    const source = await import("../src/configurator/project-configurator-ui.js");
+    const spec = source.default as unknown as { isReady(c: { values: { address: string } }): boolean };
+    for (const address of [
+      ADDRESS, `inferops://acme.knowledge/project/project/${PROJECT}`, "inferops://acme.operations/project/board/PROOF",
+      `inferops://ACME.operations/project/project/${PROJECT}`, `inferops://acme.operations/project/project/${PROJECT}/x`,
+      `https://acme.operations/project/project/${PROJECT}`, "",
+    ]) {
+      expect(spec.isReady({ values: { address } }), address).toBe(parseProjectAddress(address) !== null);
+    }
+  });
+});

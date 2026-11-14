@@ -18,7 +18,7 @@
 // Ported in part from the archived fork (archive/main-2026-11-14, 24f5d885) and from
 // gatekeeper-inferlab (FAC-214); README.md is the ledger of what was taken and what was left.
 
-import { DurableObject, type RpcStub, RpcTarget, WorkerEntrypoint } from "cloudflare:workers";
+import { DurableObject, RpcStub, RpcTarget, WorkerEntrypoint } from "cloudflare:workers";
 import { skipRpcValidation, validateRpc } from "capnweb-validate";
 import { advanceToOAuth, claimOAuth, putInitiation } from "@gadgets/gatekeeper-kit/connect-handshake";
 import {
@@ -45,6 +45,7 @@ import {
   apiRequest, exchangeCode, locationOf, locationPageOf, logout, projectOf,
 } from "./inferops-api";
 import type { Location, LocationPage, Project, ProjectSession } from "./types";
+import PROJECT_CONFIGURATOR_HTML from "./generated/project-configurator-ui.txt";
 import TYPES_CODE from "./types.txt";
 
 export { OperationsAccount, SubjectIndex };
@@ -231,6 +232,15 @@ export function parseProjectAddress(url: string): { tenantSlug: string; workspac
   return { tenantSlug: match[1]!, workspaceSlug: match[2]!, projectId: match[3]! };
 }
 
+/** The Project picker's capability: address shape only, nothing read. */
+class ProjectConfiguratorUI extends RpcTarget {
+  async resourceUrl(address: string | null | undefined): Promise<string> {
+    const parsed = typeof address === "string" ? parseProjectAddress(address.trim()) : null;
+    if (!parsed) throw new Error("That isn't an InferOps Project address.");
+    return `inferops://${parsed.tenantSlug}.${parsed.workspaceSlug}/project/project/${parsed.projectId}`;
+  }
+}
+
 @validateRpc()
 export class OperationsUser extends WorkerEntrypoint<Cloudflare.Env, UserProps> implements GatekeeperUser {
   async describe(): Promise<AccountDescription> {
@@ -271,8 +281,13 @@ export class OperationsUser extends WorkerEntrypoint<Cloudflare.Env, UserProps> 
     return { class: this.ctx.exports.ProjectGatekeeper({ props }), resource: PROJECT_RESOURCE };
   }
 
-  async startResourceConfigurator(_resourceUrlPattern: string): Promise<ResourceConfiguratorFrame> {
-    throw new Error("Paste the Project's inferops:// address to connect it.");
+  async startResourceConfigurator(resourceUrlPattern: string): Promise<ResourceConfiguratorFrame> {
+    if (resourceUrlPattern !== PROJECT_RESOURCE.urlPattern) {
+      throw new Error(`Unsupported resource configurator type: ${resourceUrlPattern}`);
+    }
+    // The frame's only capability: turn a typed address into a canonical one. It reads no InferOps
+    // data, so it can reveal nothing; binding checks the company, workspace and Project live.
+    return { iframeHtml: PROJECT_CONFIGURATOR_HTML, ui: new RpcStub(new ProjectConfiguratorUI()) };
   }
 
   async revoke(): Promise<void> {
