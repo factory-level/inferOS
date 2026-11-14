@@ -636,6 +636,16 @@ for (const gk of gatekeepers) {
       binding.props = { sharingDomain: "dev" };
     }
     config.services.push(binding);
+    // The attention authority (FAC-237) is InferLab operations' (FAC-235): who may see an attention
+    // target, answered with each person's own InferOps connection. Without this binding, attention
+    // is refused (packages/workshop-backend/src/attention.ts).
+    if (gk.name === "gatekeeper-inferlab-ops") {
+      config.services.push({
+        binding: "ATTENTION_AUTHORITY",
+        service: gk.name,
+        entrypoint: "InferLabAttentionAuthority",
+      });
+    }
   }
 
   if (useWorkersAi) {
