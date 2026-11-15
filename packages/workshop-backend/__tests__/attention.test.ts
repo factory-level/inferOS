@@ -8,6 +8,7 @@ import { OverseerDurableObject } from "../src/overseer.js";
 import { makeUserStorage } from "../src/storage-schema/user-storage.js";
 import { OVERSEER_STORAGE_VERSION } from "../src/storage-schema/overseer-migrations.js";
 import { subjectAccountName } from "../src/account-subject.js";
+import { ATTENTION_LABEL_CASES } from "./attention-label-cases.js";
 import { ATTENTION_BINDING_NAME, MAX_ATTENTION_LABEL, acceptedInferWorkUrl, accountSubject, attentionItemKey,
   cleanAttentionLabel, inferWorkOriginsFrom, parseAttentionIntent, type AttentionAuthority } from "../src/attention.js";
 import type { AttentionIntent } from "../src/attention-binding";
@@ -540,5 +541,10 @@ describe("labels and opening (FAC-238)", () => {
     expect(acceptedInferWorkUrl("http://localhost:19804/r/x", inferWorkOriginsFrom({INFERWORK_ORIGINS: "http://localhost:19804"})))
       .toBe("http://localhost:19804/r/x");
     expect(cleanAttentionLabel("\u0000\u0007 ")).toBeNull();
+  });
+
+  it("shows a label only when something visible is left: controls, whitespace and format characters out", () => {
+    for (const [input, visible] of ATTENTION_LABEL_CASES)
+      expect(cleanAttentionLabel(input), JSON.stringify(input)).toBe(visible === "" ? null : visible);
   });
 });

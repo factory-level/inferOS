@@ -153,8 +153,11 @@ export interface AttentionAuthority {
 export const MAX_ATTENTION_LABEL = 200;
 
 /**
- * A label as it may be shown: a trimmed single line, with control characters removed and at most
- * MAX_ATTENTION_LABEL characters, or null for anything that isn't a non-empty string.
+ * A label as it may be shown: a trimmed single line, with control characters turned into spaces,
+ * format characters (zero-width, bidi and other `\p{Cf}`) removed, and at most MAX_ATTENTION_LABEL
+ * characters; or null for anything that isn't a string with something visible left in it.
+ * MIRRORED by the InferLab gatekeeper's `visibleName`: its `nameOf` treats a name this would null
+ * as unreadable. Both are held to `__tests__/attention-label-cases.ts`, byte-identical in each package.
  */
 export function cleanAttentionLabel(value: unknown): string | null {
   if (typeof value !== "string") return null;
@@ -162,7 +165,7 @@ export function cleanAttentionLabel(value: unknown): string | null {
   let flat = Array.from(value, ch => {
     let code = ch.charCodeAt(0);
     return code < 0x20 || code === 0x7f || (code >= 0x80 && code < 0xa0) ? " " : ch;
-  }).join("").replace(/\s+/g, " ").trim();
+  }).join("").replace(/\p{Cf}/gu, "").replace(/\s+/g, " ").trim();
   if (!flat) return null;
   return flat.length <= MAX_ATTENTION_LABEL ? flat : `${flat.slice(0, MAX_ATTENTION_LABEL - 1)}…`;
 }
