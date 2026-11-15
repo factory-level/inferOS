@@ -226,7 +226,8 @@ export class TestHooks extends DurableObject<Cloudflare.Env> {
   }
 
   /** The attention authority, as the Workshop's ATTENTION_AUTHORITY binding reaches it. */
-  async attention(method: "approves" | "eligible" | "visible" | "verifyEvent", ...args: unknown[]): Promise<unknown> {
+  async attention(method: "approves" | "eligible" | "visible" | "verifyEvent" | "describe" | "open",
+      ...args: unknown[]): Promise<unknown> {
     const authority = new InferLabAttentionAuthority(this.ctx as unknown as ExecutionContext, this.env);
     try {
       const call = authority as unknown as Record<string, (...a: unknown[]) => Promise<unknown>>;
