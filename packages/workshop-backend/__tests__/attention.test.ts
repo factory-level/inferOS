@@ -485,6 +485,29 @@ describe("labels and opening (FAC-238)", () => {
       .toBe("At most 100 attention items can be described at once.");
   });
 
+  it("looks a key up in the caller's own list only: a target-shaped key or another person's key names nothing", async () => {
+    let authority = new FakeAuthority();
+    let fixture = await setup(authority);
+    await raise(fixture, authority, INTENT);
+    let [item] = await read(fixture.owner, authority);
+    authority.labels.set(INTENT.target.id, "Main yard");
+    // The viewer holds no item. Keys shaped like the owner's target, or the owner's own key.
+    let t = INTENT.target;
+    let keys = [JSON.stringify(t), JSON.stringify({target: t}), `${t.tenantId}|${t.kind}|${t.id}`, t.id,
+      `inferops://acme.ops/${t.kind}/${t.id}`, item!.itemKey];
+    expect(await describeItems(fixture.viewer, authority, keys)).toEqual(keys.map(() => null));
+    for (let key of keys) {
+      expect(await refusal(open(fixture.viewer, authority, key)), key).toBe("That attention item isn't in your list.");
+    }
+    // The authority was never asked about that target on the viewer's behalf.
+    expect(authority.describedAs).toEqual([]);
+    expect(authority.openedAs).toEqual([]);
+    // The owner's item is untouched, and still theirs.
+    expect((await stored(fixture.owner))[0]?.personal).toBe("unread");
+    expect(await describeItems(fixture.owner, authority, [item!.itemKey])).toEqual(["Main yard"]);
+    expect(authority.describedAs).toEqual([fixture.ownerName]);
+  });
+
   it("rejects an answer with the wrong number of labels rather than calling a record gone", async () => {
     let authority = new FakeAuthority();
     let fixture = await setup(authority);
