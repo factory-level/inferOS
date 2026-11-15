@@ -41,3 +41,6 @@ export class RpcStub<T> {
     this.target = target;
   }
 }
+
+/** workerd's persistent-stub symbol: a gadget's `[restore]()` method is keyed by it. */
+export const restore: unique symbol = Symbol("restore");

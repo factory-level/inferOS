@@ -27,10 +27,19 @@ const refresh = document.createElement("button");
 refresh.type = "button";
 refresh.className = "refresh";
 refresh.textContent = "Refresh";
-head.append(titles, refresh);
+const watch = document.createElement("button");
+watch.type = "button";
+watch.className = "refresh";
+watch.textContent = "Watch for reviews";
+const watching = document.createElement("p");
+watching.className = "project";
+watching.setAttribute("aria-live", "polite");
+const actions = document.createElement("div");
+actions.append(watch, refresh);
+head.append(titles, actions);
 const body = document.createElement("section");
 body.setAttribute("aria-live", "polite");
-app.append(head, body);
+app.append(head, watching, body);
 document.body.append(app);
 
 function show(view: View): void {
@@ -51,6 +60,15 @@ async function load(): Promise<void> {
 }
 
 refresh.addEventListener("click", () => { void load(); });
+
+// FAC-239: make the hook that alerts on new reviews. It starts off; Activity turns it on.
+watch.addEventListener("click", () => {
+  watch.disabled = true;
+  void gadget.watchReviews()
+    .then((answer) => { watching.textContent = answer.message; })
+    .catch(() => { watching.textContent = "Couldn't reach this gadget's server. Try again."; })
+    .finally(() => { watch.disabled = false; });
+});
 
 // Awaited at the top level so an export captures the list rather than the loading state.
 await load();

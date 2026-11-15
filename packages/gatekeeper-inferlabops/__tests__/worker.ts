@@ -321,8 +321,8 @@ export class TestHooks extends DurableObject<Cloudflare.Env> {
 
 /** What the test hook and its firings recorded. */
 type HookState = {
-  received: { eventId: string; type: string; location: string; locationProject: string; revision: string;
-    projectRead: string }[];
+  received: { eventId: string; type: string; workspaceId: string; location: string; locationProject: string;
+    revision: string; projectRead: string }[];
   observations: { title: string; subresources?: string[] }[];
   /** Refuse every firing, as the Workshop does for a disabled or deleted hook. */
   refuse: boolean;
@@ -384,7 +384,7 @@ class RecordingHook extends RpcTarget {
     if (this.state.slowMs > 0) await new Promise(resolve => setTimeout(resolve, this.state.slowMs));
     const project = await event.project.getProject();
     this.state.received.push({
-      eventId: event.eventId, type: event.type, location: event.location.name,
+      eventId: event.eventId, type: event.type, workspaceId: event.workspaceId, location: event.location.name,
       locationProject: event.location.project.id, revision: event.revision, projectRead: project.key,
     });
   }
