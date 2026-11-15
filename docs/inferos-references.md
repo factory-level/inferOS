@@ -49,3 +49,24 @@ X-Frame-Options: SAMEORIGIN
   pages keep their own `frame-ancestors 'none'`), nor in `pnpm dev-client`'s Vite server on :3000.
 - **Gadget frames are unaffected.** Gadget, resource configurator and gatekeeper app frames are
   `srcdoc` frames inside the shell, which load no document a header could reach.
+
+## Review Alerts
+
+A bundled blueprint, `inferlab.review-alerts`
+(`packages/bundled-blueprints/blueprints/review-alerts/`), that shows the Locations of one InferOps
+Project that are waiting for review. Like every bundled blueprint it is installed on the first
+`/api` request and offered as a standard output format ("Review Alerts", icon `listChecks`).
+
+- **One binding, `PROJECT`**: a gatekeeper binding to InferLab operations
+  (`gatekeeperName: "inferlabops"`, pattern `inferops://*.*/project/project/*`). The installer
+  connects their own account and Project; the blueprint suggests none.
+- **The server reads live and keeps nothing.** `getReviewAlerts()` reads the Project and pages its
+  Locations (100 a page, at most 20 pages, `incomplete` past that) and returns those whose review is
+  `requested`. Unbound, it answers "Not connected: connect an InferLab operations Project", never
+  an empty list. A refusal is named (`NotFound`, `Forbidden`, `ConnectionExpired`, ...) with a
+  message of its own, never the error's text.
+- **The client** draws loading, not connected, failed, empty ("No Locations are waiting for
+  review") and the list, as text only.
+- The kernel does not check an assignment's vendor against a binding's `gatekeeperName`
+  (`AuthenticatedApi.newWorkspaceFromBlueprint`), so the picker is what keeps `PROJECT` an InferLab
+  operations connection.

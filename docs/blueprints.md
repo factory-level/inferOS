@@ -243,6 +243,8 @@ A gadget made from a bundled blueprint follows it like any other. When the deplo
 
 The bundled formats currently ship build output (bundled `client.js` and `server.js`), which does not merge well. A gadget customized by editing those files may see heavy conflicts when it takes an update. That is accepted until the formats ship as source.
 
+Besides the Docs, Sheets and Slides formats, the set includes **Review Alerts** (`inferlab.review-alerts`, FAC-232), the first bundled blueprint that declares a binding: `PROJECT`, an InferLab operations Project the installer connects. See [inferos-references.md](inferos-references.md#review-alerts).
+
 ## Creating and Managing Blueprints
 
 Blueprints are managed through the Blueprints menu in the gadget editor header, whose **Publish as blueprint…** item opens the Blueprint modal. (The menu's other item, **Update from blueprint…**, is the reverse direction: see [Updating a Gadget from a Blueprint](#updating-a-gadget-from-a-blueprint).) The UI allows:
