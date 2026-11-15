@@ -197,21 +197,40 @@ export function subjectIndexName(subject: { issuer: string; subject: string }): 
   return `subject~${part(subject.issuer)}~${part(subject.subject)}`;
 }
 
+/** At most this many live connections are kept per person; the oldest beyond it is dropped. */
+const SUBJECT_INDEX_LIMIT = 16;
+
 /**
- * Which connection belongs to a person, by their stable subject: the one the attention authority
- * answers with. The most recent connection wins; revoking it removes it. Holds ids only.
+ * Which connections belong to a person, by their stable subject: the attention authority answers
+ * with the most recent one still live. Every live connection is kept, so revoking one leaves the
+ * others: a second connect the Workshop deduplicates (it keeps the first and revokes the new one)
+ * must not leave the person with no connection. Holds ids only.
  */
 @validateRpc()
 export class SubjectIndex extends DurableObject<Cloudflare.Env> {
+  #ids(): string[] {
+    const ids = this.ctx.storage.kv.get<string[]>("accounts");
+    if (ids) return ids;
+    // Before FAC-242 the index held one id under "account".
+    const legacy = this.ctx.storage.kv.get<string>("account");
+    return legacy ? [legacy] : [];
+  }
+
+  #store(ids: string[]): void {
+    this.ctx.storage.kv.delete("account");
+    if (ids.length === 0) this.ctx.storage.kv.delete("accounts");
+    else this.ctx.storage.kv.put("accounts", ids);
+  }
+
   async remember(accountId: string): Promise<void> {
-    this.ctx.storage.kv.put("account", accountId);
+    this.#store([...this.#ids().filter(id => id !== accountId), accountId].slice(-SUBJECT_INDEX_LIMIT));
   }
 
   async forget(accountId: string): Promise<void> {
-    if (this.ctx.storage.kv.get<string>("account") === accountId) this.ctx.storage.kv.delete("account");
+    this.#store(this.#ids().filter(id => id !== accountId));
   }
 
   async account(): Promise<string | null> {
-    return this.ctx.storage.kv.get<string>("account") ?? null;
+    return this.#ids().at(-1) ?? null;
   }
 }

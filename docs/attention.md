@@ -152,3 +152,14 @@ holds what in InferLab, or who can see a record. Until that binding exists, atte
 
 The Home list's component and browser tests sit beside it in
 `packages/workshop-frontend/src/features/attention/`.
+
+## Recovery (FAC-242)
+
+These were checked live against a local InferOps, offline, with a fault proxy in front of the ingress (inferops `docs/agent/architecture/local-development.md`, "Recovery drills").
+
+- **A redelivered event changes nothing.** The ingress records it as a duplicate (`events.ingress.accepted`, `duplicate: true`), so the hook doesn't fire again. A raise is also keyed by recipient, event and reason.
+- **Events that arrive out of order** each give their own item, once.
+- **A crash or restart loses nothing.** Accepted events, the driver's checkpoints and the items persist in `.wrangler/state`, and an event the worker was still sending is redelivered. In one run, the local workerd runtime restarted itself 5 times on the first hook firing after a SIGKILL; that delivery got a 500 and the sender's retry succeeded.
+- **A disabled or deleted hook** receives the event (202) but raises nothing. InferOps isn't asked to verify it.
+- **A deleted target** is withheld from Home at the next read, because the authority's `visible` is false.
+- **A second connect of the same person** keeps their attention. The InferLab authority's `SubjectIndex` keeps every live connection, so the Workshop revoking the duplicate leaves the first one.

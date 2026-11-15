@@ -67,7 +67,10 @@ Project that are waiting for review. Like every bundled blueprint it is installe
   message of its own, never the error's text.
 - **Watching for reviews** (FAC-239). "Watch for reviews" calls `watchReviews()`, which subscribes
   one persistent hook to the Project's committed events (`PROJECT.subscribe`, restored through the
-  gadget's `[restore]`) and stores only that it did, so a second watch makes no second hook. The
+  gadget's `[restore]`) and stores only that it did, so a second watch makes no second hook. Two
+  watches at once share the one in flight (FAC-242). The marker isn't cleared when the person
+  deletes the hook in Activity: the Workshop doesn't tell the gadget, so after a deletion it still
+  reports "watching" and makes no new hook. The
   hook starts disabled; the person turns it on in Activity or on the gadget's Connections tab. Each
   review requested then raises attention (`env.ATTENTION.raise`): InferOps' event id as the source,
   the Location as the target, and the holders of `location:write` in the event's workspace as the

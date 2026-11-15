@@ -88,6 +88,12 @@ class ReviewHook extends RpcTarget {
 }
 
 export class Gadget extends DurableObject<GadgetEnv> {
+  /**
+   * The watch in flight, if any. `subscribe` is an outgoing call, so the input gate opens while it
+   * runs: a second `watchReviews()` then must join this one, not make a second hook.
+   */
+  #watching: Promise<WatchState> | null = null;
+
   /** Every delivery of the hook `watchReviews()` made comes back through here. */
   async [restore](params: { type?: string }): Promise<ReviewHook> {
     if (params?.type !== HOOK.type) throw new TypeError(`Unknown restore type: ${String(params?.type)}`);
@@ -99,6 +105,11 @@ export class Gadget extends DurableObject<GadgetEnv> {
    * turns it on in Activity. A second call makes no second hook.
    */
   async watchReviews(): Promise<WatchState> {
+    this.#watching ??= this.#watch().finally(() => { this.#watching = null; });
+    return this.#watching;
+  }
+
+  async #watch(): Promise<WatchState> {
     const session = this.env.PROJECT;
     if (!session) return { state: "notConnected", message: NOT_CONNECTED };
     if (await this.ctx.storage.get(WATCHING_KEY)) return { state: "watching", created: false, message: WATCHING };
