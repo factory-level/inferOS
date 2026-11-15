@@ -30,7 +30,7 @@ import type {
   HookController, HookDescription, HookInitiator, HookTargetMetadata,
 } from "@gadgets/workshop-shared/gatekeeper";
 import { VENDOR_ID } from "./account";
-import { type EventDestination, ISSUER_PATTERN, ISSUER_MAX_LENGTH, readConfig, readDestinations, receivesEventsFor } from "./config";
+import { ISSUER_PATTERN, ISSUER_MAX_LENGTH, readConfig, readDestinationsState, receivesEventsFor } from "./config";
 import type { ProjectEventHook, ProjectEventType } from "./types";
 
 type EventLogFields = { vendorId: string; reason: string; destinationKey: string; eventId: string; duplicate: boolean };
@@ -48,7 +48,8 @@ export const CHECKPOINT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
 /** Why a delivery was refused, logged with the destination key and never with the body. */
 export type IngressRefusal =
-  | "unknown_destination" | "too_large" | "signature" | "unreadable" | "schema" | "scope";
+  | "receiver_off" | "unavailable" | "unknown_destination" | "too_large" | "signature" | "unreadable" | "schema"
+  | "scope";
 
 // ── The contract (`inferlab.committed-event` v1) ───────────────────────────────────────────────
 
@@ -217,15 +218,20 @@ const refusal = (status: number, reason: IngressRefusal, key: string | null) => 
 export const eventDriver = (exports: Cloudflare.Exports) => exports.ProjectEventDriver.getByName("events");
 
 /**
- * One delivery to `POST <BASE_URL>/events/<key>`. 202 once recorded (a duplicate included); 404 for
- * an unknown key; 413 too large; 401 a bad signature or timestamp; 400 not the contract; 403 not
- * this destination's scope. Nothing is read from the body before its signature is checked.
+ * One delivery to `POST <BASE_URL>/events/<key>`. 202 once recorded (a duplicate included); 503 while
+ * the receiver is off (its connection settings are, or `INFERLAB_EVENT_DESTINATIONS` is set but
+ * invalid) or can't record it, which the sender retries; 404 for a key no valid configuration names;
+ * 413 too large; 401 a bad signature or timestamp; 400 not the contract; 403 not this destination's
+ * scope. Nothing is read from the body before its signature is checked.
  */
 export async function handleEventDelivery(request: Request, env: Cloudflare.Env, exports: Cloudflare.Exports,
                                           key: string, nowMs = Date.now()): Promise<Response> {
   const config = readConfig(env);
-  const destination: EventDestination | undefined = readDestinations(env).get(key);
-  if ("off" in config || !destination) return refusal(404, "unknown_destination", null);
+  const destinations = readDestinationsState(env);
+  // Off by a misconfiguration (a bad rotation, say): retryable, so no committed event is lost.
+  if ("off" in config || destinations.state === "invalid") return refusal(503, "receiver_off", null);
+  const destination = destinations.state === "ok" ? destinations.destinations.get(key) : undefined;
+  if (!destination) return refusal(404, "unknown_destination", null);
   const declared = Number(request.headers.get("content-length") ?? "0");
   if (declared > MAX_EVENT_BYTES) return refusal(413, "too_large", key);
   let body: Uint8Array;
@@ -249,7 +255,16 @@ export async function handleEventDelivery(request: Request, env: Cloudflare.Env,
     deliveryId: request.headers.get(DELIVERY_HEADER)?.toLowerCase() ?? null,
   });
   if ("refused" in parsed) return refusal(parsed.refused === "scope" ? 403 : 400, parsed.refused, key);
-  const { duplicate } = await eventDriver(exports).ingest(parsed);
+  let duplicate: boolean;
+  try {
+    ({ duplicate } = await eventDriver(exports).ingest(parsed));
+  } catch (error) {
+    // Not acknowledged: the sender retries with the same event id, and the retry reconciles.
+    logger.error("could not record an InferLab event", {
+      event: "events.ingress.unrecorded", destinationKey: key, eventId: parsed.eventId, error,
+    });
+    return new Response(null, { status: 503 });
+  }
   logger.info("accepted an InferLab event", {
     event: "events.ingress.accepted", destinationKey: key, eventId: parsed.eventId, duplicate,
   });
@@ -331,7 +346,7 @@ export class ProjectEventDriver extends DurableObject<Cloudflare.Env> {
   /** Disable hook `key`: forget it and end its queued deliveries. */
   async unregister(key: string): Promise<void> {
     this.#hooks.remove(key);
-    await this.#reschedule();
+    await this.#reconcileAlarm();
   }
 
   /** Drop every hook of connection `accountId`, and refuse any it enables from now on. */
@@ -340,12 +355,14 @@ export class ProjectEventDriver extends DurableObject<Cloudflare.Env> {
     for (const [key, registration] of this.#hooks.entries()) {
       if (registration.accountId === accountId) this.#hooks.remove(key);
     }
-    await this.#reschedule();
+    await this.#reconcileAlarm();
   }
 
   /**
    * Record `event` once: its checkpoint and one queued delivery per enabled hook that may watch it,
-   * in one transaction, before the delivery is acknowledged. A known event id changes nothing.
+   * in one transaction, before the delivery is acknowledged. A known event id records nothing. Either
+   * way the alarm is then reconciled from what is stored, so a retry of an event whose alarm was lost
+   * after its commit (an interrupted object, a failed `setAlarm`) still gets it delivered.
    */
   async ingest(event: StoredEvent): Promise<{ duplicate: boolean }> {
     const now = Date.now();
@@ -357,16 +374,18 @@ export class ProjectEventDriver extends DurableObject<Cloudflare.Env> {
       for (const [key] of watching) this.#hooks.enqueue(key, event.eventId, event, now);
       return watching.length;
     });
-    if (queued === null) return { duplicate: true };
-    // Due now when queued; otherwise, at least soon enough to forget old checkpoints.
-    await this.ctx.storage.setAlarm(queued > 0 ? now : (this.#hooks.nextDue() ?? now + CHECKPOINT_RETENTION_MS));
-    return { duplicate: false };
+    await this.#reconcileAlarm();
+    return { duplicate: queued === null };
   }
 
+  /** Deliver what is due, forget old checkpoints, and re-arm while work remains, even after a failure. */
   async alarm(): Promise<void> {
-    await this.#hooks.run(Date.now());
-    this.#forgetOldCheckpoints(Date.now());
-    await this.#reschedule();
+    try {
+      await this.#hooks.run(Date.now());
+      this.#forgetOldCheckpoints(Date.now());
+    } finally {
+      await this.#reconcileAlarm();
+    }
   }
 
   #forgetOldCheckpoints(now: number): void {
@@ -375,12 +394,20 @@ export class ProjectEventDriver extends DurableObject<Cloudflare.Env> {
     }
   }
 
-  async #reschedule(): Promise<void> {
-    const due = this.#hooks.nextDue();
+  /**
+   * Set the alarm from what is stored: the next queued delivery, else a later sweep while any
+   * checkpoint remains, else none. An alarm already set no later than that is kept (it runs and
+   * reconciles again), so this only ever brings one forward or adds a missing one.
+   */
+  async #reconcileAlarm(): Promise<void> {
     const hasCheckpoints = this.ctx.storage.kv.list({ prefix: CHECKPOINT_PREFIX, limit: 1 })[Symbol.iterator]().next().done === false;
-    if (due !== undefined) await this.ctx.storage.setAlarm(due);
-    else if (hasCheckpoints) await this.ctx.storage.setAlarm(Date.now() + CHECKPOINT_RETENTION_MS);
-    else await this.ctx.storage.deleteAlarm();
+    const wanted = this.#hooks.nextDue() ?? (hasCheckpoints ? Date.now() + CHECKPOINT_RETENTION_MS : undefined);
+    const current = await this.ctx.storage.getAlarm();
+    if (wanted === undefined) {
+      if (current !== null) await this.ctx.storage.deleteAlarm();
+    } else if (current === null || current > wanted) {
+      await this.ctx.storage.setAlarm(wanted);
+    }
   }
 }
 

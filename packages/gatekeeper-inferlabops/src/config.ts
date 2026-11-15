@@ -114,30 +114,39 @@ export type EventDestination = { key: string; workspaceId: string; secret: strin
 export type EventsEnv = { INFERLAB_EVENT_DESTINATIONS?: string };
 
 /**
- * `INFERLAB_EVENT_DESTINATIONS`: a JSON array of `{key, workspaceId, secret}`, read whole. A
- * malformed entry, a repeated key or a short secret turns every destination off (an empty map), so
- * nothing is accepted under a configuration nobody meant. Unset: no destinations. Never logged.
+ * What `INFERLAB_EVENT_DESTINATIONS` says: `unset` (no destinations, on purpose); `invalid` (set, but
+ * a malformed entry, a repeated key or a short secret turns every destination off, so nothing is
+ * accepted under a configuration nobody meant); or the destinations. Never logged.
  */
-export function readDestinations(env: EventsEnv): Map<string, EventDestination> {
-  const off = new Map<string, EventDestination>();
+export type DestinationsState =
+  | { state: "unset" } | { state: "invalid" } | { state: "ok"; destinations: Map<string, EventDestination> };
+
+/** `INFERLAB_EVENT_DESTINATIONS`: a JSON array of `{key, workspaceId, secret}`, read whole. */
+export function readDestinationsState(env: EventsEnv): DestinationsState {
   const raw = env.INFERLAB_EVENT_DESTINATIONS?.trim();
-  if (!raw) return off;
+  if (!raw) return { state: "unset" };
   let entries: unknown;
   try {
     entries = JSON.parse(raw);
   } catch {
-    return off;
+    return { state: "invalid" };
   }
-  if (!Array.isArray(entries)) return off;
+  if (!Array.isArray(entries) || entries.length === 0) return { state: "invalid" };
   const destinations = new Map<string, EventDestination>();
   for (const entry of entries) {
     const { key, workspaceId, secret } = (entry ?? {}) as Record<string, unknown>;
-    if (typeof key !== "string" || !DESTINATION_KEY.test(key) || destinations.has(key)) return off;
-    if (typeof workspaceId !== "string" || !TENANT_ID.test(workspaceId)) return off;
-    if (typeof secret !== "string" || secret.length < MIN_SECRET_LENGTH) return off;
+    if (typeof key !== "string" || !DESTINATION_KEY.test(key) || destinations.has(key)) return { state: "invalid" };
+    if (typeof workspaceId !== "string" || !TENANT_ID.test(workspaceId)) return { state: "invalid" };
+    if (typeof secret !== "string" || secret.length < MIN_SECRET_LENGTH) return { state: "invalid" };
     destinations.set(key, { key, workspaceId: workspaceId.toLowerCase(), secret });
   }
-  return destinations;
+  return { state: "ok", destinations };
+}
+
+/** The configured destinations: empty unless `INFERLAB_EVENT_DESTINATIONS` is set and valid. */
+export function readDestinations(env: EventsEnv): Map<string, EventDestination> {
+  const read = readDestinationsState(env);
+  return read.state === "ok" ? read.destinations : new Map();
 }
 
 /** Whether some destination carries `workspaceId`'s events: what a hook on it needs to fire. */

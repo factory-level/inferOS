@@ -51,6 +51,7 @@ InferOps' committed events reach Gadget server code through the Workshop's own H
 
   | Check | Refusal |
   | --- | --- |
+  | The receiver is on: the connection settings are valid, and `INFERLAB_EVENT_DESTINATIONS`, if set, is valid. Off by a misconfiguration (a botched secret rotation, say) is retryable, so nothing committed is lost | 503 |
   | `<key>` is a configured destination; its own secret checks the signature | 404 |
   | The body is at most 16 KiB (`MAX_EVENT_BYTES`) | 413 |
   | `x-inferlab-signature` `t=…,v1=…` is HMAC-SHA256 of `<t>.` and the **raw bytes**, compared in constant time, `t` within 300 s of now. Nothing is parsed before this | 401 |
@@ -58,6 +59,8 @@ InferOps' committed events reach Gadget server code through the Workshop's own H
   | The scope is the destination's: `issuer` is `INFERLAB_AUTH_ORIGIN`, `destination` is `<key>`, the company is `INFEROPS_COMPANY`, and the workspace (envelope and event) is the destination's one workspace | 403 |
 
 - **Checkpoint and acknowledgement.** The deployment's one `ProjectEventDriver` records the event in one transaction: a checkpoint on its `eventId` (`seen:`, kept 7 days) and one queued delivery per enabled hook that may watch it. Only then does the ingress answer **202** `{accepted, duplicate}`. It doesn't wait for any hook: the kit's queue delivers from the driver's alarm and retries. The same `eventId` again (InferOps retries a timeout with the same id) answers 202 `duplicate: true` and queues nothing, so a hook fires once. Storage is durable, so a restart before delivery still delivers, once.
+  - **The alarm is reconciled from what is stored** on every accept and every duplicate, before the answer: due at the next queued delivery, else a later checkpoint sweep, else none. So if the alarm was lost after a commit (an interrupted object, a failed `setAlarm`), the sender's retry restores it. The alarm reconciles again after every run, even a failed one, so it re-arms while work remains.
+  - A delivery that can't be recorded answers 503, unacknowledged, and the sender retries it.
 - **Subscribing.** A Gadget calls `ProjectSession.subscribe(hook)` with a persistent stub (`types.d.ts`). The facet checks that a destination serves this binding's workspace and that the person can read the Project now. It mints a delivery stub to itself (`ctx.restore`) and binds a `ProjectEventHookController`, whose props carry the binding's company, workspace and Project. The Workshop keeps the hook **disabled until the user enables it**. On enable, the controller registers it with the driver.
 - **Delivery.** A hook watches only its own binding's company and workspace (`watches`). The event's own fields only select among hooks whose binding already has them. Each firing goes through the Workshop's `startHook()`, which refuses a disabled or deleted hook. The binding's facet (`ProjectEventDeliveryImpl`) then re-reads the Location **with the connected person's own token, now**:
   - a Location they can't read (403/404), an expired or revoked connection, or another Project's Location is dropped, disclosing nothing;

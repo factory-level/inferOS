@@ -807,6 +807,24 @@ describe("event ingress", () => {
     expect(await checkpointed(id)).toBe(false);
   });
 
+  it("is a retryable 503 while the receiver is off, never a terminal 404; 404 only for an unknown key", async () => {
+    const body = JSON.stringify(envelope(nextEventId()));
+    const signature = await sign(body);
+    const headers = { "content-type": "application/json", "x-inferlab-signature": signature,
+      "x-inferlab-delivery": (JSON.parse(body) as { event: { eventId: string } }).event.eventId };
+    const post = (overrides: Record<string, string | undefined>, key = DESTINATION) =>
+      worker.fetch(new Request(`${BASE}/events/${key}`, { method: "POST", headers, body }),
+        { ...env, ...overrides } as Env, eventsCtx).then(r => r.status);
+    expect(await post({ INFEROPS_COMPANY: "" }), "connection settings off").toBe(503);
+    expect(await post({ INFERLAB_AUTH_ORIGIN: "http://evil.example" }), "bad origin").toBe(503);
+    for (const bad of ["not json", "[]", JSON.stringify([{ key: DESTINATION, workspaceId: WS, secret: "short" }]),
+        JSON.stringify([{ key: DESTINATION, workspaceId: WS, secret: SECRET }, { key: DESTINATION, workspaceId: WS, secret: SECRET }])]) {
+      expect(await post({ INFERLAB_EVENT_DESTINATIONS: bad }), bad).toBe(503);
+    }
+    expect(await post({ INFERLAB_EVENT_DESTINATIONS: undefined }), "no destinations configured").toBe(404);
+    expect(await post({}, "inferos-elsewhere"), "unknown key, valid configuration").toBe(404);
+  });
+
   it("acknowledges a signed delivery once it is recorded; the same event again changes nothing", async () => {
     const id = nextEventId();
     const body = JSON.stringify(envelope(id));
@@ -831,6 +849,10 @@ describe("hooks on a Project's events", () => {
     return { label: owner.label, key };
   }
   const received = async () => (await hooks().readHook()).received;
+  /** Wait for the automatically fired alarm's delivery, without calling `alarm()` ourselves. */
+  const waitForReceived = async (count: number) => {
+    for (let i = 0; i < 100 && (await received()).length < count; i++) await new Promise(r => setTimeout(r, 50));
+  };
 
   it("starts disabled: an event before it is enabled reaches nobody, one after reaches it once", async () => {
     await subscribed();
@@ -914,6 +936,44 @@ describe("hooks on a Project's events", () => {
     await drain();
     expect((await received()).map(r => r.eventId)).toEqual([id]);
   }, 20_000);
+
+  it("an alarm lost after the commit is restored by the sender's retry: the hook fires once", async () => {
+    // A driver of its own: earlier tests' hooks, checkpoints and retry alarms would schedule it anyway.
+    await runInDurableObject(driver(), async (_i, state) => {
+      await state.storage.deleteAlarm();
+      await state.storage.deleteAll();
+    });
+    await subscribed();
+    expect(await hooks().enableHook()).toBeNull();
+    await drain();
+    // The next setAlarm fails, as an interrupted object or a failed write would leave it: the event
+    // and its queued delivery are committed, but nothing is scheduled to deliver them.
+    await runInDurableObject(driver(), (_i, state) => {
+      const storage = state.storage as unknown as { setAlarm(at: number): Promise<void> };
+      const real = storage.setAlarm.bind(storage);
+      let failNext = true;
+      storage.setAlarm = async (at: number) => {
+        if (failNext) {
+          failNext = false;
+          throw new Error("injected: setAlarm failed after the commit");
+        }
+        return real(at);
+      };
+    });
+    const id = nextEventId();
+    const body = JSON.stringify(envelope(id));
+    expect((await deliver(body)).status).toBe(503);
+    expect(await checkpointed(id)).toBe(true);
+    const alarmAt = () => runInDurableObject(driver(), (_i, state) => state.storage.getAlarm());
+    // Nothing is scheduled: the delivery would wait forever.
+    expect(await alarmAt()).toBeNull();
+    expect(await received()).toEqual([]);
+    // The sender retries the same event: a duplicate, which reconciles the alarm before it is acked.
+    expect(await deliver(body)).toEqual({ status: 202, json: { accepted: true, duplicate: true } });
+    // Reconciled: due now, so the runtime fires it by itself; nothing here calls alarm().
+    await waitForReceived(1);
+    expect((await received()).map(r => r.eventId)).toEqual([id]);
+  });
 
   it("disconnecting drops the connection's hooks, and refuses enabling them again", async () => {
     const { label } = await subscribed();
