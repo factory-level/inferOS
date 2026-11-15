@@ -1,5 +1,6 @@
 // @vitest-environment node
 import { describe, expect, it } from "vitest";
+import { restore } from "cloudflare:workers";
 import { ExportHandler, Gadget, failureOf } from "../files/server.ts";
 import type { GadgetEnv, ProjectSession } from "../files/lib/protocol.ts";
 
@@ -12,6 +13,7 @@ const location = (id: string, status: "none" | "requested"): Location =>
 function session(pages: Location[][], calls: unknown[] = []): ProjectSession {
   return {
     getProject: async () => ({ key: "PROOF", name: "Proof Project" }),
+    subscribe: async () => {},
     listLocations: async (options) => {
       calls.push(options);
       const index = options?.cursor === undefined ? 0 : Number(options.cursor);
@@ -74,6 +76,7 @@ describe("Review Alerts server", () => {
     const calls: unknown[] = [];
     const PROJECT: ProjectSession = {
       getProject: async () => ({ key: "PROOF", name: "Proof Project" }),
+      subscribe: async () => {},
       listLocations: async (options) => {
         calls.push(options);
         return { items: [location(String(calls.length), "requested")], nextCursor: "same" };
@@ -92,6 +95,7 @@ describe("Review Alerts server", () => {
     const PROJECT: ProjectSession = {
       getProject: async () => { throw named(name); },
       listLocations: async () => { throw new Error("not reached"); },
+      subscribe: async () => {},
     };
     expect(await gadget({ PROJECT }).getReviewAlerts()).toEqual({ state: "failed", reason: name, message });
   });
@@ -100,6 +104,7 @@ describe("Review Alerts server", () => {
     const PROJECT: ProjectSession = {
       getProject: async () => ({ key: "PROOF", name: "Proof Project" }),
       listLocations: async () => { throw new Error("upstream said something private"); },
+      subscribe: async () => {},
     };
     const result = await gadget({ PROJECT }).getReviewAlerts();
     expect(result).toEqual({
@@ -125,5 +130,94 @@ describe("Review Alerts server", () => {
     expect(await handler.getExportFormats()).toEqual([
       { id: "pdf", label: "PDF", mode: "browser", contentType: "application/pdf", fileExtension: ".pdf" },
     ]);
+  });
+});
+
+// FAC-239: watching for reviews. One hook, made once; each event raises one attention intent for
+// the holders of location:write in the event's workspace, citing InferOps' event id.
+describe("Review Alerts watching", () => {
+  const storage = () => {
+    const data = new Map<string, unknown>();
+    return {
+      data,
+      get: async (k: string) => data.get(k),
+      put: async (k: string, v: unknown) => { data.set(k, v); },
+      list: async () => new Map(data),
+    };
+  };
+  const watcher = (env: GadgetEnv, store = storage()) => {
+    const restored: unknown[] = [];
+    const state = { storage: store, restore: async (p: unknown) => { restored.push(p); return { stub: p }; } };
+    return { g: new Gadget(state as unknown as DurableObjectState, env), store, restored };
+  };
+  const subscribing = (fail?: Error) => {
+    const subscribed: unknown[] = [];
+    const PROJECT = {
+      ...session([[]]),
+      subscribe: async (hook: unknown) => { if (fail) throw fail; subscribed.push(hook); },
+    };
+    return { PROJECT, subscribed };
+  };
+
+  it("is not connected without a Project, and makes nothing", async () => {
+    const { g, store } = watcher({});
+    expect(await g.watchReviews()).toMatchObject({ state: "notConnected" });
+    expect(store.data.size).toBe(0);
+  });
+
+  it("subscribes one persistent hook, once, and stores only that it did", async () => {
+    const { PROJECT, subscribed } = subscribing();
+    const { g, store, restored } = watcher({ PROJECT });
+    expect(await g.watchReviews()).toEqual({
+      state: "watching", created: true, message: "Watching for reviews. Turn the hook on in Activity to be alerted.",
+    });
+    expect(await g.watchReviews()).toMatchObject({ state: "watching", created: false });
+    expect(restored).toEqual([{ type: "review-alerts" }]);
+    expect(subscribed).toEqual([{ stub: { type: "review-alerts" } }]);
+    expect([...store.data.keys()]).toEqual(["watching"]);
+  });
+
+  it("says why when it can't watch, and stores nothing", async () => {
+    const { PROJECT } = subscribing(new Error("no events here"));
+    const { g, store } = watcher({ PROJECT });
+    expect(await g.watchReviews()).toEqual({
+      state: "failed",
+      message: "This InferOS doesn't receive InferOps events for that workspace, so it can't watch for reviews.",
+    });
+    expect(store.data.size).toBe(0);
+    const { PROJECT: expired } = subscribing(named("ConnectionExpired"));
+    expect(await watcher({ PROJECT: expired }).g.watchReviews()).toMatchObject({
+      state: "failed", message: expect.stringContaining("expired or was revoked"),
+    });
+  });
+
+  it("restores its own hook only, and the hook raises exactly the attention intent", async () => {
+    const raised: unknown[] = [];
+    const ATTENTION = { raise: async (intent: unknown) => { raised.push(intent); return { recipients: 1 }; } };
+    const { g } = watcher({ ATTENTION });
+    await expect(g[restore]({ type: "other" })).rejects.toThrow("Unknown restore type: other");
+    const hook = await g[restore]({ type: "review-alerts" });
+    const target = { v: 1 as const, tenantId: "00000000-0000-4000-8000-000000000c01", kind: "project/location", id: "loc-1" };
+    await hook.receiveEvent({ eventId: "evt-1", workspaceId: "ws-1", location: { ref: target } });
+    expect(raised).toEqual([{
+      v: 1, sourceEventId: "evt-1", reason: "review_requested", target,
+      audience: { kind: "permission-holders", workspaceId: "ws-1", permission: "location:write" },
+    }]);
+  });
+
+  it("a hook without the attention capability fails loudly", async () => {
+    const hook = await watcher({}).g[restore]({ type: "review-alerts" });
+    await expect(hook.receiveEvent({ eventId: "e", workspaceId: "w", location: { ref: { v: 1, tenantId: "t", kind: "k", id: "i" } } }))
+      .rejects.toThrow("Attention is unavailable");
+  });
+});
+
+// workerd starts a gadget's worker only if every export is an entrypoint (a class or a handler);
+// any other exported value, a string constant say, fails the whole worker.
+describe("Review Alerts server module", () => {
+  it("exports only entrypoints and functions", async () => {
+    const module = await import("../files/server.ts");
+    for (const [name, value] of Object.entries(module))
+      expect({ name, type: typeof value }).toEqual({ name, type: "function" });
   });
 });

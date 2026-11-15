@@ -997,8 +997,8 @@ describe("hooks on a Project's events", () => {
     await deliver(body);
     await drain();
     expect(await received()).toEqual([{
-      eventId: id, type: "project.location.review_requested", location: "Main yard", locationProject: PROJECT,
-      revision: "4", projectRead: "PROOF",
+      eventId: id, type: "project.location.review_requested", workspaceId: WS, location: "Main yard",
+      locationProject: PROJECT, revision: "4", projectRead: "PROOF",
     }]);
     // The firing observed the Project and the Location, as a read does.
     expect((await hooks().readHook()).observations[0]).toEqual({

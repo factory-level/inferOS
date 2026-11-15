@@ -10,16 +10,55 @@
  */
 export interface ProjectSession {
   getProject(): Promise<{ key: string; name: string }>;
+  /**
+   * Have `hook.receiveEvent()` called with each committed InferOps event on this Project's
+   * Locations (a review requested). The hook starts disabled; the person enables it in Activity.
+   * Every call makes another hook, so call it once.
+   */
+  subscribe(hook: unknown): Promise<void>;
   listLocations(options?: { cursor?: string; limit?: number }): Promise<{
     items: { ref: { id: string }; name: string; review: { status: "none" | "requested" } }[];
     nextCursor?: string;
   }>;
 }
 
+/** A committed InferOps event, as the hook receives it: the fields Review Alerts reads. */
+export interface ReviewEvent {
+  eventId: string;
+  /** The InferOps workspace the event was committed in. */
+  workspaceId: string;
+  location: { ref: { v: 1; tenantId: string; kind: string; id: string } };
+}
+
+/**
+ * The host's attention capability (`env.ATTENTION`, FAC-237): one `inferlab.attention-intent` v1,
+ * a target reference and an audience rule, never a recipient list or a URL. The host checks the
+ * event is real and who may see it, and gives each such person one item on their Home.
+ */
+export interface Attention {
+  raise(intent: {
+    v: 1;
+    sourceEventId: string;
+    reason: "review_requested";
+    target: { v: 1; tenantId: string; kind: string; id: string };
+    audience: { kind: "permission-holders"; workspaceId: string; permission: string };
+  }): Promise<unknown>;
+}
+
 /** The bindings the gadget's Durable Object receives. `PROJECT` is absent until one is connected. */
 export interface GadgetEnv {
   PROJECT?: ProjectSession;
+  ATTENTION?: Attention;
 }
+
+/**
+ * Whether the gadget alerts on new reviews (FAC-239). `watching`: its hook exists; the person turns
+ * it on in Activity, and it then raises a Needs attention item for each review requested.
+ */
+export type WatchState =
+  | { state: "notConnected"; message: string }
+  | { state: "failed"; message: string }
+  | { state: "watching"; created: boolean; message: string };
 
 /** A Location of the Project that is waiting for review. */
 export interface WaitingLocation {
@@ -62,4 +101,5 @@ export type ReviewAlerts =
 /** The gadget's RPC surface, as the client's `gadget` stub reaches it. */
 export interface GadgetStub {
   getReviewAlerts(): Promise<ReviewAlerts>;
+  watchReviews(): Promise<WatchState>;
 }

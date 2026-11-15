@@ -739,6 +739,7 @@ class ProjectEventDeliveryImpl extends RpcTarget implements ProjectEventDelivery
     const pending = this.#gk.pendingReviews().has(location.ref.id);
     await callback.receiveEvent({
       eventId: event.eventId, type: event.type, occurredAt: event.occurredAt,
+      workspaceId: event.workspaceId,
       location: pending ? { ...location, review: { status: "requested" } } : location,
       revision: event.revision, project,
     } satisfies ProjectEvent);

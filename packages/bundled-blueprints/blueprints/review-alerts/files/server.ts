@@ -3,12 +3,41 @@
  *  -----------------------------------------------------------------------
  *  Reads one InferOps Project through the PROJECT binding (InferLab
  *  operations) and answers which of its Locations are waiting for review.
- *  It keeps nothing: every call reads InferOps again, as the person who
- *  connected the Project, so what it shows is what that person may see now.
+ *  It keeps nothing of InferOps: every call reads InferOps again, as the
+ *  person who connected the Project, so what it shows is what that person
+ *  may see now.
+ *
+ *  Watching (FAC-239): `watchReviews()` subscribes one persistent hook to the
+ *  Project's committed events. The person turns it on in Activity; each review
+ *  requested then raises a Needs attention item through the host's attention
+ *  capability, citing InferOps' event id, for the holders of `location:write`
+ *  in that workspace. The only thing stored is that the hook was made.
  * ========================================================================= */
 
-import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
-import type { GadgetEnv, ReadFailure, ReviewAlerts, WaitingLocation } from "./lib/protocol.ts";
+import { DurableObject, RpcTarget, WorkerEntrypoint, restore } from "cloudflare:workers";
+import type {
+  Attention, GadgetEnv, ReadFailure, ReviewAlerts, ReviewEvent, WaitingLocation, WatchState,
+} from "./lib/protocol.ts";
+
+// workerd's persistent-stub symbol, which the stock Workers types don't declare yet.
+declare module "cloudflare:workers" {
+  export const restore: unique symbol;
+}
+
+/** The restore parameters of this gadget's one hook. */
+const HOOK = { type: "review-alerts" } as const;
+
+/** The storage key recording that the hook was made, so a second watch makes no second hook. */
+const WATCHING_KEY = "watching";
+
+/**
+ * Who a review alert is for: the people who may act on the Location. Not exported: a gadget's
+ * module exports only its entrypoints (workerd refuses any other value, and the worker won't start).
+ */
+const ALERT_PERMISSION = "location:write";
+
+const WATCHING = "Watching for reviews. Turn the hook on in Activity to be alerted.";
+const NO_EVENTS = "This InferOS doesn't receive InferOps events for that workspace, so it can't watch for reviews.";
 
 /** Locations asked for per page: the most InferLab operations returns at once. */
 const PAGE_SIZE = 100;
@@ -37,7 +66,52 @@ export function failureOf(error: unknown): ReadFailure {
   return name !== undefined && KNOWN_FAILURES.has(name) ? name as ReadFailure : "Unexpected";
 }
 
+/** The hook InferOps' events reach: one alert per review requested, citing the event. */
+class ReviewHook extends RpcTarget {
+  readonly #attention: Attention | undefined;
+
+  constructor(attention: Attention | undefined) {
+    super();
+    this.#attention = attention;
+  }
+
+  async receiveEvent(event: ReviewEvent): Promise<void> {
+    if (!this.#attention) throw new Error("Attention is unavailable to this gadget.");
+    await this.#attention.raise({
+      v: 1,
+      sourceEventId: event.eventId,
+      reason: "review_requested",
+      target: event.location.ref,
+      audience: { kind: "permission-holders", workspaceId: event.workspaceId, permission: ALERT_PERMISSION },
+    });
+  }
+}
+
 export class Gadget extends DurableObject<GadgetEnv> {
+  /** Every delivery of the hook `watchReviews()` made comes back through here. */
+  async [restore](params: { type?: string }): Promise<ReviewHook> {
+    if (params?.type !== HOOK.type) throw new TypeError(`Unknown restore type: ${String(params?.type)}`);
+    return new ReviewHook(this.env.ATTENTION);
+  }
+
+  /**
+   * Makes this gadget's hook on the bound Project's events, once. It starts disabled: the person
+   * turns it on in Activity. A second call makes no second hook.
+   */
+  async watchReviews(): Promise<WatchState> {
+    const session = this.env.PROJECT;
+    if (!session) return { state: "notConnected", message: NOT_CONNECTED };
+    if (await this.ctx.storage.get(WATCHING_KEY)) return { state: "watching", created: false, message: WATCHING };
+    try {
+      await session.subscribe(await this.ctx.restore(HOOK));
+    } catch (error) {
+      const reason = failureOf(error);
+      return { state: "failed", message: reason === "Unexpected" ? NO_EVENTS : FAILURE_MESSAGES[reason] };
+    }
+    await this.ctx.storage.put(WATCHING_KEY, true);
+    return { state: "watching", created: true, message: WATCHING };
+  }
+
   /** The bound Project's Locations that are waiting for review, read now. */
   async getReviewAlerts(): Promise<ReviewAlerts> {
     const session = this.env.PROJECT;
@@ -74,8 +148,9 @@ export class Gadget extends DurableObject<GadgetEnv> {
   }
 
   /**
-   * How many keys this gadget has stored: always none, because Review Alerts keeps no copy of
-   * anything it reads. The instantiation proof reads it to show a fresh gadget starts empty.
+   * How many keys this gadget has stored: none of what it reads, because Review Alerts keeps no
+   * copy of InferOps; only the marker that its hook was made, once `watchReviews()` made it. The
+   * instantiation proof reads it to show a fresh gadget starts empty.
    */
   async storedKeyCount(): Promise<number> {
     return (await this.ctx.storage.list()).size;

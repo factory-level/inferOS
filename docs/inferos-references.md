@@ -65,12 +65,20 @@ Project that are waiting for review. Like every bundled blueprint it is installe
   `requested`. Unbound, it answers "Not connected: connect an InferLab operations Project", never
   an empty list. A refusal is named (`NotFound`, `Forbidden`, `ConnectionExpired`, ...) with a
   message of its own, never the error's text.
+- **Watching for reviews** (FAC-239). "Watch for reviews" calls `watchReviews()`, which subscribes
+  one persistent hook to the Project's committed events (`PROJECT.subscribe`, restored through the
+  gadget's `[restore]`) and stores only that it did, so a second watch makes no second hook. The
+  hook starts disabled; the person turns it on in Activity or on the gadget's Connections tab. Each
+  review requested then raises attention (`env.ATTENTION.raise`): InferOps' event id as the source,
+  the Location as the target, and the holders of `location:write` in the event's workspace as the
+  audience. The server module exports only entrypoints (workerd starts no gadget worker that
+  exports any other value).
 - **The client** draws loading, not connected, failed, empty ("No Locations are waiting for
   review") and the list, as text only.
 - **Fresh instantiation** is proved in
   `packages/integration-tests/__tests__/review-alerts-instantiation.test.ts`: each install is a new
   workspace, bound only to the connection that install made on the installer's own account, with
-  no hook, an empty store, and `upstream` naming the blueprint and its release.
+  no hook (until someone watches), an empty store, and `upstream` naming the blueprint and its release.
 - The kernel does not check an assignment's vendor against a binding's `gatekeeperName`
   (`AuthenticatedApi.newWorkspaceFromBlueprint`), so the picker is what keeps `PROJECT` an InferLab
   operations connection.

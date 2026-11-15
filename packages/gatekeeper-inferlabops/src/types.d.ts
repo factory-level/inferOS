@@ -129,6 +129,11 @@ export interface ProjectEvent {
   type: ProjectEventType;
   /** When it was committed (ISO 8601, UTC). */
   occurredAt: string;
+  /**
+   * The InferOps workspace it was committed in: the audience workspace to raise attention for
+   * (`env.ATTENTION.raise({audience: {workspaceId, ...}})`).
+   */
+  workspaceId: string;
   /** The Location, read when the event arrived, as the connected person sees it. */
   location: Location;
   /** The Location's revision the change produced. The Location as read may be newer. */

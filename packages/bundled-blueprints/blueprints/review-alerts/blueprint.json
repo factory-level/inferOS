@@ -2,7 +2,7 @@
   "$comment": "FAC-232. The PROJECT binding names the InferLab operations gatekeeper (packages/gatekeeper-inferlabops, vendor id inferlabops). The installer picks their own connection and Project; nothing is bound until they do.",
   "blueprintId": "inferlab.review-alerts",
   "title": "Review Alerts",
-  "description": "Shows the Locations of one InferOps Project that are waiting for review.",
+  "description": "Shows the Locations of one InferOps Project that are waiting for review, and can alert you on Home when a new review is requested.",
   "output": {
     "id": "review-alerts",
     "noun": "Review Alerts",
