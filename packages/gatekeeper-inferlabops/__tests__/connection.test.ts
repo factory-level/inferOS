@@ -230,6 +230,66 @@ describe("configuration", () => {
 });
 
 // ── Connecting: explicit, separate from sign-in, company-bound ─────────────────────────────────
+// ── Callback tampering (FAC-235 live QA): only the exact state of a live attempt completes ──────
+describe("callback state tampering", () => {
+  /** An attempt sent to InferLab but not yet returned: its genuine state, and the parts of it. */
+  async function begun(who: Who) {
+    const attemptId = env.CONNECT_ATTEMPT.newUniqueId().toString();
+    const nonce = (++counter).toString(16).padStart(64, "c");
+    const label = `${who}-${counter}`;
+    await hooks().startAttempt(attemptId, nonce, label);
+    const first = await get(`${BASE}/${attemptId}/${nonce}`);
+    expect(first.status).toBe(302);
+    const state = new URL(first.headers.get("location")!).searchParams.get("state")!;
+    const [id, oauthNonce] = state.split(".") as [string, string];
+    return { label, state, id, oauthNonce };
+  }
+  const callback = (state: string, who: Who = "owner") =>
+    get(`${BASE}/oauth?code=code-${who}&state=${encodeURIComponent(state)}`);
+  const flip = (hex: string, at: number) =>
+    hex.slice(0, at) + (hex[at] === "0" ? "1" : "0") + hex.slice(at + 1);
+  const exchanges = () => seen.filter(s => s.path === "/auth/token").length;
+
+  it("refuses every altered state with the invalid-link page, exchanges no code and connects no one", async () => {
+    const a = await begun("owner");
+    const other = await begun("owner");
+    const fresh = env.CONNECT_ATTEMPT.newUniqueId().toString();
+    const tampered: [string, string][] = [
+      ["one nonce digit changed", `${a.id}.${flip(a.oauthNonce, 10)}`],
+      ["the nonce's case changed", `${a.id}.${a.oauthNonce.toUpperCase()}`],
+      ["one attempt-id digit changed", `${flip(a.id, 5)}.${a.oauthNonce}`],
+      ["another live attempt's id", `${other.id}.${a.oauthNonce}`],
+      ["an unused but valid attempt id", `${fresh}.${a.oauthNonce}`],
+      ["another live attempt's nonce", `${a.id}.${other.oauthNonce}`],
+      ["the parts swapped", `${a.oauthNonce}.${a.id}`],
+      ["an extra segment", `${a.state}.00`],
+      ["no nonce", `${a.id}.`],
+      ["no attempt id", `.${a.oauthNonce}`],
+      ["empty", ""],
+      ["the nonce truncated", `${a.id}.${a.oauthNonce.slice(0, 63)}`],
+      ["the nonce padded", `${a.id}.${a.oauthNonce}0`],
+    ];
+    for (const [name, state] of tampered) {
+      const res = await callback(state);
+      expect(res.status, name).toBe(400);
+      expect(await res.text(), name).toContain("link");
+    }
+    expect(exchanges()).toBe(0);
+    expect(await hooks().received(a.label)).toBeNull();
+    expect(await hooks().received(other.label)).toBeNull();
+
+    // Nothing tampered burned the real attempts: each genuine state still completes, once.
+    expect((await callback(a.state)).status).toBe(200);
+    expect(await hooks().received(a.label)).not.toBeNull();
+    expect((await callback(other.state)).status).toBe(200);
+    expect(await hooks().received(other.label)).not.toBeNull();
+    expect(exchanges()).toBe(2);
+    // A replay of a spent state is refused like any other.
+    expect((await callback(a.state)).status).toBe(400);
+    expect(exchanges()).toBe(2);
+  });
+});
+
 describe("connecting", () => {
   it("is never a sign-in: a connect asking for auth scopes is refused", async () => {
     expect(await hooks().vendorConnect("auth")).toMatch(/doesn't sign you in/);
