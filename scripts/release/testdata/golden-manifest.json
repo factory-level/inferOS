@@ -660,6 +660,12 @@
             "ProjectGatekeeper"
           ],
           "tag": "v1"
+        },
+        {
+          "new_sqlite_classes": [
+            "ProjectEventDriver"
+          ],
+          "tag": "v2"
         }
       ],
       "modules": [

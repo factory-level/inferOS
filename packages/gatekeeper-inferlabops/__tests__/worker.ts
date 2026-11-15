@@ -3,24 +3,28 @@
 // WorkerEntrypoint exports are not registered in `ctx.exports` (see gatekeeper-inferlab's test
 // worker), so the entrypoints are re-exported as undecorated subclasses with the same behaviour.
 
-import { DurableObject, RpcStub, RpcTarget, WorkerEntrypoint } from "cloudflare:workers";
+import { DurableObject, RpcStub, RpcTarget, WorkerEntrypoint, restore } from "cloudflare:workers";
 import type {
   ActionDescription, ApprovalQueue, ConnectHandoff, GatekeeperConnectCallback, GatekeeperSubject,
-  GatekeeperUser, GatekeeperUserVerifier, ObservationDescription,
+  GatekeeperUser, GatekeeperUserVerifier, HookController, HookDescription, ObservationDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
 import {
   GatekeeperVendor as RealVendor, InferLabAttentionAuthority as RealAttention,
-  OperationsUser as RealUser, OperationsVerifier as RealVerifier, type ProjectGatekeeper,
+  OperationsUser as RealUser, OperationsVerifier as RealVerifier, ProjectGatekeeper,
+  ProjectEventHookController as RealEventController,
 } from "../src/worker.js";
+import type { StoredEvent } from "../src/events.js";
+import type { ProjectEvent } from "../src/types.js";
 import { subjectIndexName } from "../src/account.js";
 
 export { default } from "../src/worker.js";
-export { ConnectAttempt, OperationsAccount, ProjectGatekeeper, SubjectIndex } from "../src/worker.js";
+export { ConnectAttempt, OperationsAccount, ProjectEventDriver, ProjectGatekeeper, SubjectIndex } from "../src/worker.js";
 
 export class GatekeeperVendor extends RealVendor {}
 export class OperationsUser extends RealUser {}
 export class OperationsVerifier extends RealVerifier {}
 export class InferLabAttentionAuthority extends RealAttention {}
+export class ProjectEventHookController extends RealEventController {}
 
 /** The accounts the fake Workshop received, by attempt label: their account ids. */
 const received = new Map<string, string>();
@@ -48,8 +52,15 @@ export type QueueLog = {
 };
 
 class FakeQueue extends RpcTarget {
-  constructor(readonly log: QueueLog) {
+  constructor(readonly log: QueueLog, readonly storage?: DurableObjectStorage) {
     super();
+  }
+
+  /** As the Workshop's: keeps the controller; the hook stays disabled until a test enables it. */
+  async bindHook(controller: unknown, _callback: unknown, description: HookDescription): Promise<void> {
+    if (!this.storage) throw new Error("this queue binds no hooks");
+    this.storage.kv.put("hookController", controller);
+    this.storage.kv.put("hookDescription", description);
   }
 
   async authorizeObservation(description: ObservationDescription): Promise<void> {
@@ -230,4 +241,171 @@ export class TestHooks extends DurableObject<Cloudflare.Env> {
     const raw = received.get(label);
     return raw ? JSON.parse(raw) as GatekeeperSubject : null;
   }
+
+  // ── Hooks (FAC-236), with this object standing in for the Overseer ───────────────────────────
+  //
+  // One hook at a time: subscribing through a session stores the controller it binds; enabling
+  // hands it an initiator whose firings reach `startHook()` here, delivering to a RecordingHook.
+
+  #hook: HookState = { received: [], observations: [], refuse: false, failures: 0, slowMs: 0 };
+
+  /** Subscribe through `key`'s session, with its facet's ctx.restore() routed back here. */
+  async subscribe(key: string): Promise<{ description?: HookDescription; error?: string }> {
+    const facet = this.ctx.facets.get<ProjectGatekeeper>(`gk-${key}`, () => { throw new Error("no facet"); });
+    await (facet as unknown as HookFacet).testRestoreThrough(this.ctx.id.toString(), key);
+    this.ctx.storage.kv.delete("hookController");
+    using queue = new RpcStub(new FakeQueue({ observations: [], actions: [] }, this.ctx.storage));
+    using session = await facet.startSession(queue as never) as unknown as { subscribe(h: unknown): Promise<void> } & Disposable;
+    using hook = new RpcStub(new RecordingHook(this.#hook));
+    try {
+      await session.subscribe(hook);
+      return { description: this.ctx.storage.kv.get<HookDescription>("hookDescription")! };
+    } catch (error) {
+      return { error: (error as Error).message };
+    }
+  }
+
+  async enableHook(): Promise<string | null> {
+    const initiator = (this.ctx.exports as unknown as HookExports).TestHookInitiator({ props: { hooks: this.ctx.id.toString() } });
+    try {
+      await this.#controller().enable(initiator as never, { workspaceId: "test-workspace" });
+      return null;
+    } catch (error) {
+      return (error as Error).message;
+    }
+  }
+
+  async disableHook(): Promise<void> {
+    await this.#controller().disable();
+  }
+
+  /** The Overseer's startHook(): refused for a disabled or deleted hook, as the Workshop's is. */
+  startHook() {
+    if (this.#hook.refuse) throw new Error("Hook is disabled or was deleted.");
+    if (this.#hook.failures > 0) {
+      this.#hook.failures--;
+      throw new Error("The test Workshop failed to start the firing.");
+    }
+    return { callback: new RecordingHook(this.#hook), approvalQueue: new RpcStub(new FiringQueue(this.#hook)) };
+  }
+
+  /** What a delivery stub the facet minted reaches: the facet's own `[restore]()` target. */
+  async deliverHook(key: string, callback: RpcStub<RpcTarget>, approvalQueue: RpcStub<RpcTarget>,
+                    event: StoredEvent): Promise<void> {
+    const facet = this.ctx.facets.get<ProjectGatekeeper>(`gk-${key}`, () => { throw new Error("no facet"); });
+    await (facet as unknown as HookFacet).testDeliver(callback, approvalQueue, event);
+  }
+
+  setHook(behavior: Partial<Pick<HookState, "refuse" | "failures" | "slowMs">>): void {
+    Object.assign(this.#hook, behavior);
+  }
+
+  readHook(): Pick<HookState, "received" | "observations"> {
+    return { received: this.#hook.received, observations: this.#hook.observations };
+  }
+
+  resetHook(): void {
+    this.#hook.received.length = 0;
+    this.#hook.observations.length = 0;
+    this.#hook.refuse = false;
+    this.#hook.failures = 0;
+    this.#hook.slowMs = 0;
+  }
+
+  #controller(): HookController<RpcTarget> {
+    const controller = this.ctx.storage.kv.get<HookController<RpcTarget>>("hookController");
+    if (!controller) throw new Error("No hook has been bound.");
+    return controller;
+  }
 }
+
+/** What the test hook and its firings recorded. */
+type HookState = {
+  received: { eventId: string; type: string; location: string; locationProject: string; revision: string;
+    projectRead: string }[];
+  observations: { title: string; subresources?: string[] }[];
+  /** Refuse every firing, as the Workshop does for a disabled or deleted hook. */
+  refuse: boolean;
+  /** Fail this many more firings, as a transient failure would. */
+  failures: number;
+  /** How long the hook takes to return. */
+  slowMs: number;
+};
+
+type HookExports = {
+  TestHooks: DurableObjectNamespace<TestHooks>;
+  TestHookInitiator(options: { props: { hooks: string } }): Fetcher<TestHookInitiator>;
+  TestHookDelivery(options: { props: { hooks: string; key: string } }): Fetcher<TestHookDelivery>;
+};
+
+const testHooks = (exports: Cloudflare.Exports, id: string) => {
+  const namespace = (exports as unknown as HookExports).TestHooks;
+  return namespace.get(namespace.idFromString(id));
+};
+
+/** The Overseer's HookInitiator: each firing reaches the TestHooks object that enabled the hook. */
+export class TestHookInitiator extends WorkerEntrypoint<Cloudflare.Env, { hooks: string }> {
+  startHook() {
+    return testHooks(this.ctx.exports, this.ctx.props.hooks).startHook();
+  }
+}
+
+/**
+ * Stands in for the stub the facet mints with ctx.restore(), which this pool cannot do (its
+ * Durable Object wrappers don't forward `[restore]`): it reaches the facet's real `[restore]`
+ * target through TestHooks.
+ */
+export class TestHookDelivery extends WorkerEntrypoint<Cloudflare.Env, { hooks: string; key: string }> {
+  deliver(callback: RpcStub<RpcTarget>, approvalQueue: RpcStub<RpcTarget>, event: StoredEvent) {
+    return testHooks(this.ctx.exports, this.ctx.props.hooks).deliverHook(this.ctx.props.key, callback, approvalQueue, event);
+  }
+}
+
+/** The approval queue of every firing: records what the deliveries observed. */
+class FiringQueue extends RpcTarget {
+  constructor(private readonly state: HookState) {
+    super();
+  }
+
+  async authorizeObservation(observation: { title: string; subresources?: string[] }): Promise<void> {
+    this.state.observations.push({ title: observation.title, subresources: observation.subresources });
+  }
+
+  async submitAction(): Promise<void> {}
+}
+
+/** A Gadget's hook: records each event, and reads the Project back through the session it was given. */
+class RecordingHook extends RpcTarget {
+  constructor(private readonly state: HookState) {
+    super();
+  }
+
+  async receiveEvent(event: ProjectEvent): Promise<void> {
+    if (this.state.slowMs > 0) await new Promise(resolve => setTimeout(resolve, this.state.slowMs));
+    const project = await event.project.getProject();
+    this.state.received.push({
+      eventId: event.eventId, type: event.type, location: event.location.name,
+      locationProject: event.location.project.id, revision: event.revision, projectRead: project.key,
+    });
+  }
+}
+
+type HookFacet = {
+  testRestoreThrough(hooks: string, key: string): Promise<void>;
+  testDeliver(callback: RpcStub<RpcTarget>, queue: RpcStub<RpcTarget>, event: StoredEvent): Promise<void>;
+};
+const facetPrototype = ProjectGatekeeper.prototype as unknown as HookFacet & { [restore](p: unknown): {
+  deliver(c: unknown, q: unknown, e: unknown): Promise<void> } };
+
+/** Make this facet's ctx.restore() mint TestHookDelivery stubs that route back to `[restore]`. */
+facetPrototype.testRestoreThrough = async function(hooks, key) {
+  const { ctx } = this as unknown as { ctx: DurableObjectState };
+  const exports = ctx.exports as unknown as HookExports;
+  (ctx as unknown as { restore: unknown }).restore = async () => Object.assign(
+    exports.TestHookDelivery({ props: { hooks, key } }), { [Symbol.dispose]() {} });
+};
+
+/** Deliver through the target the facet's `[restore]()` returns for a hook's delivery stub. */
+facetPrototype.testDeliver = function(callback, queue, event) {
+  return (this as unknown as typeof facetPrototype)[restore]({ kind: "project-events" }).deliver(callback, queue, event);
+};
