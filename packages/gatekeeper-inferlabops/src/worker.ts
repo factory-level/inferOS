@@ -18,7 +18,7 @@
 // Ported in part from the archived fork (archive/main-2026-11-14, 24f5d885) and from
 // gatekeeper-inferlab (FAC-214); README.md is the ledger of what was taken and what was left.
 
-import { DurableObject, RpcStub, RpcTarget, WorkerEntrypoint } from "cloudflare:workers";
+import { DurableObject, RpcStub, RpcTarget, WorkerEntrypoint, restore } from "cloudflare:workers";
 import { skipRpcValidation, validateRpc } from "capnweb-validate";
 import { advanceToOAuth, claimOAuth, putInitiation } from "@gadgets/gatekeeper-kit/connect-handshake";
 import {
@@ -39,16 +39,21 @@ import type {
   ResourceDescription, SupportedResource, VendorDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
 import { type CallCredentials, OperationsAccount, SubjectIndex, VENDOR_ID, isDefiniteNo, subjectIndexName } from "./account";
-import { type OperationsConfig, readConfig, redirectUriFor } from "./config";
+import { DESTINATION_KEY, EVENTS_PATH, GATEKEEPER_PATH, type OperationsConfig, readConfig, receivesEventsFor, redirectUriFor } from "./config";
+import {
+  EVENTS_NOT_CONFIGURED, EVENT_TYPES, type ProjectEventDelivery, type ProjectEventHookTarget, type StoredEvent,
+  eventHookDescription, forgetEventHooks, handleEventDelivery,
+} from "./events";
 import {
   ConnectFailure, INFERLAB_CLIENT_ID, InferOpsApiError, type LocationRecord, OTHER_COMPANY, type ProjectRecord,
   apiRequest, exchangeCode, locationOf, locationPageOf, logout, projectOf,
 } from "./inferops-api";
-import type { Location, LocationPage, Project, ProjectSession } from "./types";
+import type { Location, LocationPage, Project, ProjectEvent, ProjectSession } from "./types";
 import PROJECT_CONFIGURATOR_HTML from "./generated/project-configurator-ui.txt";
 import TYPES_CODE from "./types.txt";
 
 export { OperationsAccount, SubjectIndex };
+export { ProjectEventDriver, ProjectEventHookController } from "./events";
 
 const logger = createLogger<{ vendorId: string }>({ component: "gatekeeper.inferlabops", vendorId: VENDOR_ID });
 
@@ -295,7 +300,12 @@ export class OperationsUser extends WorkerEntrypoint<Cloudflare.Env, UserProps> 
   }
 
   async revoke(): Promise<void> {
-    await accountStub(this.ctx, this.ctx.props.accountId).revoke();
+    // Its hooks go too (FAC-236), whatever signing out does: a disconnected connection delivers nothing.
+    try {
+      await forgetEventHooks(this.ctx.exports, this.ctx.props.accountId);
+    } finally {
+      await accountStub(this.ctx, this.ctx.props.accountId).revoke();
+    }
   }
 
   async reconnect(): Promise<{ url: string }> {
@@ -433,6 +443,7 @@ export class ProjectGatekeeper extends DurableObject<Cloudflare.Env, ProjectProp
       snippet: `Project ${p.projectId} in ${p.workspaceSlug}`,
       suggestedBindingName: "INFEROPS_PROJECT",
       tsType: "ProjectSession",
+      hookTsType: "ProjectEventHook",
     };
   }
 
@@ -448,12 +459,41 @@ export class ProjectGatekeeper extends DurableObject<Cloudflare.Env, ProjectProp
   async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<ProjectSession> {
     // The session reaches InferOps only through these closures: none of them is an RPC method of
     // this facet, so nothing holding the facet stub can make an arbitrary InferOps call.
-    return new ProjectSessionImpl(approvalQueue.dup(), {
+    return new ProjectSessionImpl(approvalQueue.dup(), this.#access());
+  }
+
+  /** The closures a session or a hook delivery reaches InferOps through. */
+  #access(): FacetAccess {
+    return {
       props: this.ctx.props,
       call: (path, parse, options) => this.#call(path, parse, options),
       pendingReviews: () => this.#pendingReviews(),
       queueReview: (locationId, expectedRevision) => this.#queueReview(locationId, expectedRevision),
-    });
+      subscribe: (queue, hook) => this.#subscribe(queue, hook),
+    };
+  }
+
+  /**
+   * Bind a hook on this Project's events (FAC-236): through the Workshop, which keeps it disabled
+   * until the user enables it. Its scope is this binding's, carried by the controller's props.
+   */
+  async #subscribe(queue: RpcStub<ApprovalQueue>, hook: RpcStub<ProjectEventHookTarget>): Promise<void> {
+    const p = this.ctx.props;
+    if (!receivesEventsFor(this.env, p.workspaceId)) throw new Error(EVENTS_NOT_CONFIGURED);
+    // Refuses before the user is asked if the person can't read the Project now.
+    await this.#call(`/project/projects/${p.projectId}`, projectOf);
+    using delivery: RpcStub<ProjectEventDelivery> = await this.ctx.restore({ kind: "project-events" });
+    const controller = this.ctx.exports.ProjectEventHookController({ props: {
+      key: crypto.randomUUID(), accountId: p.accountId, tenantId: p.tenantId, workspaceId: p.workspaceId,
+      projectId: p.projectId, types: [...EVENT_TYPES], delivery,
+    } });
+    // @ts-expect-error Workers widens the controller's hook type across bindHook RPC.
+    await queue.bindHook(controller, hook, eventHookDescription(p.projectId));
+  }
+
+  /** The target of a hook's delivery stub, minted by `#subscribe`. */
+  [restore](_params: { kind: "project-events" }): ProjectEventDelivery {
+    return new ProjectEventDeliveryImpl(this.#access());
   }
 
   /** One InferOps call with the person's own, current token. */
@@ -551,6 +591,7 @@ type FacetAccess = {
           options?: { method?: "GET" | "POST"; idempotencyKey?: string; body?: unknown }): Promise<T>;
   pendingReviews(): Map<string, PendingReview>;
   queueReview(locationId: string, expectedRevision: string): number;
+  subscribe(queue: RpcStub<ApprovalQueue>, hook: RpcStub<ProjectEventHookTarget>): Promise<void>;
 };
 
 /** What a read reports: required, so no observation can leave its subresources out. */
@@ -648,6 +689,58 @@ class ProjectSessionImpl extends RpcTarget implements ProjectSession {
       // location:write and location:read itself.
       autoApprovable: true,
     });
+  }
+
+  async subscribe(hook: RpcStub<ProjectEventHookTarget>): Promise<void> {
+    await this.#gk.subscribe(this.#queue, hook);
+  }
+}
+
+/** What a delivery drops instead of disclosing: the person can't read it now, or isn't connected. */
+const UNDISCLOSED = new Set(["NotFound", "Forbidden", "ConnectionExpired"]);
+
+/**
+ * A hook's delivery (FAC-236): the binding's facet, which hands an event to one firing only if it
+ * is this binding's company and workspace, the Location is this Project's, and the connected person
+ * can read it now with their own token. The firing's approval queue authorizes the observation
+ * and backs the Project session the hook receives.
+ */
+@validateRpc()
+class ProjectEventDeliveryImpl extends RpcTarget implements ProjectEventDelivery {
+  readonly #gk: FacetAccess;
+
+  constructor(gk: FacetAccess) {
+    super();
+    this.#gk = gk;
+  }
+
+  async deliver(callback: RpcStub<ProjectEventHookTarget>, approvalQueue: RpcStub<ApprovalQueue>,
+                event: StoredEvent): Promise<void> {
+    const p = this.#gk.props;
+    if (event.tenantId !== p.tenantId || event.workspaceId !== p.workspaceId) return;
+    let location: LocationRecord;
+    try {
+      // Admission now, as the person: never the platform's delivery, never an earlier read.
+      location = await this.#gk.call(`/project/locations/${event.locationId}`, locationOf);
+    } catch (error) {
+      if (UNDISCLOSED.has((error as Error).name)) return;
+      throw error;
+    }
+    if (location.project.id !== p.projectId) return;
+    await approvalQueue.authorizeObservation({
+      title: "Received an InferOps event",
+      description: `A review was requested for Location ${location.name}.`,
+      containsRestrictedData: true,
+      subresources: [projectSubresource(p), locationSubresource(p, location.ref.id)],
+    });
+    // Owns its queue: released when receiveEvent() returns.
+    using project = new ProjectSessionImpl(approvalQueue.dup(), this.#gk);
+    const pending = this.#gk.pendingReviews().has(location.ref.id);
+    await callback.receiveEvent({
+      eventId: event.eventId, type: event.type, occurredAt: event.occurredAt,
+      location: pending ? { ...location, review: { status: "requested" } } : location,
+      revision: event.revision, project,
+    } satisfies ProjectEvent);
   }
 }
 
@@ -804,6 +897,15 @@ export default {
    * `/authorize`, and `/oauth` is the exact redirect URI InferOps registered.
    */
   async fetch(request: Request, env: Cloudflare.Env, ctx: ExecutionContext): Promise<Response> {
+    // InferOps' committed events (FAC-236): `POST <BASE_URL>/events/<key>`, signed, no browser.
+    const events = new URL(request.url).pathname.split("/");
+    const eventsPrefix = `${GATEKEEPER_PATH}/${EVENTS_PATH}`.split("/");
+    if (events.length === eventsPrefix.length + 1 && eventsPrefix.every((segment, i) => events[i] === segment)) {
+      const key = events.at(-1)!;
+      if (request.method !== "POST") return new Response(null, { status: 405, headers: { allow: "POST" } });
+      if (!DESTINATION_KEY.test(key)) return new Response(null, { status: 404 });
+      return handleEventDelivery(request, env, ctx.exports, key);
+    }
     const config = readConfig(env);
     if ("off" in config) {
       return htmlResponse(errorPageHtml("InferLab operations is not configured", config.off), 503);

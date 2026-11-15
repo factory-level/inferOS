@@ -24,6 +24,7 @@ export default defineConfig({
           OPERATIONS_ACCOUNT: { className: "OperationsAccount", useSQLite: true },
           SUBJECT_INDEX: { className: "SubjectIndex", useSQLite: true },
           PROJECT_GATEKEEPER: { className: "ProjectGatekeeper", useSQLite: true },
+          PROJECT_EVENT_DRIVER: { className: "ProjectEventDriver", useSQLite: true },
           // The Project facet reads `ctx.props`, reachable only through `ctx.facets`, so tests drive
           // it from TestHooks, as the overseer does in production.
           TEST_HOOKS: { className: "TestHooks", useSQLite: true },
@@ -32,6 +33,11 @@ export default defineConfig({
           INFERLAB_AUTH_ORIGIN: "http://localhost:23380",
           INFEROPS_COMPANY: "00000000-0000-4000-8000-000000000001",
           BASE_URL: "http://localhost:8787/gatekeeper/inferlabops",
+          // One event destination for the Field Ops workspace (a test secret, not a real one).
+          INFERLAB_EVENT_DESTINATIONS: JSON.stringify([{
+            key: "inferos-field-ops", workspaceId: "00000000-0000-4000-8000-000000000011",
+            secret: "test-secret-0123456789abcdef0123456789abcdef",
+          }]),
         },
       },
     }),

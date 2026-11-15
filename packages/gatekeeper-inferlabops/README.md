@@ -43,11 +43,33 @@ Signing in to InferOS is `gatekeeper-inferlab` (FAC-214). Sign-in grants nothing
 - **`verifyEvent(workspace, intent)`:** whether `intent.sourceEventId` is an event InferOps really committed, read with the workspace owner's own connection (`GET /project/locations/<id>/events/<eventId>`, inferops#2686). True only when it exists and matches the intent: its resource is the target, its type is the one for the reason (`review_requested` is `project.location.review_requested`), its workspace is the audience's and its company is this deployment's. Not found, any mismatch, an owner with no connection or no grant: false.
 - **Indeterminate answers throw**, so nothing is delivered on a guess.
 
+## Events and hooks (FAC-236)
+
+InferOps' committed events reach Gadget server code through the Workshop's own Hook machinery, as every push-driven gatekeeper's do (`ApprovalQueue.bindHook`, `HookController`, `HookInitiator`, and the kit's `HookRegistry`, after `gatekeeper-pagerduty`).
+
+- **Ingress:** `POST <BASE_URL>/events/<key>` (`src/events.ts`). InferOps' dispatch (FAC-234) delivers each committed event there, signed, to each destination of the event's workspace. No browser is involved. In order, each failure refused:
+
+  | Check | Refusal |
+  | --- | --- |
+  | `<key>` is a configured destination; its own secret checks the signature | 404 |
+  | The body is at most 16 KiB (`MAX_EVENT_BYTES`) | 413 |
+  | `x-inferlab-signature` `t=…,v1=…` is HMAC-SHA256 of `<t>.` and the **raw bytes**, compared in constant time, `t` within 300 s of now. Nothing is parsed before this | 401 |
+  | The body is UTF-8 JSON: FAC-234's envelope `{v: 1, issuer, destination, tenantId, workspaceId, event}`, and the event is `inferlab.committed-event` v1, checked with the pinned schema's own patterns; `x-inferlab-delivery` is its `eventId`; the resource is a Location | 400 |
+  | The scope is the destination's: `issuer` is `INFERLAB_AUTH_ORIGIN`, `destination` is `<key>`, the company is `INFEROPS_COMPANY`, and the workspace (envelope and event) is the destination's one workspace | 403 |
+
+- **Checkpoint and acknowledgement.** The deployment's one `ProjectEventDriver` records the event in one transaction: a checkpoint on its `eventId` (`seen:`, kept 7 days) and one queued delivery per enabled hook that may watch it. Only then does the ingress answer **202** `{accepted, duplicate}`. It doesn't wait for any hook: the kit's queue delivers from the driver's alarm and retries. The same `eventId` again (InferOps retries a timeout with the same id) answers 202 `duplicate: true` and queues nothing, so a hook fires once. Storage is durable, so a restart before delivery still delivers, once.
+- **Subscribing.** A Gadget calls `ProjectSession.subscribe(hook)` with a persistent stub (`types.d.ts`). The facet checks that a destination serves this binding's workspace and that the person can read the Project now. It mints a delivery stub to itself (`ctx.restore`) and binds a `ProjectEventHookController`, whose props carry the binding's company, workspace and Project. The Workshop keeps the hook **disabled until the user enables it**. On enable, the controller registers it with the driver.
+- **Delivery.** A hook watches only its own binding's company and workspace (`watches`). The event's own fields only select among hooks whose binding already has them. Each firing goes through the Workshop's `startHook()`, which refuses a disabled or deleted hook. The binding's facet (`ProjectEventDeliveryImpl`) then re-reads the Location **with the connected person's own token, now**:
+  - a Location they can't read (403/404), an expired or revoked connection, or another Project's Location is dropped, disclosing nothing;
+  - otherwise the firing observes the Project and the Location, and `receiveEvent` gets the event id, type, time, revision, the Location as read, and a `ProjectSession` backed by the firing's approval queue.
+- **Raising attention.** The hook runs as the Gadget's own code, so it may raise attention with `env.ATTENTION` (FAC-237), citing `event.eventId` as the source event (see `docs/attention.md`).
+- **Disabling and disconnecting.** Disabling a hook removes it and its queued deliveries. Disconnecting (`revoke`) drops every hook of that connection and refuses enabling one again.
+
 ## Sign-out and revocation
 
 | What | Effect |
 | --- | --- |
-| Disconnect in the Workshop (`revoke`) | Deletes every token at once, then always tries both: signing this connection's own InferLab session out (`POST /auth/logout` with its refresh token), and forgetting the connection for the attention authority. A step that fails is reported, both if both fail; the tokens are gone either way, so the next read fails. |
+| Disconnect in the Workshop (`revoke`) | Drops the connection's event hooks (FAC-236). Deletes every token at once, then always tries both: signing this connection's own InferLab session out (`POST /auth/logout` with its refresh token), and forgetting the connection for the attention authority. A step that fails is reported, both if both fail; the tokens are gone either way, so the next read fails. |
 | An InferOps grant revoked | The next call is refused by InferOps (`Forbidden`/`NotFound`). A collaborator who lost access is no longer admitted. |
 | InferLab "sign out everywhere", or the session expiring | The next refresh is refused. Reads answer `ConnectionExpired` and the Workshop asks for a reconnect. |
 
@@ -58,8 +80,9 @@ Reconnecting is "disconnect, then connect again". There is no staged reconnect i
 - `INFERLAB_AUTH_ORIGIN`: required. The central-auth origin, which also serves the InferOps API.
 - `INFEROPS_COMPANY`: required. The one company's tenant id.
 - `BASE_URL`: set by the dev server and the deployer. It must end in `/gatekeeper/inferlabops`.
+- `INFERLAB_EVENT_DESTINATIONS` (FAC-236): a secret. A JSON array of `{key, workspaceId, secret}`, the same key, workspace and secret as the InferOps callback destination that delivers to `<BASE_URL>/events/<key>`. The key follows the contract's rule, the workspace is a tenant id, and the secret is at least 32 characters. Anything malformed turns every destination off. Unset: no event is accepted and no hook can be subscribed.
 
-Each setting fails closed with a reason that names it. There is no default origin or company, no demo company and no password path. `scripts/run-dev-server.ts` passes the first two through.
+Each setting fails closed with a reason that names it. There is no default origin or company, no demo company and no password path. `scripts/run-dev-server.ts` passes the first two and `INFERLAB_EVENT_DESTINATIONS` through.
 
 ## Port ledger
 
@@ -88,4 +111,9 @@ The donor is the archived fork at `archive/main-2026-11-14` (`24f5d885`), specif
 - the review action (simulation, idempotency, stale revision, rejection);
 - observers (own connection, revoked, outage, foreign ids);
 - revoke and expiry;
-- the attention authority, including a revoked recipient, and `verifyEvent` on every match point.
+- the attention authority, including a revoked recipient, and `verifyEvent` on every match point;
+- events and hooks (FAC-236):
+  - the contract's patterns against the pinned schema, its valid and invalid fixtures, and the destinations setting;
+  - every ingress refusal: forged, altered, stale and future signatures; unsigned and forged bodies however malformed; an unknown key, an oversized body, non-JSON, non-UTF-8, and schema- or scope-invalid but signed bodies. None records a checkpoint;
+  - a duplicate acknowledged without a second fire;
+  - the hook lifecycle: disabled by default, enable, a revoked grant, another Project's Location, a disabled and a deleted hook, a restart before delivery, a slow hook not delaying the acknowledgement, and a disconnect.
