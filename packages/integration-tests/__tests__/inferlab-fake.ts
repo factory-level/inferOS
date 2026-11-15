@@ -5,6 +5,7 @@
 // Location, and grants the test can revoke.
 
 import { createHmac } from "node:crypto";
+import { existsSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { RpcStub } from "capnweb";
@@ -37,11 +38,26 @@ export const signInGatekeeper = (): GatekeeperSpec => ({
   patch: config => { config.vars = { ...config.vars, ...shared, BASE_URL: SIGN_IN_BASE }; },
 });
 
-/** InferLab operations (FAC-235/236), with one event destination for the workspace. */
-export const operationsGatekeeper = (): GatekeeperSpec => ({
+/**
+ * InferLab operations (FAC-235/236), with one event destination for the workspace. Prebuilt rather
+ * than built by the harness, as gatekeeper-github is: its validated tree imports the generated
+ * configurator UI, which `build:integration-worker` produces (`test:prebuild`).
+ */
+export function operationsGatekeeper(): GatekeeperSpec {
+  const dir = resolve(PACKAGES, "gatekeeper-inferlabops");
+  const entry = resolve(dir, ".wrangler/validate/src/worker.ts");
+  if (!existsSync(entry)) {
+    throw new Error(`No validated InferLab operations gatekeeper at ${entry}: run ` +
+      "`vp run -F @gadgets/gatekeeper-inferlabops build:integration-worker` first.");
+  }
+  return operationsSpec(dir);
+}
+
+const operationsSpec = (dir: string): GatekeeperSpec => ({
   binding: "INFERLABOPS",
-  dir: resolve(PACKAGES, "gatekeeper-inferlabops"),
+  dir,
   patch: config => {
+    delete config.build;
     config.vars = {
       ...config.vars, ...shared, BASE_URL: OPS_BASE,
       INFERLAB_EVENT_DESTINATIONS: JSON.stringify([{ key: DESTINATION, workspaceId: WS, secret: SECRET }]),
