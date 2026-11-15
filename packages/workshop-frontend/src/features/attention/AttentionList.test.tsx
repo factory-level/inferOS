@@ -8,7 +8,7 @@ import type { AttentionItem, AuthenticatedApi } from "@gadgets/workshop-shared/a
 import { AttentionList } from "./AttentionList";
 import { AttentionSummary } from "./AttentionSummary";
 
-const mock = vi.hoisted(() => ({ goTo: vi.fn<(url: string) => void>(), toast: vi.fn() }));
+const mock = vi.hoisted(() => ({ goTo: vi.fn<(url: string) => void>(), toast: vi.fn<(toast: unknown) => void>() }));
 vi.mock("./goToInferWork", () => ({ goToInferWork: mock.goTo }));
 vi.mock("@cloudflare/kumo", async original => ({
   ...await original<typeof import("@cloudflare/kumo")>(),
