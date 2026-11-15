@@ -594,6 +594,8 @@ for (const gk of gatekeepers) {
     "DISABLE_PASSWORD_AUTH", "AUTH_GATEKEEPERS", "ENABLE_CLOUDFLARE_LIMITS", "PUBLIC_BASE_URL",
     // The issuer each subject-keyed sign-in gatekeeper may sign people in for (FAC-214).
     "AUTH_GATEKEEPER_ISSUERS",
+    // The InferWork origins attention items open at (FAC-238).
+    "INFERWORK_ORIGINS",
     "DAILY_LLM_CALL_LIMIT", "MINIMUM_CLOUDFLARE_BALANCE",
     // Platform AI Gateway — makes the cross-provider model catalog available. CF_AI_GATEWAY
     // always needs CF_AI_GATEWAY_ACCOUNT_ID plus one transport: the WORKERS_AI binding
