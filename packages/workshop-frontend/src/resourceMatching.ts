@@ -154,13 +154,14 @@ export function matchesResourceText(search: string, resource: SupportedResource)
 }
 
 /**
- * Normalize a resource URL for sending to the backend. Prepends https:// if no protocol
+ * Normalize a resource URL for sending to the backend. Prepends https:// if no scheme
  * is present, and strips a trailing /* wildcard (which is just "everything under here").
+ * A URL that already names a scheme, such as `inferops://…`, keeps it.
  */
 export function normalizeResourceUrl(url: string): string {
   let normalized = url.trim()
-  // Default to https:// if no protocol specified.
-  if (normalized && !/^https?:\/\//i.test(normalized)) {
+  // Default to https:// only when no scheme is given at all.
+  if (normalized && !/^[a-z][a-z0-9+.-]*:\/\//i.test(normalized)) {
     normalized = 'https://' + normalized
   }
   // Strip trailing /* wildcard — it's not meaningful for the backend.

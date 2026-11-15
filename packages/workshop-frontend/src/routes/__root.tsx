@@ -38,6 +38,9 @@ function RootComponent() {
   // Routes that don't require auth (public routes)
   const isSignup = pathname === '/signup'
   const isBlueprint = pathname.startsWith('/blueprint/')
+  // /open/gadget and /open/blueprint redirect a valid address before anything renders, so what
+  // renders here is only their refusal, which needs no sign-in to read.
+  const isOpenReference = pathname === '/open/gadget' || pathname === '/open/blueprint'
   // The connect / sign-in handoff popup needs no shell and must not wait on auth: a sign-in popup
   // has no session, and ConnectHandoffPage runs its own useAuth for connects.
   const isHandoff = pathname === HANDOFF_PATH
@@ -45,7 +48,8 @@ function RootComponent() {
   // A standalone (no app shell) render is used for the handoff popup and for signed-out visitors
   // of public routes. Signed-in users get the full app chrome so public pages (esp. the blueprint
   // detail) feel native — sidebar and all — instead of floating on a bare page.
-  const standalone = isSignup || isHandoff || (isBlueprint && !isAuthenticated)
+  const standalone = isSignup || isHandoff ||
+    ((isBlueprint || isOpenReference) && !isAuthenticated)
 
   // The workspace editor renders fullscreen (no app chrome). /gadget/ is the legacy URL, kept
   // here so the chrome doesn't flash in during the redirect to /workspace/.

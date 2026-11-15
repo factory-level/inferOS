@@ -1,0 +1,8 @@
+# Read by Workers Static Assets wherever this build is served: the router's ASSETS binding when
+# deployed, and the backend's assets in `pnpm run-local`. InferOS may be framed only by itself
+# (FAC-232): its pages never render inside another origin. Gadget, configurator and gatekeeper app
+# frames are srcdoc frames of the shell, which these headers do not touch. Keep in step with
+# FRAME_POLICY_HEADERS in packages/router/src/frame-policy.ts (its test reads this file).
+/*
+  Content-Security-Policy: frame-ancestors 'self'
+  X-Frame-Options: SAMEORIGIN

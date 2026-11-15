@@ -8,6 +8,8 @@
 // The same worker doubles as the dev router (`pnpm dev-server` at the repo root): dev has no
 // `ASSETS` binding, so frontend requests fall through to the backend instead.
 
+import { withFramePolicy } from "./frame-policy";
+
 // gatekeeper-email's entrypoint: a WorkerEntrypoint whose optional email() handler is present.
 type EmailEntrypoint = CloudflareWorkersModule.WorkerEntrypoint &
     Required<Pick<CloudflareWorkersModule.WorkerEntrypoint, "email">>;
@@ -67,7 +69,7 @@ export default {
     // callbacks.
 
     if (env.ASSETS) {
-      return env.ASSETS.fetch(req);
+      return withFramePolicy(await env.ASSETS.fetch(req));
     }
 
     // Dev only: with no assets binding here, everything else goes to the backend.

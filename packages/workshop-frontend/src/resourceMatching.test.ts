@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { classifyMatch, completeUrl, getPlaceholderRanges } from './resourceMatching'
+import { classifyMatch, completeUrl, getPlaceholderRanges, normalizeResourceUrl } from './resourceMatching'
 
 const CHAT_SPACE = 'https://chat.google.com/:kind(room|dm)/:spaceId'
 const CHAT_THREAD = 'https://chat.google.com/:kind(room|dm)/:spaceId/:threadId{/:messageId}?'
@@ -119,5 +119,18 @@ describe('completeUrl', () => {
 describe('getPlaceholderRanges', () => {
   it('leaves a query value that starts with a colon alone', () => {
     expect(getPlaceholderRanges('https://github.com/o/r/issues?q=:open')).toEqual([])
+  })
+})
+
+describe('normalizeResourceUrl', () => {
+  it('adds https:// only when no scheme is given', () => {
+    expect(normalizeResourceUrl('github.com/acme/repo')).toBe('https://github.com/acme/repo')
+    expect(normalizeResourceUrl(' https://github.com/acme/* ')).toBe('https://github.com/acme')
+    expect(normalizeResourceUrl('HTTP://example.com')).toBe('HTTP://example.com')
+  })
+
+  it('keeps a non-web scheme, such as an InferOps resource address (FAC-232)', () => {
+    const project = 'inferops://grokbot.operations/project/project/00000000-0000-4000-8000-000000000c41'
+    expect(normalizeResourceUrl(project)).toBe(project)
   })
 })
