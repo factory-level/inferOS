@@ -678,6 +678,37 @@ describe("attention authority", () => {
     });
     expect(await attention("describe", ownerS, [target])).toEqual({ thrown: expect.stringMatching(/unreadable/) });
     expect(await attention("open", ownerS, target)).toEqual({ thrown: expect.stringMatching(/unreadable/) });
+    // A name with nothing visible in it is unreadable too, never "no longer available".
+    for (const name of ["", "   ", "\t\n", "\u0000\u0007", "\u0085 \u007f"]) {
+      vi.stubGlobal("fetch", async (input: RequestInfo, init?: RequestInit) => {
+        const url = new URL(typeof input === "string" ? input : (input as Request).url);
+        if (url.pathname === `/project/locations/${LOC}`) return Response.json({ id: LOC, name });
+        return realFetch(input, init);
+      });
+      expect(await attention("describe", ownerS, [target])).toEqual({ thrown: expect.stringMatching(/unreadable/) });
+    }
+  });
+
+  it("describe: reads at most a few targets at once, answering every one in order", async () => {
+    const owner = await connect("owner");
+    const ownerS = (await hooks().subjectOf(owner.label))!;
+    const realFetch = globalThis.fetch;
+    let inFlight = 0;
+    let peak = 0;
+    vi.stubGlobal("fetch", async (input: RequestInfo, init?: RequestInit) => {
+      const url = new URL(typeof input === "string" ? input : (input as Request).url);
+      if (!url.pathname.startsWith("/project/locations/")) return realFetch(input, init);
+      inFlight++;
+      peak = Math.max(peak, inFlight);
+      await new Promise(r => setTimeout(r, 5));
+      inFlight--;
+      return realFetch(input, init);
+    });
+    const many = Array.from({ length: 40 }, (_, i) => (i % 2 ? loc2 : target));
+    const labels = await attention("describe", ownerS, many);
+    expect(labels).toEqual(many.map(t => (t === target ? "Main yard" : "Field depot")));
+    expect(peak).toBeGreaterThan(1);
+    expect(peak).toBeLessThanOrEqual(8);
   });
 
   it("open: the resolver's own link, asked with the person's OWN token, in the workspace that has it", async () => {

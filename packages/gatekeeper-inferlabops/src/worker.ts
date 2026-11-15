@@ -687,11 +687,38 @@ function recordPath(target: AttentionTarget, tenantId: string): string | null {
   return null;
 }
 
-/** A Project's or Location's name, from InferOps' answer; an answer without one is unreadable. */
+/**
+ * A Project's or Location's name, from InferOps' answer. An answer without a usable name is
+ * unreadable and throws: not a string, or nothing left once control characters and whitespace
+ * are taken out (the host's label cleaning would turn that into null, which reads as "gone").
+ */
 function nameOf(body: unknown): string {
   const name = (body as { name?: unknown } | null)?.name;
   if (typeof name !== "string") throw new Error("InferOps answered an unreadable record");
+  // Char codes rather than a regex: a control character in a regex literal is a lint error.
+  const visible = Array.from(name, ch => {
+    const code = ch.charCodeAt(0);
+    return code < 0x20 || code === 0x7f || (code >= 0x80 && code < 0xa0) ? " " : ch;
+  }).join("").trim();
+  if (!visible) throw new Error("InferOps answered an unreadable record");
   return name;
+}
+
+/** How many targets `describe` reads at once, so one Home load can't flood InferOps. */
+const DESCRIBE_CONCURRENCY = 8;
+
+/** `fn` over `items` with at most `limit` running at once; results in input order. */
+async function mapLimited<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = [];
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i]!);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
 }
 
 /**
@@ -728,19 +755,13 @@ export class InferLabAttentionAuthority extends WorkerEntrypoint<Cloudflare.Env>
   }
 
   /**
-   * Whether `intent.sourceEventId` is a COMMITTED InferOps event that matches the intent: read with
-   * the workspace OWNER's own connection, so a workspace can cite only events its owner may see.
-   * True only when it exists and its resource is `intent.target`, its type is the one for
-   * `intent.reason`, its workspace is the audience's and its company is this deployment's. Not
-   * found or any mismatch is false; an answer InferOps can't give throws.
-   */
-  /**
    * The label for each of `targets` that `subject` can see now, read with their OWN connection: the
    * Project's or Location's name, or null when they have no connection, can't see it in any of
    * their workspaces (403/404), or the kind has no label here. Same length and order. An answer
    * InferOps can't give (an outage, an ended session, an unreadable record) throws, so a failure is
    * never shown as "no longer available". One company read per call; each target is tried in the
-   * person's workspaces in turn, since a target carries no workspace.
+   * person's workspaces in turn, since a target carries no workspace, with at most
+   * DESCRIBE_CONCURRENCY targets read at once.
    */
   @skipRpcValidation()
   async describe(subject: GatekeeperSubject, targets: AttentionTarget[]): Promise<(string | null)[]> {
@@ -748,7 +769,7 @@ export class InferLabAttentionAuthority extends WorkerEntrypoint<Cloudflare.Env>
     if (!account) return targets.map(() => null);
     const config = configOrThrow(this.env);
     const company = await account.company();
-    return Promise.all(targets.map(async target => {
+    return mapLimited(targets, DESCRIBE_CONCURRENCY, async target => {
       const path = recordPath(target, config.tenantId);
       if (!path) return null;
       for (const w of company.workspaces) {
@@ -756,7 +777,7 @@ export class InferLabAttentionAuthority extends WorkerEntrypoint<Cloudflare.Env>
         if (body !== null) return nameOf(body);
       }
       return null;
-    }));
+    });
   }
 
   /**
@@ -764,7 +785,8 @@ export class InferLabAttentionAuthority extends WorkerEntrypoint<Cloudflare.Env>
    * (`resource.resolve`, destination `page`), asked with their OWN connection for the target's
    * address in each of their workspaces in turn. Null when they have no connection or no workspace
    * of theirs resolves it (403/404); throws when InferOps can't answer. Never a URL from the item:
-   * only the resolver's `href`, which the host then checks against its InferWork origins.
+   * only the resolver's `href`, which the host then checks against its InferWork origins. A record
+   * lives in exactly one workspace, so the first workspace that resolves it is the only one.
    */
   @skipRpcValidation()
   async open(subject: GatekeeperSubject, target: AttentionTarget): Promise<{ url: string } | null> {
@@ -785,6 +807,13 @@ export class InferLabAttentionAuthority extends WorkerEntrypoint<Cloudflare.Env>
     return null;
   }
 
+  /**
+   * Whether `intent.sourceEventId` is a COMMITTED InferOps event that matches the intent: read with
+   * the workspace OWNER's own connection, so a workspace can cite only events its owner may see.
+   * True only when it exists and its resource is `intent.target`, its type is the one for
+   * `intent.reason`, its workspace is the audience's and its company is this deployment's. Not
+   * found or any mismatch is false; an answer InferOps can't give throws.
+   */
   @skipRpcValidation()
   async verifyEvent(workspace: { workspaceId: string; owner: GatekeeperSubject }, intent: AttentionIntent): Promise<boolean> {
     const config = configOrThrow(this.env);
