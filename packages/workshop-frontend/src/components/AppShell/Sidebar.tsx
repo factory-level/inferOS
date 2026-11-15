@@ -23,6 +23,7 @@ import {
 } from './SidebarWorkspaces'
 import SidebarUtilityStrip from './SidebarUtilityStrip'
 import { UnreadSummary } from '../../features/notifications/UnreadSummary'
+import { AttentionSummary } from '../../features/attention/AttentionSummary'
 import { inNativeApp, returnToInstalls } from '../../features/native-app/nativeApp'
 
 /**
@@ -190,6 +191,7 @@ export default function Sidebar({
               collapsed={collapsed}
             />
             <UnreadSummary collapsed={collapsed} />
+            <AttentionSummary collapsed={collapsed} />
           </nav>
 
           {/* Workspace tools: search. Pinned so it's always reachable. */}
