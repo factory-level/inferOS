@@ -229,11 +229,22 @@ const attention = (method: "approves" | "eligible" | "visible" | "verifyEvent" |
   hooks().attention(method, ...args) as unknown as Promise<any>;
 
 let counter = 0;
+/** Every attempt label made for each person, across the suite (storage outlives a test). */
+const made: Record<Who, string[]> = { owner: [], observer: [], nomember: [], other: [] };
+/**
+ * Revokes every connection `who` made earlier in the suite, so the next connect is their only one:
+ * the subject index keeps every live connection, and a test about a person's last connection needs
+ * it to be the last.
+ */
+async function withoutEarlierConnections(who: Who): Promise<void> {
+  for (const label of made[who].splice(0)) await hooks().revoke(label).catch(() => undefined);
+}
 /** Connects `who` end to end through the browser legs; returns the attempt label. */
 async function connect(who: Who): Promise<{ label: string; page: Response; authorize: URL }> {
   const attemptId = env.CONNECT_ATTEMPT.newUniqueId().toString();
   const nonce = (++counter).toString(16).padStart(64, "b");
   const label = `${who}-${counter}`;
+  made[who].push(label);
   await hooks().startAttempt(attemptId, nonce, label);
   const first = await get(`${BASE}/${attemptId}/${nonce}`);
   expect(first.status).toBe(302);
@@ -547,6 +558,7 @@ describe("revoking", () => {
   });
 
   it("still forgets the connection and deletes the tokens when the logout fails, and says so", async () => {
+    await withoutEarlierConnections("owner");
     const { label } = await connect("owner");
     const subject = (await hooks().subjectOf(label))!;
     await hooks().open(label, ADDRESS, "v3");
@@ -593,6 +605,7 @@ describe("attention authority", () => {
   });
 
   it("a revoked recipient gets nothing at once: neither eligible nor visible", async () => {
+    await withoutEarlierConnections("observer");
     const owner = await connect("owner");
     const observer = await connect("observer");
     const observerS = (await hooks().subjectOf(observer.label))!;
@@ -604,6 +617,26 @@ describe("attention authority", () => {
     await hooks().revoke(observer.label);
     expect(await attention("visible", observerS, [target])).toEqual([false]);
     void owner;
+  });
+
+  it("a second connect the Workshop deduplicates keeps the person's attention (FAC-242)", async () => {
+    // The Workshop keeps the first connection of an identity and revokes the duplicate.
+    await withoutEarlierConnections("owner");
+    const first = await connect("owner");
+    const again = await connect("owner");
+    const ownerS = (await hooks().subjectOf(first.label))!;
+    await hooks().revoke(again.label);
+    expect(await attention("approves", { workspaceId: "w", owner: ownerS }, intent)).toBe(true);
+    expect(await attention("eligible", intent, [ownerS])).toEqual([ownerS]);
+    expect(await attention("visible", ownerS, [target])).toEqual([true]);
+    // The other order (the Workshop keeps the new one and revokes the old) still answers too.
+    const third = await connect("owner");
+    await hooks().revoke(first.label);
+    expect(await attention("approves", { workspaceId: "w", owner: ownerS }, intent)).toBe(true);
+    // Revoking the last live one leaves nothing.
+    await hooks().revoke(third.label);
+    expect(await attention("approves", { workspaceId: "w", owner: ownerS }, intent)).toBe(false);
+    expect(await attention("visible", ownerS, [target])).toEqual([false]);
   });
 
   it("verifyEvent: true only for a committed event the OWNER can read that matches the intent", async () => {

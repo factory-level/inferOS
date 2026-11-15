@@ -177,6 +177,22 @@ describe("Review Alerts watching", () => {
     expect([...store.data.keys()]).toEqual(["watching"]);
   });
 
+  it("two watches at once make one hook: the second joins the first (FAC-242)", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>(r => { release = r; });
+    const subscribed: unknown[] = [];
+    const PROJECT = { ...session([[]]), subscribe: async (hook: unknown) => { await gate; subscribed.push(hook); } };
+    const { g } = watcher({ PROJECT });
+    const both = Promise.all([g.watchReviews(), g.watchReviews()]);
+    release();
+    const [a, b] = await both;
+    expect(a).toEqual(b);
+    expect(a).toMatchObject({ state: "watching", created: true });
+    expect(subscribed).toHaveLength(1);
+    // Once settled, a later watch reads the stored marker again.
+    expect(await g.watchReviews()).toMatchObject({ state: "watching", created: false });
+  });
+
   it("says why when it can't watch, and stores nothing", async () => {
     const { PROJECT } = subscribing(new Error("no events here"));
     const { g, store } = watcher({ PROJECT });

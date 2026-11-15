@@ -42,6 +42,7 @@ Signing in to InferOS is `gatekeeper-inferlab` (FAC-214). Sign-in grants nothing
 - **`approves(workspace, intent)`:** the target is this deployment's company, and the owner holds a grant in the audience workspace and can see the target.
 - **`verifyEvent(workspace, intent)`:** whether `intent.sourceEventId` is an event InferOps really committed, read with the workspace owner's own connection (`GET /project/locations/<id>/events/<eventId>`, inferops#2686). True only when it exists and matches the intent: its resource is the target, its type is the one for the reason (`review_requested` is `project.location.review_requested`), its workspace is the audience's and its company is this deployment's. Not found, any mismatch, an owner with no connection or no grant: false.
 - **Indeterminate answers throw**, so nothing is delivered on a guess.
+- **Which connection:** `SubjectIndex` keeps every live connection a person has (up to 16), and the authority answers with the newest still there. Revoking a connection removes only that one. So a second connect that the Workshop deduplicates (it keeps the first connection and revokes the new duplicate) leaves the first in place, and the person keeps their attention (FAC-242). Before that fix, the index held one id, and revoking the duplicate emptied it.
 
 ## Events and hooks (FAC-236)
 
