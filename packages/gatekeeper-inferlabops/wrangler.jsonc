@@ -37,6 +37,12 @@
         "SubjectIndex",
         "ProjectGatekeeper"
       ]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": [
+        "ProjectEventDriver"
+      ]
     }
   ]
 }

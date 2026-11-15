@@ -1,6 +1,6 @@
 /// <reference types="@cloudflare/vitest-plugin/types" />
 
-import type { ConnectAttempt } from "../src/worker.js";
+import type { ConnectAttempt, ProjectEventDriver } from "../src/worker.js";
 import type { TestHooks } from "./worker.js";
 
 declare global {
@@ -9,6 +9,7 @@ declare global {
       // Declared only in vitest.config.ts.
       CONNECT_ATTEMPT: DurableObjectNamespace<ConnectAttempt>;
       TEST_HOOKS: DurableObjectNamespace<TestHooks>;
+      PROJECT_EVENT_DRIVER: DurableObjectNamespace<ProjectEventDriver>;
     }
   }
 }

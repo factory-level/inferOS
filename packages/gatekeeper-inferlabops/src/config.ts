@@ -89,3 +89,66 @@ export function readConfig(env: OperationsEnv): OperationsConfig | { off: string
 
 /** The exact redirect URI InferOps must have registered for the `inferos` client. */
 export const redirectUriFor = (config: OperationsConfig): string => `${config.baseUrl}/oauth`;
+
+// ── Event destinations (FAC-236) ───────────────────────────────────────────────────────────────
+
+/**
+ * Where InferOps delivers this deployment's committed events: `<BASE_URL>/events/<key>`, one path
+ * per destination key, so the secret that checks a delivery is chosen before its body is read.
+ */
+export const EVENTS_PATH = "events";
+
+/** The contract's destination key rule (`inferlab.callback-destination` v1). */
+export const DESTINATION_KEY = /^[a-z][a-z0-9-]{1,62}$/;
+/** The shortest signing secret accepted: 32 characters. */
+export const MIN_SECRET_LENGTH = 32;
+
+/**
+ * One configured event destination: the key InferOps names it by, the one workspace of this
+ * deployment's company whose events it carries, and the secret InferOps signs them with. The same
+ * key, workspace and secret are configured on the InferOps side (its callback destination).
+ */
+export type EventDestination = { key: string; workspaceId: string; secret: string };
+
+/** The setting this part reads. */
+export type EventsEnv = { INFERLAB_EVENT_DESTINATIONS?: string };
+
+/**
+ * What `INFERLAB_EVENT_DESTINATIONS` says: `unset` (no destinations, on purpose); `invalid` (set, but
+ * a malformed entry, a repeated key or a short secret turns every destination off, so nothing is
+ * accepted under a configuration nobody meant); or the destinations. Never logged.
+ */
+export type DestinationsState =
+  | { state: "unset" } | { state: "invalid" } | { state: "ok"; destinations: Map<string, EventDestination> };
+
+/** `INFERLAB_EVENT_DESTINATIONS`: a JSON array of `{key, workspaceId, secret}`, read whole. */
+export function readDestinationsState(env: EventsEnv): DestinationsState {
+  const raw = env.INFERLAB_EVENT_DESTINATIONS?.trim();
+  if (!raw) return { state: "unset" };
+  let entries: unknown;
+  try {
+    entries = JSON.parse(raw);
+  } catch {
+    return { state: "invalid" };
+  }
+  if (!Array.isArray(entries) || entries.length === 0) return { state: "invalid" };
+  const destinations = new Map<string, EventDestination>();
+  for (const entry of entries) {
+    const { key, workspaceId, secret } = (entry ?? {}) as Record<string, unknown>;
+    if (typeof key !== "string" || !DESTINATION_KEY.test(key) || destinations.has(key)) return { state: "invalid" };
+    if (typeof workspaceId !== "string" || !TENANT_ID.test(workspaceId)) return { state: "invalid" };
+    if (typeof secret !== "string" || secret.length < MIN_SECRET_LENGTH) return { state: "invalid" };
+    destinations.set(key, { key, workspaceId: workspaceId.toLowerCase(), secret });
+  }
+  return { state: "ok", destinations };
+}
+
+/** The configured destinations: empty unless `INFERLAB_EVENT_DESTINATIONS` is set and valid. */
+export function readDestinations(env: EventsEnv): Map<string, EventDestination> {
+  const read = readDestinationsState(env);
+  return read.state === "ok" ? read.destinations : new Map();
+}
+
+/** Whether some destination carries `workspaceId`'s events: what a hook on it needs to fire. */
+export const receivesEventsFor = (env: EventsEnv, workspaceId: string): boolean =>
+  [...readDestinations(env).values()].some(d => d.workspaceId === workspaceId.toLowerCase());

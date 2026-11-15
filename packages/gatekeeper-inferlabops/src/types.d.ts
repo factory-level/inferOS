@@ -3,7 +3,7 @@
  * read and request here happens as the person who connected it, with exactly their own InferOps
  * access: what they can't see, you can't see.
  */
-import type { RpcTarget } from "cloudflare:workers";
+import type { RpcStub, RpcTarget } from "cloudflare:workers";
 
 /** A record's revision: a decimal string. Pass the one you read back when you change the record. */
 export type Revision = string;
@@ -82,4 +82,62 @@ export interface ProjectSession extends RpcTarget {
    * while a review is waiting is a `Conflict`; a changed Location is a `StaleRevision`.
    */
   requestReview(locationId: string, expectedRevision: Revision): Promise<void>;
+
+  /**
+   * Have `hook.receiveEvent()` called with each committed InferOps event on a Location of this
+   * Project: today, a review being requested. Each event is checked when it arrives: it reaches the
+   * hook only if the person who connected this Project can read that Location now, so a revoked
+   * grant or connection stops delivery at once.
+   *
+   * The hook starts disabled, and nothing is delivered until the user enables it. Every call
+   * creates a distinct hook, so subscribe once. An event is delivered once, even when InferOps
+   * sends it again. Throws if this deployment receives no InferOps events for this workspace.
+   *
+   * `hook` must be a persistent stub that restores through a Gadget's `[restore]()` method: inside
+   * the Gadget, create it with `this.ctx.restore(params)`. The Gadget's `[restore]()` receives those
+   * `params` for every delivery.
+   *
+   * @example
+   * // server.js
+   * import { DurableObject, RpcTarget, restore } from "cloudflare:workers";
+   * export class Gadget extends DurableObject {
+   *   async [restore](params) {
+   *     if (params.type === "reviews") return new Reviews(this.env);
+   *     throw new TypeError(`Unknown restore type: ${params.type}`);
+   *   }
+   *   async watch() {
+   *     await this.env.INFEROPS_PROJECT.subscribe(await this.ctx.restore({ type: "reviews" }));
+   *   }
+   * }
+   * class Reviews extends RpcTarget {
+   *   constructor(env) { super(); this.env = env; }
+   *   async receiveEvent(event) {
+   *     // Read more as the person, through event.project; raise attention with event.eventId.
+   *   }
+   * }
+   */
+  subscribe(hook: RpcStub<ProjectEventHook>): Promise<void>;
+}
+
+/** What happened: today, only a review being requested for a Location. */
+export type ProjectEventType = "project.location.review_requested";
+
+/** One committed InferOps event on a Location of the Project, as the hook receives it. */
+export interface ProjectEvent {
+  /** InferOps' id for the event: the same on every delivery of it. Cite it when raising attention. */
+  eventId: string;
+  type: ProjectEventType;
+  /** When it was committed (ISO 8601, UTC). */
+  occurredAt: string;
+  /** The Location, read when the event arrived, as the connected person sees it. */
+  location: Location;
+  /** The Location's revision the change produced. The Location as read may be newer. */
+  revision: Revision;
+  /** The Project, as the connected person: read more, or request reviews, from here. */
+  project: ProjectSession;
+}
+
+/** What a Gadget implements to receive this Project's events (see `ProjectSession.subscribe`). */
+export interface ProjectEventHook extends RpcTarget {
+  receiveEvent(event: ProjectEvent): Promise<void>;
 }
