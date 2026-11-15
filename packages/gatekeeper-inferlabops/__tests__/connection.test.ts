@@ -18,6 +18,9 @@ const LOC = "00000000-0000-4000-8000-00000000a211";
 const LOC_ELSEWHERE = "00000000-0000-4000-8000-00000000a212";
 const ADDRESS = `inferops://acme.operations/project/project/${PROJECT}`;
 const EVENT = "00000000-0000-4000-8000-0000000000e1";
+/** A second workspace only the owner holds, with a Location of its own. */
+const WS2 = "00000000-0000-4000-8000-000000000021";
+const LOC2 = "00000000-0000-4000-8000-00000000a231";
 
 type Who = "owner" | "observer" | "nomember" | "other";
 const PRINCIPAL: Record<Who, string> = {
@@ -45,6 +48,9 @@ let outage = false;
 let usedKeys = new Map<string, string>();
 /** Fail the next review request with a 503, after nothing was committed. */
 let failNextReview = false;
+/** Who asked the resolver for what, and whether it refuses everything. */
+let resolveCalls: { who: Who | null; address: string }[] = [];
+let resolveRefused = false;
 /** Make `/auth/logout` fail. */
 let logoutFails = false;
 /** A company id `/auth/company` answers instead of the person's own. */
@@ -72,7 +78,7 @@ const reads = (who: Who) => who === "owner" || who === "observer";
 
 function answer(method: string, path: string, query: URLSearchParams, who: Who | null,
                 headers: Record<string, string>, body: unknown): Response {
-  if (outage && path.startsWith("/project/")) return new Response("down", { status: 503 });
+  if (outage && (path.startsWith("/project/") || path.startsWith("/resources/"))) return new Response("down", { status: 503 });
   if (path === "/auth/token") {
     const code = (body as { code?: string }).code ?? "";
     const person = code.replace(/^code-/, "") as Who;
@@ -100,9 +106,13 @@ function answer(method: string, path: string, query: URLSearchParams, who: Who |
   const member = who !== "nomember";
   if (path === "/auth/company") {
     return Response.json({ tenantId: companyAnswer ?? COMPANY, slug: "acme", principalId: PRINCIPAL[who],
-      workspaces: member ? [{ workspaceId: WS, workspaceName: "Operations", product: "inferops", role: who === "owner" ? "member" : "viewer" }] : [] });
+      workspaces: member ? [{ workspaceId: WS, workspaceName: "Operations", product: "inferops", role: who === "owner" ? "member" : "viewer" },
+        ...(who === "owner" ? [{ workspaceId: WS2, workspaceName: "Field", product: "inferops", role: "member" }] : [])] : [] });
   }
-  if (path === "/workspaces") return Response.json([{ id: WS, tenant_id: COMPANY, product: "inferops", name: "Operations", slug: "operations" }]);
+  if (path === "/workspaces") {
+    return Response.json([{ id: WS, tenant_id: COMPANY, product: "inferops", name: "Operations", slug: "operations" },
+      { id: WS2, tenant_id: COMPANY, product: "inferops", name: "Field", slug: "field" }]);
+  }
   const ws = headers["x-workspace-id"];
   const allowed = member && ws === WS && !grantRevoked.has(who) && reads(who);
   if (path === "/auth/permissions") {
@@ -127,6 +137,21 @@ function answer(method: string, path: string, query: URLSearchParams, who: Who |
   }
   if (path === `/project/locations/${LOC_ELSEWHERE}` && method === "GET") {
     return allowed ? Response.json(location(LOC_ELSEWHERE, OTHER_PROJECT)) : Response.json({ error: { code: "NOT_FOUND" } }, { status: 404 });
+  }
+  if (path === `/project/locations/${LOC2}` && method === "GET") {
+    return who === "owner" && ws === WS2 && !grantRevoked.has(who)
+      ? Response.json({ ...location(LOC2, PROJECT), name: "Field depot" })
+      : Response.json({ error: { code: "NOT_FOUND" } }, { status: 404 });
+  }
+  if (path === "/resources/resolve" && method === "GET") {
+    resolveCalls.push({ who, address: query.get("address") ?? "" });
+    if (resolveRefused) return Response.json({ error: { code: "NOT_FOUND" } }, { status: 404 });
+    const m = /^inferops:\/\/acme\.([a-z]+)\/project\/location\/([0-9a-f-]+)$/.exec(query.get("address") ?? "");
+    const ok = m && query.get("destination") === "page" && (
+      (m[1] === "operations" && m[2] === LOC && reads(who) && member) ||
+      (m[1] === "field" && m[2] === LOC2 && who === "owner"));
+    return ok ? Response.json({ v: 1, href: `https://work.example.test/r/project/location/${m![2]}` })
+      : Response.json({ error: { code: "NOT_FOUND" } }, { status: 404 });
   }
   if (path === `/project/locations/${LOC}/events/${EVENT}` && method === "GET") {
     if (!allowed) return Response.json({ error: { code: "NOT_FOUND" } }, { status: 404 });
@@ -166,6 +191,7 @@ beforeEach(() => {
   seen = []; tokens = new Map(); refreshes = new Map(); grantRevoked = new Set();
   reviewStatus = "none"; revision = 3; outage = false; eventEdit = {};
   usedKeys = new Map(); failNextReview = false; logoutFails = false; companyAnswer = null;
+  resolveCalls = []; resolveRefused = false;
   vi.stubGlobal("fetch", async (input: RequestInfo, init?: RequestInit) => {
     const url = new URL(typeof input === "string" ? input : input.url);
     if (url.origin !== ORIGIN) throw new Error(`unexpected fetch to ${url.origin}`);
@@ -192,7 +218,7 @@ const hooks = () => env.TEST_HOOKS.getByName("hooks");
 type Outcome = { value?: any; error?: string };
 const call = (key: string, method: string, ...args: unknown[]) =>
   hooks().call(key, method, ...args) as unknown as Promise<Outcome>;
-const attention = (method: "approves" | "eligible" | "visible" | "verifyEvent", ...args: unknown[]) =>
+const attention = (method: "approves" | "eligible" | "visible" | "verifyEvent" | "describe" | "open", ...args: unknown[]) =>
   hooks().attention(method, ...args) as unknown as Promise<any>;
 
 let counter = 0;
@@ -608,6 +634,72 @@ describe("attention authority", () => {
     eventEdit = {};
     outage = true;
     expect(await attention("verifyEvent", ws, intent)).toEqual({ thrown: expect.stringMatching(/503/) });
+  });
+
+  const loc2 = { v: 1, tenantId: COMPANY, kind: "project/location", id: LOC2 };
+  const stranger = { issuer: ORIGIN, subject: "00000000-0000-4000-8000-0000000000aa" };
+
+  it("describe: each label with the person's OWN connection, across their workspaces; null when not theirs", async () => {
+    const owner = await connect("owner");
+    const observer = await connect("observer");
+    const ownerS = (await hooks().subjectOf(owner.label))!;
+    const observerS = (await hooks().subjectOf(observer.label))!;
+    // LOC is in the first workspace, LOC2 only in the owner's second: found there.
+    expect(await attention("describe", ownerS, [target, loc2])).toEqual(["Main yard", "Field depot"]);
+    // The observer holds only the first workspace: LOC2 is null for them, never the owner's label.
+    expect(await attention("describe", observerS, [target, loc2])).toEqual(["Main yard", null]);
+    // Each read used the asker's own token: the observer's never reached the owner's workspace.
+    const reads = seen.filter(s => s.path === `/project/locations/${LOC2}`);
+    expect(reads.filter(r => r.headers["x-workspace-id"] === WS2).every(r => /\.owner\./.test(r.headers.authorization!)))
+      .toBe(true);
+    expect(reads.filter(r => /\.observer\./.test(r.headers.authorization!)).every(r => r.headers["x-workspace-id"] === WS))
+      .toBe(true);
+    // No connection; a foreign company or kind; a revoked grant: null.
+    expect(await attention("describe", stranger, [target])).toEqual([null]);
+    expect(await attention("describe", ownerS, [{ ...target, tenantId: OTHER_COMPANY }, { ...target, kind: "knowledge/page" }]))
+      .toEqual([null, null]);
+    grantRevoked.add("observer");
+    expect(await attention("describe", observerS, [target])).toEqual([null]);
+  });
+
+  it("describe and open: an outage or an unreadable answer throws, never an empty answer", async () => {
+    const owner = await connect("owner");
+    const ownerS = (await hooks().subjectOf(owner.label))!;
+    outage = true;
+    expect(await attention("describe", ownerS, [target])).toEqual({ thrown: expect.stringMatching(/503/) });
+    outage = false;
+    // Wrap the fake InferOps: two answers without the field they must carry.
+    const realFetch = globalThis.fetch;
+    vi.stubGlobal("fetch", async (input: RequestInfo, init?: RequestInit) => {
+      const url = new URL(typeof input === "string" ? input : (input as Request).url);
+      if (url.pathname === `/project/locations/${LOC}`) return Response.json({ v: 1 });
+      if (url.pathname === "/resources/resolve") return Response.json({ v: 1 });
+      return realFetch(input, init);
+    });
+    expect(await attention("describe", ownerS, [target])).toEqual({ thrown: expect.stringMatching(/unreadable/) });
+    expect(await attention("open", ownerS, target)).toEqual({ thrown: expect.stringMatching(/unreadable/) });
+  });
+
+  it("open: the resolver's own link, asked with the person's OWN token, in the workspace that has it", async () => {
+    const owner = await connect("owner");
+    const observer = await connect("observer");
+    const ownerS = (await hooks().subjectOf(owner.label))!;
+    const observerS = (await hooks().subjectOf(observer.label))!;
+    expect(await attention("open", ownerS, target)).toEqual({ url: `https://work.example.test/r/project/location/${LOC}` });
+    expect(await attention("open", ownerS, loc2)).toEqual({ url: `https://work.example.test/r/project/location/${LOC2}` });
+    // The owner's LOC2 was found in the second workspace, after the first said no.
+    expect(resolveCalls.filter(c => c.address.endsWith(LOC2)).map(c => c.address))
+      .toEqual([`inferops://acme.operations/project/location/${LOC2}`, `inferops://acme.field/project/location/${LOC2}`]);
+    expect(resolveCalls.every(c => c.who === "owner")).toBe(true);
+    // Not theirs, no connection, another company, a refused resolve: null.
+    expect(await attention("open", observerS, loc2)).toBeNull();
+    expect(await attention("open", stranger, target)).toBeNull();
+    expect(await attention("open", ownerS, { ...target, tenantId: OTHER_COMPANY })).toBeNull();
+    resolveRefused = true;
+    expect(await attention("open", ownerS, target)).toBeNull();
+    resolveRefused = false;
+    outage = true;
+    expect(await attention("open", ownerS, target)).toEqual({ thrown: expect.stringMatching(/503/) });
   });
 
   it("an answer InferOps can't give throws, so nothing is delivered on a guess", async () => {

@@ -678,6 +678,22 @@ function committedEventOf(body: unknown): {
   };
 }
 
+/** The InferOps read for a target this authority can label: a Project or a Location of this company. */
+function recordPath(target: AttentionTarget, tenantId: string): string | null {
+  const id = target.id.toLowerCase();
+  if (target.tenantId.toLowerCase() !== tenantId || !UUID.test(id)) return null;
+  if (target.kind === "project/location") return `/project/locations/${id}`;
+  if (target.kind === "project/project") return `/project/projects/${id}`;
+  return null;
+}
+
+/** A Project's or Location's name, from InferOps' answer; an answer without one is unreadable. */
+function nameOf(body: unknown): string {
+  const name = (body as { name?: unknown } | null)?.name;
+  if (typeof name !== "string") throw new Error("InferOps answered an unreadable record");
+  return name;
+}
+
 /**
  * Who may see an attention target, answered with each person's OWN connection, live. A person
  * without a connection, or whose InferOps access refuses, sees nothing. An answer InferOps can't
@@ -718,6 +734,57 @@ export class InferLabAttentionAuthority extends WorkerEntrypoint<Cloudflare.Env>
    * `intent.reason`, its workspace is the audience's and its company is this deployment's. Not
    * found or any mismatch is false; an answer InferOps can't give throws.
    */
+  /**
+   * The label for each of `targets` that `subject` can see now, read with their OWN connection: the
+   * Project's or Location's name, or null when they have no connection, can't see it in any of
+   * their workspaces (403/404), or the kind has no label here. Same length and order. An answer
+   * InferOps can't give (an outage, an ended session, an unreadable record) throws, so a failure is
+   * never shown as "no longer available". One company read per call; each target is tried in the
+   * person's workspaces in turn, since a target carries no workspace.
+   */
+  @skipRpcValidation()
+  async describe(subject: GatekeeperSubject, targets: AttentionTarget[]): Promise<(string | null)[]> {
+    const account = await this.#account(subject);
+    if (!account) return targets.map(() => null);
+    const config = configOrThrow(this.env);
+    const company = await account.company();
+    return Promise.all(targets.map(async target => {
+      const path = recordPath(target, config.tenantId);
+      if (!path) return null;
+      for (const w of company.workspaces) {
+        const body = await account.readIfVisible(path, w.id);
+        if (body !== null) return nameOf(body);
+      }
+      return null;
+    }));
+  }
+
+  /**
+   * Where `subject` opens `target`: the InferWork link InferLab's own resolver builds
+   * (`resource.resolve`, destination `page`), asked with their OWN connection for the target's
+   * address in each of their workspaces in turn. Null when they have no connection or no workspace
+   * of theirs resolves it (403/404); throws when InferOps can't answer. Never a URL from the item:
+   * only the resolver's `href`, which the host then checks against its InferWork origins.
+   */
+  @skipRpcValidation()
+  async open(subject: GatekeeperSubject, target: AttentionTarget): Promise<{ url: string } | null> {
+    const account = await this.#account(subject);
+    if (!account) return null;
+    const config = configOrThrow(this.env);
+    if (!recordPath(target, config.tenantId)) return null;
+    const company = await account.company();
+    for (const w of company.workspaces) {
+      const address = `inferops://${company.slug}.${w.slug}/${target.kind}/${target.id.toLowerCase()}`;
+      const body = await account.readIfVisible(
+        `/resources/resolve?address=${encodeURIComponent(address)}&destination=page`, w.id);
+      if (body === null) continue;
+      const href = (body as { href?: unknown } | null)?.href;
+      if (typeof href !== "string" || href === "") throw new Error("InferOps answered an unreadable resolution");
+      return { url: href };
+    }
+    return null;
+  }
+
   @skipRpcValidation()
   async verifyEvent(workspace: { workspaceId: string; owner: GatekeeperSubject }, intent: AttentionIntent): Promise<boolean> {
     const config = configOrThrow(this.env);
