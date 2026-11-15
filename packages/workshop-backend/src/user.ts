@@ -1,5 +1,5 @@
 import { RpcStub } from "capnweb";
-import type { ChatReadState, ChatTimelineHead, UnreadStateScope, UnreadStateSubscriber, UserUnreadState, UnreadThread, UserUnreadSummary, WorkspaceUnreadSummary } from "@gadgets/workshop-shared/api";
+import type { AttentionItem, AttentionPersonalState, ChatReadState, ChatTimelineHead, UnreadStateScope, UnreadStateSubscriber, UserUnreadState, UnreadThread, UserUnreadSummary, WorkspaceUnreadSummary } from "@gadgets/workshop-shared/api";
 import { WorkspaceMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, RedactedAiModelConfig, ModelKind, modelKind, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, WorkspaceMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, OutputSummary, ListOutputsResult, AUTH_ERROR_CODES, createAuthError, ConnectFlowStart, validateCommitEmail, NotificationSubscriber, NotificationMute, UserNotification, type DeviceSessionHandoffStart, type WebPushSubscription } from '@gadgets/workshop-shared/api';
 import { ActionDescription, Gatekeeper, GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor, AccountDescription, VendorDescription, GatekeeperConnectCallback, ConnectHandoff, SupportedResource, ResourceConfiguratorFrame, AppUiContext, GatekeeperUiFrame, GatekeeperUserSelection, GatekeeperUserSelectionExchange, RedeemedGatekeeperUserSelection } from "@gadgets/workshop-shared/gatekeeper";
 import { shouldAutoProvisionAccount, ambientGatekeeperMode } from "./provisioning-policy.js";
@@ -14,6 +14,8 @@ import {
   type ChatReadCursor,
 } from "./storage-schema/user-storage.js";
 import { chatKey, chatKeyPrefix } from "./storage-schema/overseer-storage.js";
+import { accountSubject, attentionAuthorityFrom, type AttentionAuthority } from "./attention.js";
+import { subjectAccountName } from "./account-subject.js";
 import { recordAnalytics } from "./analytics";
 import { createWorkshopLogger } from "./observability";
 import { getGatewayModels, type GatewayModels } from "./ai-gateway.js";
@@ -1118,6 +1120,62 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     this.#unreadChanged(workspaceId, chatId);
   }
 
+  /**
+   * Store one attention item a workspace's `env.ATTENTION` resolved this user as a recipient of
+   * (attention.ts). The first item for a key is kept, with its read state; a repeat from the same
+   * or another workspace only records that workspace too. Ignored from a workspace the user no
+   * longer lists, and refused when it isn't addressed to this user.
+   */
+  async attentionRaised(workspaceId: string, item: AttentionItem): Promise<void> {
+    if (subjectAccountName(item.recipient) !== this.storage.profile.get().id) {
+      throw new Error("Attention item is not addressed to this user.");
+    }
+    if (!this.storage.gadgets.get(workspaceId)) return;
+    let existing = this.storage.attentionItems.get(item.itemKey);
+    if (existing?.workspaceIds.includes(workspaceId)) return;
+    this.storage.attentionItems.put(existing ? {...existing, workspaceIds: [...existing.workspaceIds, workspaceId]}
+        : {...item, personal: "unread", workspaceIds: [workspaceId]});
+  }
+
+  /** The attention authority, or null when none is configured (see attention.ts). */
+  attentionAuthority(): AttentionAuthority | null {
+    return attentionAuthorityFrom(this.env);
+  }
+
+  /**
+   * This user's attention items, newest first, keeping only those whose target the authority says
+   * they can still see now. Nothing without an authority, or for an account with no InferLab
+   * identity.
+   */
+  async getAttentionItems(): Promise<AttentionItem[]> {
+    let authority = this.attentionAuthority();
+    let subject = accountSubject(this.storage.profile.get().id);
+    if (!authority || !subject) return [];
+    let records = [...this.storage.attentionItems.list()]
+        .toSorted((a, b) => b.createdAt.localeCompare(a.createdAt) || a.itemKey.localeCompare(b.itemKey));
+    if (records.length === 0) return [];
+    let visible = await authority.visible(subject, records.map(record => record.target));
+    return records.filter((_, i) => visible[i] === true)
+        .map(({workspaceIds, ...item}) => item);
+  }
+
+  /** Set this user's own state for one of their attention items; an unknown key is ignored. */
+  async setAttentionState(itemKey: string, personal: AttentionPersonalState): Promise<void> {
+    let existing = this.storage.attentionItems.get(itemKey);
+    if (existing && existing.personal !== personal) this.storage.attentionItems.put({...existing, personal});
+  }
+
+  #forgetAttentionWorkspace(workspaceId: string): void {
+    this.ctx.storage.transactionSync(() => {
+      for (let record of Array.from(this.storage.attentionItems.list())) {
+        if (!record.workspaceIds.includes(workspaceId)) continue;
+        let workspaceIds = record.workspaceIds.filter(id => id !== workspaceId);
+        if (workspaceIds.length) this.storage.attentionItems.put({...record, workspaceIds});
+        else this.storage.attentionItems.delete(record.itemKey);
+      }
+    });
+  }
+
   /** Remove the listing and its accepted work before the source is destroyed; no callback read. */
   async workspaceRemoved(workspaceId: string): Promise<void> {
     await this.deleteWorkspace(workspaceId);
@@ -1655,6 +1713,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     this.storage.gadgets.delete(id);
     this.storage.outputs.byWorkspace.delete(id);
     this.#forgetUnreadWorkspace(id);
+    this.#forgetAttentionWorkspace(id);
   }
 
   /**
