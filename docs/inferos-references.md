@@ -67,6 +67,10 @@ Project that are waiting for review. Like every bundled blueprint it is installe
   message of its own, never the error's text.
 - **The client** draws loading, not connected, failed, empty ("No Locations are waiting for
   review") and the list, as text only.
+- **Fresh instantiation** is proved in
+  `packages/integration-tests/__tests__/review-alerts-instantiation.test.ts`: each install is a new
+  workspace, bound only to the connection that install made on the installer's own account, with
+  no hook, an empty store, and `upstream` naming the blueprint and its release.
 - The kernel does not check an assignment's vendor against a binding's `gatekeeperName`
   (`AuthenticatedApi.newWorkspaceFromBlueprint`), so the picker is what keeps `PROJECT` an InferLab
   operations connection.
