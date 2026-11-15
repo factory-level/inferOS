@@ -87,11 +87,43 @@ existing users have none. Items survive eviction and restart like the rest of th
 - **Workspace removal** removes what that workspace alone raised; an item another workspace also
   raised stays.
 
+## Labels, opening and the Home list (FAC-238)
+
+Home's "Needs attention" section (`packages/workshop-frontend/src/features/attention/`) shows the
+person's own items, and the sidebar shows how many are unread and not dismissed.
+
+- **Labels are read at render time, with the viewer's own rights.**
+  - `describeAttentionItems(itemKeys)` looks each key up in the caller's own User DO, so a caller
+    can't name someone else's target. It asks the authority's `describe(subject, targets)` and
+    cleans each label: one line, no control characters, capped at 200 characters.
+  - Null means the record is unknown, no longer visible or gone, and the row reads "No longer
+    available", with no Open.
+  - When the authority can't tell, the call rejects and Home shows an error, never "no longer
+    available" and never an empty list.
+- **Open never comes from a URL the item holds; it holds none.**
+  - `openAttentionItem(itemKey)` looks the item up the same way and asks the authority's
+    `open(subject, target)`. InferLab resolves the reference with its own resolver
+    (`resource.resolve`, FAC-229), from its trusted origins.
+  - The host accepts the link only if it is an absolute http(s) URL with no user info, on one of
+    `INFERWORK_ORIGINS` exactly (comma-separated bare origins).
+  - The page navigates to the accepted link, and only after the person clicks Open. The link grants
+    nothing, and InferWork checks access again.
+- **Acknowledging is personal.** Mark read, Mark unread and Dismiss call `setAttentionState` and
+  change nothing in InferLab. A review stays requested until InferLab resolves it. Open also marks
+  the item read.
+- **States are drawn deliberately:** loading (skeleton), empty ("Nothing needs your attention."),
+  error ("Couldn't check what needs your attention", with Retry), and per row "No longer
+  available". Dismissed items sit behind "Show dismissed".
+- **Kept current:** one store per signed-in API serves both the list and the badge, and reads again
+  on focus, on becoming visible, every minute, and after each change. So another tab's change, a
+  status change or a revoked target settles to what the server says.
+
 ## The authority
 
 `AttentionAuthority` (`attention.ts`) is the one seam to InferLab, provided as the
-`ATTENTION_AUTHORITY` service binding (FAC-235: `gatekeeper-inferlab-ops`, each person's own
-InferOps connection, live). Every answer is about a stable subject; the host never decides who
+`ATTENTION_AUTHORITY` service binding (FAC-235: `gatekeeper-inferlabops`, each person's own
+InferOps connection, live). Its methods are `approves`, `verifyEvent`, `eligible`, `visible`,
+and, for Home (FAC-238), `describe` and `open`. Every answer is about a stable subject; the host never decides who
 holds what in InferLab, or who can see a record. Until that binding exists, attention is refused.
 
 ## Tests
@@ -109,4 +141,11 @@ holds what in InferLab, or who can see a record. Until that binding exists, atte
 - contract-only fields;
 - a revoke between raise and read, and an indeterminate authority;
 - durability and read state across eviction;
-- misaddressed items, and workspace removal.
+- misaddressed items, and workspace removal;
+- labels with the viewer's own rights: cleaning, the cap, unknown and hidden items, another
+  person's key, no authority, an indeterminate answer and the batch limit;
+- opening: only an http(s) link with no user info on a configured InferWork origin, only for the
+  person's own item, with refusals for hidden, unavailable and indeterminate.
+
+The Home list's component and browser tests sit beside it in
+`packages/workshop-frontend/src/features/attention/`.

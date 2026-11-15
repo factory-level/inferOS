@@ -14,8 +14,12 @@ import {
   type ChatReadCursor,
 } from "./storage-schema/user-storage.js";
 import { chatKey, chatKeyPrefix } from "./storage-schema/overseer-storage.js";
-import { accountSubject, attentionAuthorityFrom, type AttentionAuthority } from "./attention.js";
+import { acceptedInferWorkUrl, accountSubject, attentionAuthorityFrom, cleanAttentionLabel, inferWorkOriginsFrom,
+  type AttentionAuthority } from "./attention.js";
 import { subjectAccountName } from "./account-subject.js";
+
+/** The most attention items one `describeAttentionItems` call may name. */
+const MAX_ATTENTION_DESCRIBE = 100;
 import { recordAnalytics } from "./analytics";
 import { createWorkshopLogger } from "./observability";
 import { getGatewayModels, type GatewayModels } from "./ai-gateway.js";
@@ -1137,6 +1141,11 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
         : {...item, personal: "unread", workspaceIds: [workspaceId]});
   }
 
+  /** The InferWork origins this deployment opens attention items at (`INFERWORK_ORIGINS`). */
+  inferWorkOrigins(): Set<string> {
+    return inferWorkOriginsFrom(this.env);
+  }
+
   /** The attention authority, or null when none is configured (see attention.ts). */
   attentionAuthority(): AttentionAuthority | null {
     return attentionAuthorityFrom(this.env);
@@ -1163,6 +1172,53 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   async setAttentionState(itemKey: string, personal: AttentionPersonalState): Promise<void> {
     let existing = this.storage.attentionItems.get(itemKey);
     if (existing && existing.personal !== personal) this.storage.attentionItems.put({...existing, personal});
+  }
+
+  /**
+   * The label for each of this user's items named by `itemKeys`, read now with their own InferLab
+   * rights (the authority's `describe`), or null for an item that is unknown, no longer visible or
+   * gone. Same length and order as `itemKeys`. Throws when the authority can't tell, so a failure
+   * is never shown as "no longer available".
+   */
+  async describeAttentionItems(itemKeys: string[]): Promise<(string | null)[]> {
+    if (itemKeys.length > MAX_ATTENTION_DESCRIBE) {
+      throw new Error(`At most ${MAX_ATTENTION_DESCRIBE} attention items can be described at once.`);
+    }
+    let authority = this.attentionAuthority();
+    let subject = accountSubject(this.storage.profile.get().id);
+    // Only this user's own items: a key is looked up in their own list, never taken as a target.
+    let records = itemKeys.map(key => this.storage.attentionItems.get(key));
+    let known = records.flatMap((record, i) => record ? [{i, target: record.target}] : []);
+    let labels: (string | null)[] = itemKeys.map(() => null);
+    if (!authority || !subject || known.length === 0) return labels;
+    let described = await authority.describe(subject, known.map(k => k.target));
+    // One answer per target, or none at all: a short or long answer would make a missing entry read
+    // as "no longer available", telling the person an accessible record is gone.
+    if (!Array.isArray(described) || described.length !== known.length) {
+      throw new Error("InferLab answered for a different number of attention items than were asked about.");
+    }
+    known.forEach((k, j) => { labels[k.i] = cleanAttentionLabel(described[j]); });
+    return labels;
+  }
+
+  /**
+   * Where this user opens one of their items: the InferWork link InferLab's resolver gives for its
+   * target, with their own rights, accepted only if it is an http(s) URL with no user info on one of
+   * this deployment's `INFERWORK_ORIGINS`. Opening grants nothing: the destination checks access
+   * again. Throws when the item is unknown, can't be opened now, or the link isn't acceptable.
+   */
+  async openAttentionItem(itemKey: string): Promise<{url: string}> {
+    let record = this.storage.attentionItems.get(itemKey);
+    if (!record) throw new Error("That attention item isn't in your list.");
+    let authority = this.attentionAuthority();
+    let subject = accountSubject(this.storage.profile.get().id);
+    if (!authority || !subject) throw new Error("Attention is unavailable on this deployment.");
+    let link = await authority.open(subject, record.target);
+    if (!link) throw new Error("You can't open this now.");
+    let url = acceptedInferWorkUrl(link.url, this.inferWorkOrigins());
+    // The offered link is not echoed: it is InferLab's, and it was refused.
+    if (!url) throw new Error("InferLab offered a link this deployment doesn't open.");
+    return {url};
   }
 
   #forgetAttentionWorkspace(workspaceId: string): void {

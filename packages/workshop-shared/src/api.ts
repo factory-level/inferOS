@@ -825,6 +825,22 @@ export interface AuthenticatedApi extends RpcTarget {
   setAttentionState(itemKey: string, personal: AttentionPersonalState): Promise<void>;
 
   /**
+   * The label to show for each of the user's own attention items named by `itemKeys` (at most 100),
+   * read now with their own InferLab rights: the record's name, or null for an item that is
+   * unknown, no longer visible or gone. Same length and order as `itemKeys`. Rejects when InferLab
+   * can't tell, so a failure is never shown as "no longer available".
+   */
+  describeAttentionItems(itemKeys: string[]): Promise<(string | null)[]>;
+
+  /**
+   * Where the user opens one of their own attention items: an InferWork link for its target,
+   * resolved by InferLab with their own rights and accepted only on this deployment's configured
+   * InferWork origins. Navigate to it; it grants nothing, and the destination checks access again.
+   * Rejects when the item is unknown, can't be opened now, or the link isn't acceptable.
+   */
+  openAttentionItem(itemKey: string): Promise<{url: string}>;
+
+  /**
    * Mute a workspace in the user's list, so its finished tasks notify no tab or device, or unmute
    * it with null. Permission requests still come through.
    */

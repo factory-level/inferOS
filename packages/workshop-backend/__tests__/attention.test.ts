@@ -8,8 +8,9 @@ import { OverseerDurableObject } from "../src/overseer.js";
 import { makeUserStorage } from "../src/storage-schema/user-storage.js";
 import { OVERSEER_STORAGE_VERSION } from "../src/storage-schema/overseer-migrations.js";
 import { subjectAccountName } from "../src/account-subject.js";
-import { ATTENTION_BINDING_NAME, accountSubject, attentionItemKey, parseAttentionIntent,
-  type AttentionAuthority } from "../src/attention.js";
+import { ATTENTION_LABEL_CASES } from "./attention-label-cases.js";
+import { ATTENTION_BINDING_NAME, MAX_ATTENTION_LABEL, acceptedInferWorkUrl, accountSubject, attentionItemKey,
+  cleanAttentionLabel, inferWorkOriginsFrom, parseAttentionIntent, type AttentionAuthority } from "../src/attention.js";
 import type { AttentionIntent } from "../src/attention-binding";
 // The InferLab contract fixtures, pinned from inferops (scripts/inferlab-contracts).
 import intentFixtures from "../../../scripts/inferlab-contracts/fixtures/inferlab.attention-intent.v1.json";
@@ -75,6 +76,24 @@ class FakeAuthority implements AttentionAuthority {
   async visible(who: GatekeeperSubject, targets: AttentionTarget[]) {
     if (this.failVisible) throw new Error("InferOps unavailable");
     return targets.map(t => !this.hidden.has(`${subjectAccountName(who)}|${t.id}`));
+  }
+  labels = new Map<string, unknown>();   // target id → what describe answers
+  failDescribe = false;
+  describedAs: string[] = [];
+  async describe(who: GatekeeperSubject, targets: AttentionTarget[]) {
+    if (this.failDescribe) throw new Error("InferOps unavailable");
+    this.describedAs.push(subjectAccountName(who));
+    return targets.map(t => this.hidden.has(`${subjectAccountName(who)}|${t.id}`)
+      ? null : (this.labels.get(t.id) ?? null)) as (string | null)[];
+  }
+  openUrl: unknown = "https://work.example.test/r/project/location/x";
+  failOpen = false;
+  openedAs: {who: string; target: AttentionTarget}[] = [];
+  async open(who: GatekeeperSubject, target: AttentionTarget) {
+    if (this.failOpen) throw new Error("InferOps unavailable");
+    this.openedAs.push({who: subjectAccountName(who), target});
+    if (this.hidden.has(`${subjectAccountName(who)}|${target.id}`)) return null;
+    return {url: this.openUrl as string};
   }
 }
 
@@ -422,5 +441,133 @@ describe("the strict intent parser", () => {
   it("accepts the contract's valid intents and refuses its invalid ones", () => {
     for (let {value} of intentFixtures.valid) expect(parseAttentionIntent(value)).toEqual(value);
     for (let {value} of intentFixtures.invalid) expect(() => parseAttentionIntent(value)).toThrow();
+  });
+});
+
+describe("labels and opening (FAC-238)", () => {
+  const WORK = new Set(["https://work.example.test"]);
+  const describeItems = (user: DurableObjectStub<UserDurableObject>, authority: AttentionAuthority | null,
+      keys: string[]) =>
+    runInDurableObject(user, (instance: UserDurableObject) => {
+      instance.attentionAuthority = () => authority;
+      return instance.describeAttentionItems(keys);
+    });
+  const open = (user: DurableObjectStub<UserDurableObject>, authority: AttentionAuthority | null,
+      key: string, origins: Set<string> = WORK) =>
+    runInDurableObject(user, (instance: UserDurableObject) => {
+      instance.attentionAuthority = () => authority;
+      instance.inferWorkOrigins = () => origins;
+      return instance.openAttentionItem(key);
+    });
+
+  it("labels each of the person's own items with their own rights, null when gone, unknown or hidden", async () => {
+    let authority = new FakeAuthority();
+    let fixture = await setup(authority);
+    await raise(fixture, authority, INTENT);
+    let [item] = await read(fixture.owner, authority);
+    authority.labels.set(INTENT.target.id, "  Main\tyard\n(north)  ");
+    expect(await describeItems(fixture.owner, authority, [item!.itemKey, "not-a-key"]))
+      .toEqual(["Main yard (north)", null]);
+    expect(authority.describedAs).toEqual([fixture.ownerName]);
+    authority.labels.set(INTENT.target.id, "x".repeat(500));
+    expect((await describeItems(fixture.owner, authority, [item!.itemKey]))[0]).toHaveLength(MAX_ATTENTION_LABEL);
+    authority.labels.set(INTENT.target.id, 42);
+    expect(await describeItems(fixture.owner, authority, [item!.itemKey])).toEqual([null]);
+    authority.hidden.add(`${fixture.ownerName}|${INTENT.target.id}`);
+    expect(await describeItems(fixture.owner, authority, [item!.itemKey])).toEqual([null]);
+    // Another person's key names nothing in this person's list.
+    expect(await describeItems(fixture.viewer, authority, [item!.itemKey])).toEqual([null]);
+    // Without an authority: nothing to label. When it can't tell: a failure, never "gone".
+    expect(await describeItems(fixture.owner, null, [item!.itemKey])).toEqual([null]);
+    authority.failDescribe = true;
+    expect(await refusal(describeItems(fixture.owner, authority, [item!.itemKey]))).toBe("InferOps unavailable");
+    expect(await refusal(describeItems(fixture.owner, authority, Array(101).fill("k"))))
+      .toBe("At most 100 attention items can be described at once.");
+  });
+
+  it("looks a key up in the caller's own list only: a target-shaped key or another person's key names nothing", async () => {
+    let authority = new FakeAuthority();
+    let fixture = await setup(authority);
+    await raise(fixture, authority, INTENT);
+    let [item] = await read(fixture.owner, authority);
+    authority.labels.set(INTENT.target.id, "Main yard");
+    // The viewer holds no item. Keys shaped like the owner's target, or the owner's own key.
+    let t = INTENT.target;
+    let keys = [JSON.stringify(t), JSON.stringify({target: t}), `${t.tenantId}|${t.kind}|${t.id}`, t.id,
+      `inferops://acme.ops/${t.kind}/${t.id}`, item!.itemKey];
+    expect(await describeItems(fixture.viewer, authority, keys)).toEqual(keys.map(() => null));
+    for (let key of keys) {
+      expect(await refusal(open(fixture.viewer, authority, key)), key).toBe("That attention item isn't in your list.");
+    }
+    // The authority was never asked about that target on the viewer's behalf.
+    expect(authority.describedAs).toEqual([]);
+    expect(authority.openedAs).toEqual([]);
+    // The owner's item is untouched, and still theirs.
+    expect((await stored(fixture.owner))[0]?.personal).toBe("unread");
+    expect(await describeItems(fixture.owner, authority, [item!.itemKey])).toEqual(["Main yard"]);
+    expect(authority.describedAs).toEqual([fixture.ownerName]);
+  });
+
+  it("rejects an answer with the wrong number of labels rather than calling a record gone", async () => {
+    let authority = new FakeAuthority();
+    let fixture = await setup(authority);
+    await raise(fixture, authority, INTENT);
+    let [item] = await read(fixture.owner, authority);
+    for (let answer of [[] as string[], ["One", "Two"]]) {
+      authority.describe = async () => answer;
+      expect(await refusal(describeItems(fixture.owner, authority, [item!.itemKey])), JSON.stringify(answer))
+        .toBe("InferLab answered for a different number of attention items than were asked about.");
+    }
+    // Two items asked about, one answered: shorter.
+    authority.describe = async () => ["Only one"];
+    expect(await refusal(describeItems(fixture.owner, authority, [item!.itemKey, item!.itemKey])))
+      .toBe("InferLab answered for a different number of attention items than were asked about.");
+  });
+
+  it("opens only a validated InferWork link, resolved with the person's own rights for their own item", async () => {
+    let authority = new FakeAuthority();
+    let fixture = await setup(authority);
+    await raise(fixture, authority, INTENT);
+    let [item] = await read(fixture.owner, authority);
+    expect(await open(fixture.owner, authority, item!.itemKey))
+      .toEqual({url: "https://work.example.test/r/project/location/x"});
+    expect(authority.openedAs).toEqual([{who: fixture.ownerName, target: INTENT.target}]);
+    // Opening changes nothing about the item's personal state, nor anything in InferLab.
+    expect((await stored(fixture.owner))[0]?.personal).toBe("unread");
+
+    // Only an http(s) link with no user info, on a configured InferWork origin exactly.
+    for (let bad of ["https://evil.example/r/x", "https://work.example.test.evil.example/x",
+        "http://work.example.test/x", "https://user:pw@work.example.test/x", "javascript:alert(1)",
+        "data:text/html,x", "//work.example.test/x", "/r/x", 42, ""]) {
+      authority.openUrl = bad;
+      expect(await refusal(open(fixture.owner, authority, item!.itemKey)), String(bad))
+        .toBe("InferLab offered a link this deployment doesn't open.");
+    }
+    authority.openUrl = "https://work.example.test/r/project/location/x";
+    expect(await refusal(open(fixture.owner, authority, item!.itemKey, new Set())))
+      .toBe("InferLab offered a link this deployment doesn't open.");
+
+    // Not the person's item; not visible now; no authority; indeterminate.
+    expect(await refusal(open(fixture.viewer, authority, item!.itemKey))).toBe("That attention item isn't in your list.");
+    authority.hidden.add(`${fixture.ownerName}|${INTENT.target.id}`);
+    expect(await refusal(open(fixture.owner, authority, item!.itemKey))).toBe("You can't open this now.");
+    expect(await refusal(open(fixture.owner, null, item!.itemKey))).toBe("Attention is unavailable on this deployment.");
+    authority.hidden.clear();
+    authority.failOpen = true;
+    expect(await refusal(open(fixture.owner, authority, item!.itemKey))).toBe("InferOps unavailable");
+  });
+
+  it("reads INFERWORK_ORIGINS as bare http(s) origins only", () => {
+    expect([...inferWorkOriginsFrom({INFERWORK_ORIGINS: " https://work.example.test , http://localhost:19804,https://x.example/path,ftp://f.example,nonsense"})])
+      .toEqual(["https://work.example.test", "http://localhost:19804"]);
+    expect(inferWorkOriginsFrom({}).size).toBe(0);
+    expect(acceptedInferWorkUrl("http://localhost:19804/r/x", inferWorkOriginsFrom({INFERWORK_ORIGINS: "http://localhost:19804"})))
+      .toBe("http://localhost:19804/r/x");
+    expect(cleanAttentionLabel("\u0000\u0007 ")).toBeNull();
+  });
+
+  it("shows a label only when something visible is left: controls, whitespace and format characters out", () => {
+    for (const [input, visible] of ATTENTION_LABEL_CASES)
+      expect(cleanAttentionLabel(input), JSON.stringify(input)).toBe(visible === "" ? null : visible);
   });
 });

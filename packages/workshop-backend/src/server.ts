@@ -250,6 +250,14 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     return retryOnDoReset(() => this.#user.setAttentionState(itemKey, personal));
   }
 
+  describeAttentionItems(itemKeys: string[]): Promise<(string | null)[]> {
+    return retryOnDoReset(() => this.#user.describeAttentionItems(itemKeys));
+  }
+
+  openAttentionItem(itemKey: string): Promise<{url: string}> {
+    return retryOnDoReset(() => this.#user.openAttentionItem(itemKey));
+  }
+
   markAllRead(): Promise<void> {
     return retryOnDoReset(() => this.#user.markAllRead());
   }

@@ -109,6 +109,10 @@ declare global {
       // Public base URL of the deployment.
       PUBLIC_BASE_URL?: string;
 
+      // The InferWork origins attention items may open at (FAC-238): comma-separated bare origins,
+      // e.g. "https://work.inferops.io". A link InferLab offers on any other origin is refused.
+      INFERWORK_ORIGINS?: string;
+
       // What the service that installed this deployment wrote on its last upload of this Worker: a
       // JSON binding of the release, its version tag and its update links. Typed `unknown` because
       // deployServiceInstall() (deployment-updates.ts) is its only reader, and shape-checks it.

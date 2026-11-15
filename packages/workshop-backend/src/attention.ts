@@ -132,6 +132,79 @@ export interface AttentionAuthority {
 
   /** For each of `targets`, whether `subject` can see it now. Same length and order as `targets`. */
   visible(subject: GatekeeperSubject, targets: AttentionTarget[]): Promise<boolean[]>;
+
+  /**
+   * The label to show `subject` for each of `targets`, read now with their own InferLab rights (the
+   * record's name), or null when they can't see it or it is gone. Same length and order as
+   * `targets`. Throws when it can't tell, so a failure is never shown as "no longer available".
+   */
+  describe(subject: GatekeeperSubject, targets: AttentionTarget[]): Promise<(string | null)[]>;
+
+  /**
+   * Where `subject` opens `target`: the InferWork link InferLab's own resolver builds from its
+   * trusted application origins (`resource.resolve`, FAC-229), read with their own rights. Null when
+   * they may not open it now. Throws when it can't tell. The host still validates the link
+   * (`acceptedInferWorkUrl`); the destination checks access again when it is opened.
+   */
+  open(subject: GatekeeperSubject, target: AttentionTarget): Promise<{url: string} | null>;
+}
+
+/** The longest label shown for an attention item; a longer one is cut. */
+export const MAX_ATTENTION_LABEL = 200;
+
+/**
+ * A label as it may be shown: a trimmed single line, with control characters turned into spaces,
+ * format characters (zero-width, bidi and other `\p{Cf}`) removed, and at most MAX_ATTENTION_LABEL
+ * characters; or null for anything that isn't a string with something visible left in it.
+ * MIRRORED by the InferLab gatekeeper's `visibleName`: its `nameOf` treats a name this would null
+ * as unreadable. Both are held to `__tests__/attention-label-cases.ts`, byte-identical in each package.
+ */
+export function cleanAttentionLabel(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  // Char codes rather than a regex: a control character in a regex literal is a lint error.
+  let flat = Array.from(value, ch => {
+    let code = ch.charCodeAt(0);
+    return code < 0x20 || code === 0x7f || (code >= 0x80 && code < 0xa0) ? " " : ch;
+  }).join("").replace(/\p{Cf}/gu, "").replace(/\s+/g, " ").trim();
+  if (!flat) return null;
+  return flat.length <= MAX_ATTENTION_LABEL ? flat : `${flat.slice(0, MAX_ATTENTION_LABEL - 1)}…`;
+}
+
+/**
+ * The InferWork origins this deployment opens attention items at, from `INFERWORK_ORIGINS`: a
+ * comma-separated list of bare origins (`https://work.example.com`). An entry that isn't a bare
+ * http(s) origin is ignored; none configured means no item can be opened.
+ */
+export function inferWorkOriginsFrom(env: {INFERWORK_ORIGINS?: string}): Set<string> {
+  let origins = new Set<string>();
+  for (let entry of (env.INFERWORK_ORIGINS ?? "").split(",")) {
+    let value = entry.trim();
+    try {
+      let url = new URL(value);
+      if ((url.protocol === "https:" || url.protocol === "http:") && url.origin === value) origins.add(url.origin);
+    } catch {
+      // Not an origin: ignored.
+    }
+  }
+  return origins;
+}
+
+/**
+ * `value` as a link the Workshop may send someone to, or null. It must be an absolute http(s) URL
+ * with no user info, on one of `origins` exactly. Nothing else about it is trusted: the
+ * destination checks access again when it is opened.
+ */
+export function acceptedInferWorkUrl(value: unknown, origins: ReadonlySet<string>): string | null {
+  if (typeof value !== "string") return null;
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return null;
+  }
+  if (url.protocol !== "https:" && url.protocol !== "http:") return null;
+  if (url.username || url.password) return null;
+  return origins.has(url.origin) ? url.href : null;
 }
 
 /** The configured authority, or null when this deployment has none (attention is then refused). */
