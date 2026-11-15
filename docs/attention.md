@@ -1,5 +1,8 @@
 # Host attention
 
+Review Alerts (`inferlab.review-alerts`) is the bundled Gadget that does this (FAC-239): its Hook
+raises a `review_requested` item for the holders of `location:write`, citing InferOps' event.
+
 A Gadget can ask for people's attention without naming them, messaging them or seeing their
 answer (FAC-237). It names a target **reference** and an audience **rule**; the host decides,
 from InferLab's current view, who that is among the workspace's own members, and gives each one
