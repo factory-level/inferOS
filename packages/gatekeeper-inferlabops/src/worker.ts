@@ -315,6 +315,11 @@ export class OperationsUser extends WorkerEntrypoint<Cloudflare.Env, UserProps> 
     return identity ? { issuer: identity.issuer, subject: identity.subject } : null;
   }
 
+  /**
+   * This person's verifier, for observer checks. Not RPC-validated, like every gatekeeper's: the
+   * validator wraps a returned `Fetcher` in a Proxy that Workers RPC refuses to serialize.
+   */
+  @skipRpcValidation()
   async getVerifier(): Promise<Fetcher<GatekeeperUserVerifier>> {
     return this.ctx.exports.OperationsVerifier({ props: { accountId: this.ctx.props.accountId } });
   }

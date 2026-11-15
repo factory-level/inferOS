@@ -473,6 +473,15 @@ describe("observer access", () => {
     expect(await hooks().verify("o1", [observer.label], all)).toEqual([]);
   });
 
+  it("admits through the verifier each person's own user entrypoint hands out, as the Workshop takes it", async () => {
+    const owner = await connect("owner");
+    const observer = await connect("observer");
+    const nomember = await connect("nomember");
+    await hooks().open(owner.label, ADDRESS, "o1");
+    const all = [projectId(), locationId()];
+    expect(await hooks().verifyThroughUsers("o1", [observer.label, nomember.label], all)).toEqual([observer.label]);
+  });
+
   it("can't be told during an outage, so it throws rather than admit or deny", async () => {
     const owner = await connect("owner");
     const observer = await connect("observer");
