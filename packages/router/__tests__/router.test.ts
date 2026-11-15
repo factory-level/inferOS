@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { parse } from 'jsonc-parser';
 import router, { type Env } from '../src/index';
+import { FRAME_POLICY_HEADERS } from '../src/frame-policy';
+// The frontend's Static Assets headers, which the framing-policy tests hold in step with the router.
+import headersFileText from '../../workshop-frontend/public/_headers?raw';
 // Imported as text so the config-integrity tests run inside workerd without filesystem access.
 import wranglerConfigText from '../wrangler.jsonc?raw';
 
@@ -223,5 +226,82 @@ describe('wrangler.jsonc contract', () => {
       binding: 'WORKSHOP_BACKEND',
       service: 'workshop-backend',
     });
+  });
+});
+
+// FAC-232: InferOS may be framed only by itself. Most shell pages are served by Workers Static
+// Assets without running the router, from the `_headers` file the frontend build ships; the router
+// adds the same policy to the asset responses it returns itself.
+async function fetchFrom(env: Env, path: string): Promise<Response> {
+  return router.fetch!(new Request(`https://example.com${path}`), env, {} as ExecutionContext);
+}
+
+describe('framing policy', () => {
+  const FRAME_ANCESTORS = "frame-ancestors 'self'";
+
+  it('refuses framing by other origins on every asset response the router returns', async () => {
+    const env = makeEnv({ ASSETS: stubFetcher('assets') });
+    for (const path of ['/', '/workspace/abc', '/open/gadget?ref=x', '/gatekeeper/not-installed']) {
+      const res = await fetchFrom(env, path);
+      expect(await res.text(), path).toBe('assets');
+      expect(res.headers.get('Content-Security-Policy'), path).toBe(FRAME_ANCESTORS);
+      expect(res.headers.get('X-Frame-Options'), path).toBe('SAMEORIGIN');
+    }
+  });
+
+  it('keeps the status and headers of the asset response', async () => {
+    const assets = {
+      fetch: async () => new Response('<!doctype html>', {
+        status: 200, headers: { 'Content-Type': 'text/html', ETag: '"abc"' },
+      }),
+    } as unknown as Fetcher;
+    const res = await fetchFrom(makeEnv({ ASSETS: assets }), '/');
+    expect(res.status).toBe(200);
+    expect(res.headers.get('Content-Type')).toBe('text/html');
+    expect(res.headers.get('ETag')).toBe('"abc"');
+  });
+
+  it('never weakens a stricter policy, and adds to one that does not name framers', async () => {
+    const denying = {
+      fetch: async () => new Response('x', {
+        headers: { 'Content-Security-Policy': "frame-ancestors 'none'", 'X-Frame-Options': 'DENY' },
+      }),
+    } as unknown as Fetcher;
+    const strict = await fetchFrom(makeEnv({ ASSETS: denying }), '/');
+    expect(strict.headers.get('Content-Security-Policy')).toBe("frame-ancestors 'none'");
+    expect(strict.headers.get('X-Frame-Options')).toBe('DENY');
+
+    const scripts = {
+      fetch: async () => new Response('x', { headers: { 'Content-Security-Policy': "script-src 'self'" } }),
+    } as unknown as Fetcher;
+    const added = await fetchFrom(makeEnv({ ASSETS: scripts }), '/');
+    expect(added.headers.get('Content-Security-Policy')).toBe(`script-src 'self', ${FRAME_ANCESTORS}`);
+  });
+
+  it('leaves the API, gatekeepers and the dev fallthrough to their own headers', async () => {
+    const plain = recordingFetcher();
+    const env = makeEnv({
+      WORKSHOP_BACKEND: plain.fetcher,
+      ASSETS: stubFetcher('assets'),
+      GATEKEEPER_GOOGLE: stubFetcher('google'),
+    });
+    for (const path of ['/api/workshop', '/blueprint-screenshot/abc', '/gatekeeper/google/connect']) {
+      const res = await fetchFrom(env, path);
+      expect(res.headers.get('Content-Security-Policy'), path).toBeNull();
+      expect(res.headers.get('X-Frame-Options'), path).toBeNull();
+    }
+    const dev = await fetchFrom(makeEnv({ WORKSHOP_BACKEND: plain.fetcher }), '/');
+    expect(dev.headers.get('X-Frame-Options')).toBeNull();
+  });
+
+  it('is the policy the frontend build ships for the paths Static Assets serves itself', () => {
+    const lines = headersFileText.split('\n').map(line => line.trim())
+      .filter(line => line !== '' && !line.startsWith('#'));
+    expect(lines).toEqual([
+      '/*',
+      `Content-Security-Policy: ${FRAME_POLICY_HEADERS['Content-Security-Policy']}`,
+      `X-Frame-Options: ${FRAME_POLICY_HEADERS['X-Frame-Options']}`,
+    ]);
+    expect(FRAME_POLICY_HEADERS['Content-Security-Policy']).toBe(FRAME_ANCESTORS);
   });
 });
