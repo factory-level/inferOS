@@ -25,6 +25,8 @@ import { Route as BlueprintIdRouteImport } from './routes/blueprint.$id'
 import { Route as ConnectHandoffRouteImport } from './routes/connect.handoff'
 import { Route as GadgetIdRouteImport } from './routes/gadget.$id'
 import { Route as GatekeepersAppIdRouteImport } from './routes/gatekeepers_.$appId'
+import { Route as OpenBlueprintRouteImport } from './routes/open.blueprint'
+import { Route as OpenGadgetRouteImport } from './routes/open.gadget'
 import { Route as WorkspaceIdRouteImport } from './routes/workspace.$id'
 
 const IndexRoute = IndexRouteImport.update({
@@ -107,6 +109,16 @@ const GatekeepersAppIdRoute = GatekeepersAppIdRouteImport.update({
   path: '/gatekeepers/$appId',
   getParentRoute: () => rootRouteImport,
 } as any)
+const OpenBlueprintRoute = OpenBlueprintRouteImport.update({
+  id: '/open/blueprint',
+  path: '/open/blueprint',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const OpenGadgetRoute = OpenGadgetRouteImport.update({
+  id: '/open/gadget',
+  path: '/open/gadget',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const WorkspaceIdRoute = WorkspaceIdRouteImport.update({
   id: '/workspace/$id',
   path: '/workspace/$id',
@@ -130,6 +142,8 @@ export interface FileRoutesByFullPath {
   '/connect/handoff': typeof ConnectHandoffRoute
   '/gadget/$id': typeof GadgetIdRoute
   '/gatekeepers/$appId': typeof GatekeepersAppIdRoute
+  '/open/blueprint': typeof OpenBlueprintRoute
+  '/open/gadget': typeof OpenGadgetRoute
   '/workspace/$id': typeof WorkspaceIdRoute
 }
 export interface FileRoutesByTo {
@@ -149,6 +163,8 @@ export interface FileRoutesByTo {
   '/connect/handoff': typeof ConnectHandoffRoute
   '/gadget/$id': typeof GadgetIdRoute
   '/gatekeepers/$appId': typeof GatekeepersAppIdRoute
+  '/open/blueprint': typeof OpenBlueprintRoute
+  '/open/gadget': typeof OpenGadgetRoute
   '/workspace/$id': typeof WorkspaceIdRoute
 }
 export interface FileRoutesById {
@@ -169,6 +185,8 @@ export interface FileRoutesById {
   '/connect/handoff': typeof ConnectHandoffRoute
   '/gadget/$id': typeof GadgetIdRoute
   '/gatekeepers_/$appId': typeof GatekeepersAppIdRoute
+  '/open/blueprint': typeof OpenBlueprintRoute
+  '/open/gadget': typeof OpenGadgetRoute
   '/workspace/$id': typeof WorkspaceIdRoute
 }
 export interface FileRouteTypes {
@@ -190,6 +208,8 @@ export interface FileRouteTypes {
     | '/connect/handoff'
     | '/gadget/$id'
     | '/gatekeepers/$appId'
+    | '/open/blueprint'
+    | '/open/gadget'
     | '/workspace/$id'
   fileRoutesByTo: FileRoutesByTo
   to:
@@ -209,6 +229,8 @@ export interface FileRouteTypes {
     | '/connect/handoff'
     | '/gadget/$id'
     | '/gatekeepers/$appId'
+    | '/open/blueprint'
+    | '/open/gadget'
     | '/workspace/$id'
   id:
     | '__root__'
@@ -228,6 +250,8 @@ export interface FileRouteTypes {
     | '/connect/handoff'
     | '/gadget/$id'
     | '/gatekeepers_/$appId'
+    | '/open/blueprint'
+    | '/open/gadget'
     | '/workspace/$id'
   fileRoutesById: FileRoutesById
 }
@@ -248,6 +272,8 @@ export interface RootRouteChildren {
   ConnectHandoffRoute: typeof ConnectHandoffRoute
   GadgetIdRoute: typeof GadgetIdRoute
   GatekeepersAppIdRoute: typeof GatekeepersAppIdRoute
+  OpenBlueprintRoute: typeof OpenBlueprintRoute
+  OpenGadgetRoute: typeof OpenGadgetRoute
   WorkspaceIdRoute: typeof WorkspaceIdRoute
 }
 
@@ -365,6 +391,20 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof GatekeepersAppIdRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/open/blueprint': {
+      id: '/open/blueprint'
+      path: '/open/blueprint'
+      fullPath: '/open/blueprint'
+      preLoaderRoute: typeof OpenBlueprintRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/open/gadget': {
+      id: '/open/gadget'
+      path: '/open/gadget'
+      fullPath: '/open/gadget'
+      preLoaderRoute: typeof OpenGadgetRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/workspace/$id': {
       id: '/workspace/$id'
       path: '/workspace/$id'
@@ -392,6 +432,8 @@ const rootRouteChildren: RootRouteChildren = {
   ConnectHandoffRoute: ConnectHandoffRoute,
   GadgetIdRoute: GadgetIdRoute,
   GatekeepersAppIdRoute: GatekeepersAppIdRoute,
+  OpenBlueprintRoute: OpenBlueprintRoute,
+  OpenGadgetRoute: OpenGadgetRoute,
   WorkspaceIdRoute: WorkspaceIdRoute,
 }
 export const routeTree = rootRouteImport
