@@ -192,6 +192,24 @@ export class TestHooks extends DurableObject<Cloudflare.Env> {
     }
   }
 
+  /**
+   * verifyObserverAccess with each observer's verifier taken as the Workshop takes it: from that
+   * person's own user entrypoint, `getVerifier()`, across RPC. Returns the admitted labels, or the
+   * thrown message.
+   */
+  async verifyThroughUsers(key: string, observerLabels: string[], subresources: string[]): Promise<string[] | string> {
+    const facet = this.ctx.facets.get<ProjectGatekeeper>(`gk-${key}`, () => { throw new Error("no facet"); });
+    try {
+      const observers = await Promise.all(observerLabels.map(async label => ({
+        id: label,
+        verifier: await this.#exports.OperationsUser({ props: { accountId: await this.#accountId(label) } }).getVerifier(),
+      })));
+      return (await facet.verifyObserverAccess(observers, subresources)).allowedObserverIds;
+    } catch (error) {
+      return (error as Error).message;
+    }
+  }
+
   async revoke(label: string): Promise<void> {
     await (await this.#account(label)).revoke();
   }
