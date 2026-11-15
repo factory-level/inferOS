@@ -30,8 +30,11 @@ const HOOK = { type: "review-alerts" } as const;
 /** The storage key recording that the hook was made, so a second watch makes no second hook. */
 const WATCHING_KEY = "watching";
 
-/** Who a review alert is for: the people who may act on the Location. */
-export const ALERT_PERMISSION = "location:write";
+/**
+ * Who a review alert is for: the people who may act on the Location. Not exported: a gadget's
+ * module exports only its entrypoints (workerd refuses any other value, and the worker won't start).
+ */
+const ALERT_PERMISSION = "location:write";
 
 const WATCHING = "Watching for reviews. Turn the hook on in Activity to be alerted.";
 const NO_EVENTS = "This InferOS doesn't receive InferOps events for that workspace, so it can't watch for reviews.";
@@ -64,7 +67,7 @@ export function failureOf(error: unknown): ReadFailure {
 }
 
 /** The hook InferOps' events reach: one alert per review requested, citing the event. */
-export class ReviewHook extends RpcTarget {
+class ReviewHook extends RpcTarget {
   readonly #attention: Attention | undefined;
 
   constructor(attention: Attention | undefined) {

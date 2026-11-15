@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { describe, expect, it } from "vitest";
 import { restore } from "cloudflare:workers";
-import { ALERT_PERMISSION, ExportHandler, Gadget, failureOf } from "../files/server.ts";
+import { ExportHandler, Gadget, failureOf } from "../files/server.ts";
 import type { GadgetEnv, ProjectSession } from "../files/lib/protocol.ts";
 
 type Location = Awaited<ReturnType<ProjectSession["listLocations"]>>["items"][number];
@@ -203,12 +203,21 @@ describe("Review Alerts watching", () => {
       v: 1, sourceEventId: "evt-1", reason: "review_requested", target,
       audience: { kind: "permission-holders", workspaceId: "ws-1", permission: "location:write" },
     }]);
-    expect(ALERT_PERMISSION).toBe("location:write");
   });
 
   it("a hook without the attention capability fails loudly", async () => {
     const hook = await watcher({}).g[restore]({ type: "review-alerts" });
     await expect(hook.receiveEvent({ eventId: "e", workspaceId: "w", location: { ref: { v: 1, tenantId: "t", kind: "k", id: "i" } } }))
       .rejects.toThrow("Attention is unavailable");
+  });
+});
+
+// workerd starts a gadget's worker only if every export is an entrypoint (a class or a handler);
+// any other exported value, a string constant say, fails the whole worker.
+describe("Review Alerts server module", () => {
+  it("exports only entrypoints and functions", async () => {
+    const module = await import("../files/server.ts");
+    for (const [name, value] of Object.entries(module))
+      expect({ name, type: typeof value }).toEqual({ name, type: "function" });
   });
 });
