@@ -484,6 +484,22 @@ describe("labels and opening (FAC-238)", () => {
       .toBe("At most 100 attention items can be described at once.");
   });
 
+  it("rejects an answer with the wrong number of labels rather than calling a record gone", async () => {
+    let authority = new FakeAuthority();
+    let fixture = await setup(authority);
+    await raise(fixture, authority, INTENT);
+    let [item] = await read(fixture.owner, authority);
+    for (let answer of [[] as string[], ["One", "Two"]]) {
+      authority.describe = async () => answer;
+      expect(await refusal(describeItems(fixture.owner, authority, [item!.itemKey])), JSON.stringify(answer))
+        .toBe("InferLab answered for a different number of attention items than were asked about.");
+    }
+    // Two items asked about, one answered: shorter.
+    authority.describe = async () => ["Only one"];
+    expect(await refusal(describeItems(fixture.owner, authority, [item!.itemKey, item!.itemKey])))
+      .toBe("InferLab answered for a different number of attention items than were asked about.");
+  });
+
   it("opens only a validated InferWork link, resolved with the person's own rights for their own item", async () => {
     let authority = new FakeAuthority();
     let fixture = await setup(authority);

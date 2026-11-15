@@ -1192,6 +1192,11 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     let labels: (string | null)[] = itemKeys.map(() => null);
     if (!authority || !subject || known.length === 0) return labels;
     let described = await authority.describe(subject, known.map(k => k.target));
+    // One answer per target, or none at all: a short or long answer would make a missing entry read
+    // as "no longer available", telling the person an accessible record is gone.
+    if (!Array.isArray(described) || described.length !== known.length) {
+      throw new Error("InferLab answered for a different number of attention items than were asked about.");
+    }
     known.forEach((k, j) => { labels[k.i] = cleanAttentionLabel(described[j]); });
     return labels;
   }
