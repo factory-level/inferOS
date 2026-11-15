@@ -148,7 +148,7 @@ export class FakeInferOps {
 }
 
 /** The handoff page's ticket, as the kit's `connectHandoffPageHtml` embeds it. */
-async function ticketOf(page: Response): Promise<string> {
+async function ticketOf(page: { status: number; text(): Promise<string> }): Promise<string> {
   const ticket = /var ticket = (".*?");\n/.exec(await page.text());
   if (!ticket) throw new Error(`The handoff page (HTTP ${page.status}) carried no ticket`);
   return JSON.parse(ticket[1]!) as string;
