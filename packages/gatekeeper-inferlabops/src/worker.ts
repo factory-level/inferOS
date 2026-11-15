@@ -47,6 +47,7 @@ import {
 import type { Location, LocationPage, Project, ProjectSession } from "./types";
 import PROJECT_CONFIGURATOR_HTML from "./generated/project-configurator-ui.txt";
 import TYPES_CODE from "./types.txt";
+import { visibleName } from "./label";
 
 export { OperationsAccount, SubjectIndex };
 
@@ -689,18 +690,12 @@ function recordPath(target: AttentionTarget, tenantId: string): string | null {
 
 /**
  * A Project's or Location's name, from InferOps' answer. An answer without a usable name is
- * unreadable and throws: not a string, or nothing left once control characters and whitespace
- * are taken out (the host's label cleaning would turn that into null, which reads as "gone").
+ * unreadable and throws: not a string, or nothing visible in it (`visibleName`), which the host
+ * would show as null and so read as "gone".
  */
 function nameOf(body: unknown): string {
   const name = (body as { name?: unknown } | null)?.name;
-  if (typeof name !== "string") throw new Error("InferOps answered an unreadable record");
-  // Char codes rather than a regex: a control character in a regex literal is a lint error.
-  const visible = Array.from(name, ch => {
-    const code = ch.charCodeAt(0);
-    return code < 0x20 || code === 0x7f || (code >= 0x80 && code < 0xa0) ? " " : ch;
-  }).join("").trim();
-  if (!visible) throw new Error("InferOps answered an unreadable record");
+  if (typeof name !== "string" || !visibleName(name)) throw new Error("InferOps answered an unreadable record");
   return name;
 }
 

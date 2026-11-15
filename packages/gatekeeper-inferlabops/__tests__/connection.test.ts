@@ -4,6 +4,8 @@
 import { env } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import worker from "../src/worker.js";
+import { visibleName } from "../src/label.js";
+import { ATTENTION_LABEL_CASES } from "./attention-label-cases.js";
 import { GATEKEEPER_PATH, ISSUER_PATTERN, NOT_CONFIGURED, OPERATIONS_CALLBACK_PATH, readConfig } from "../src/config.js";
 import { ISSUER_PATTERN as SIGN_IN_ISSUER_PATTERN } from "../../gatekeeper-inferlab/src/config.js";
 
@@ -678,8 +680,9 @@ describe("attention authority", () => {
     });
     expect(await attention("describe", ownerS, [target])).toEqual({ thrown: expect.stringMatching(/unreadable/) });
     expect(await attention("open", ownerS, target)).toEqual({ thrown: expect.stringMatching(/unreadable/) });
-    // A name with nothing visible in it is unreadable too, never "no longer available".
-    for (const name of ["", "   ", "\t\n", "\u0000\u0007", "\u0085 \u007f"]) {
+    // A name with nothing visible in it is unreadable too, never "no longer available": every name
+    // the shared case table says shows as nothing (the host would null it), zero-width ones included.
+    for (const name of ATTENTION_LABEL_CASES.filter(([, visible]) => visible === "").map(([input]) => input)) {
       vi.stubGlobal("fetch", async (input: RequestInfo, init?: RequestInit) => {
         const url = new URL(typeof input === "string" ? input : (input as Request).url);
         if (url.pathname === `/project/locations/${LOC}`) return Response.json({ id: LOC, name });
@@ -687,6 +690,10 @@ describe("attention authority", () => {
       });
       expect(await attention("describe", ownerS, [target])).toEqual({ thrown: expect.stringMatching(/unreadable/) });
     }
+  });
+
+  it("names show exactly what the host's label would: the shared case table", () => {
+    for (const [input, visible] of ATTENTION_LABEL_CASES) expect(visibleName(input), JSON.stringify(input)).toBe(visible);
   });
 
   it("describe: reads at most a few targets at once, answering every one in order", async () => {
