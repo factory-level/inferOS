@@ -125,3 +125,5 @@ the deployment's `AttentionAuthority` (InferLab) decides who may see what, and e
 DO keeps one item per event with their own read state, re-checking visibility at every read. Read
 [docs/attention.md](../../docs/attention.md) before changing `src/attention.ts`, the `"attention"`
 loopback target, or `attentionItems`.
+
+Canonical cross-repository engineering context: [InferOps maintainer guide](https://github.com/factory-level/inferops/blob/develop/docs/agent/architecture/inferos/coding-entrypoints.md). Local execution instructions above remain applicable to this checkout.
