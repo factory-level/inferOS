@@ -1,223 +1,47 @@
 # Sign-in via authentication gatekeepers
 
-Sign-in is provided by **authentication gatekeepers** — gatekeepers that advertise `providesAuth`
-and can return a provider-verified email. Each such gatekeeper uses a single OAuth app for both
-sign-in and (when the user later connects it) its capabilities, so there's only one OAuth app per
-provider — no separate "login" vs. "gatekeeper" apps.
+The maintained documentation lives in [the canonical InferOps reference](https://github.com/factory-level/inferops/blob/develop/docs/agent/architecture/inferos/oauth-signin.md).
 
-It's an optional, **additive** feature: for each allowlisted, auth-capable gatekeeper a "Continue
-with …" button appears **alongside** the normal username/password form. Off by default — with an
-empty allowlist the Workshop behaves as before (username/password, or Cloudflare Access).
+This file is a navigation entrypoint. Original source: `0af551d6d9c13be206d02c9c4fa3a7643fc0665f`. The canonical page records provider-specific behavior, historical evidence and current integration limits.
 
-The deployment opts gatekeepers into sign-in via the `AUTH_GATEKEEPERS` allowlist (comma-separated
-vendor ids). Set `DISABLE_PASSWORD_AUTH=true` to hide username/password and offer gatekeeper sign-in
-only (ignored unless the allowlist is non-empty, to avoid locking everyone out).
+The headings below preserve existing repository links. Read the canonical page for the corresponding section.
 
 ## Identity: keyed by verified email
 
-The primary account key is always the user's **verified email**. Signing in with any allowlisted
-gatekeeper that yields the same verified email resolves to the same account — its `UserDurableObject`
-is addressed by `idFromName(email)` (the same scheme as Cloudflare Access). Each gatekeeper must only
-return an email the provider has verified (Google `email_verified`, a GitHub primary+verified email,
-the Cloudflare account email); otherwise it returns null and can't be used to sign in.
+[Read the canonical reference](https://github.com/factory-level/inferops/blob/develop/docs/agent/architecture/inferos/oauth-signin.md).
 
 ### Keyed by stable subject (`providesSubject`)
 
-A gatekeeper that also declares `VendorDescription.providesSubject` (today only InferLab,
-`packages/gatekeeper-inferlab`) signs people in by the provider's **stable subject** instead:
-`GatekeeperUser.getAuthenticatedSubject()` answers `{ issuer, subject }`, and the account is
-`idFromName(subjectAccountName(subject))`, `subject~<issuer>~<subject>` with each part URI-encoded
-(`packages/workshop-backend/src/account-subject.ts`). The email is display data only: it seeds the
-display name on first sign-in and is never a key, so a changed address keeps the account and two
-subjects that share an address stay two accounts. A missing or malformed subject (an issuer that
-isn't a bare https origin, or http on loopback; a subject outside 1 to 255 printable ASCII
-characters) fails the sign-in; it never falls back to the email. The issuer must also be the one
-`AUTH_GATEKEEPER_ISSUERS` names for that vendor (`<vendor id>=<origin>` pairs), so a gatekeeper can
-only sign in people of the provider the deployment trusts it for. That setting is parsed strictly:
-an empty item, a missing `=`, a bad vendor id, whitespace in an origin, an origin outside the
-contract's issuer rule, or a vendor named twice invalidates all of it, so no vendor signs anyone in
-by subject until it is fixed. The session token is
-`"<subject account name>:<secret>"`. `ADMINS` lists these account names, never an email, for
-such accounts. The name matches the InferLab contract's `subjectKey`
-(`scripts/inferlab-contracts`, inferops ADR 0020).
+[Read the canonical reference](https://github.com/factory-level/inferops/blob/develop/docs/agent/architecture/inferos/oauth-signin.md).
 
 ## Incremental scopes
 
-Sign-in requests only the **minimal scopes** needed to verify the user's email (e.g. GitHub
-`read:user user:email`, Google `openid email profile`, Cloudflare `offline_access user-details.read`),
-and the gatekeeper grant created for login is **transient** — it self-destructs shortly after the
-email is read, so signing in never leaves a broad authorization lying around. The fuller capability
-scopes (repos, Gmail/Docs, AI Gateway billing) are requested only later, when the user explicitly
-**connects the gatekeeper** (`connectAccount(vendorId)` with the default `scopes: "full"`), which is
-what persists a usable connected account. `GatekeeperVendor.connectAccount` takes
-`{ scopes: "auth" | "full" }` to choose between the two.
+[Read the canonical reference](https://github.com/factory-level/inferops/blob/develop/docs/agent/architecture/inferos/oauth-signin.md).
 
 ## Sign-in flow
 
-1. The client calls `PublicApi.startGatekeeperLogin(vendorId)`. The backend mints a per-flow
-   nonce, creates a short-lived `PendingLogin` DO named by the nonce's hash, hands the gatekeeper a
-   `LoginConnectCallbackImpl`, and returns the gatekeeper's OAuth `url`, the `nonce`, and an
-   `attempt` stub (a capability wrapping the `PendingLogin` DO — no login id is exposed to the
-   client). The handoff that follows is the same one every connect flow uses; see
-   [connect-handoff.md](connect-handoff.md).
-2. The client opens `url` as a disowned pop-up, writing the nonce into the pop-up's own
-   sessionStorage before navigating it (`openDisownedPopup` in `connectHandoff.ts`). No page in the
-   flow ever holds `window.opener`.
-3. When the gatekeeper finishes, it calls `complete(user)`. The callback reads
-   `user.getAuthenticatedEmail()`, resolves/creates the email-keyed `UserDurableObject`, mints a
-   session, and parks the `"<email>:<secret>"` token in the `PendingLogin` DO under the hash of a
-   fresh handoff ticket. `complete()` returns that ticket, and the gatekeeper's final page
-   (`connectHandoffPageHtml` in gatekeeper-kit) navigates the pop-up to the Workshop's
-   `/connect/handoff` page with the ticket in the URL fragment.
-4. That page calls `PublicApi.confirmLogin(ticket, nonce)`, which finds the `PendingLogin` DO by the
-   nonce's hash and marks the delivered token confirmed if the ticket matches. The login tab polls
-   `attempt.receive()`, which releases the token only once it is confirmed, once. This is what binds
-   the session to the browser that started the attempt: the sign-in URL is a bearer capability, so
-   whoever holds `attempt` without the pop-up holding the nonce (an attacker who phished a victim
-   into finishing the flow) gets nothing, and the unreceived token is wiped after two minutes. The
-   pop-up never sees the token.
-5. The client stores the token and authenticates as usual.
-
-Sign-in does **not** persist a connected account: the minimal-scope grant is only used to read the
-email and is then discarded by the gatekeeper. To use a gatekeeper's capabilities (repos, Gmail/Docs)
-or Cloudflare AI Gateway billing, the user explicitly **connects** it afterward (which requests the
-full scopes and persists the connection).
+[Read the canonical reference](https://github.com/factory-level/inferops/blob/develop/docs/agent/architecture/inferos/oauth-signin.md).
 
 ## Native app return after installation sign-in
 
-The native Cloudflare OS shell uses a system authentication session, rather than an embedded web
-view, to sign in to an installation. This is required for identity-provider and security-key flows
-that reject or cannot complete in embedded browsers. The app opens the installation with a fresh
-opaque `cfos_native_state` value and a fresh, non-extractable P-256 key pair, passing only the
-public key as `cfos_native_key`. That uncompressed 65-byte public key is encoded as 87 characters
-of unpadded base64url.
-
-Once the browser is authenticated, the Workshop presents an explicit **Continue in Cloudflare
-OS** confirmation. It does not mint a transfer merely because a specially formed URL was loaded.
-After confirmation:
-
-1. `AuthenticatedApi.beginDeviceSessionHandoff()` stages an encrypted transfer in the authenticated
-   user's Durable Object. Page JavaScript receives its routing `userDoId` and a single-use, 256-bit
-   hex `ticket`; only the ticket's SHA-256 hash is stored with the transfer. It never receives the
-   encrypted envelope or its credential. Retrying a staged state reissues the ticket without
-   minting another credential, invalidating the earlier ticket.
-2. The page performs a same-origin, top-level form POST containing `userDoId`, `state`, and `ticket`
-   to `/api/device-session/callback`. The ticket is required to redeem the transfer, while the
-   navigation headers are CSRF checks, not authentication. In Access mode the route also verifies
-   the Access JWT and requires its user to own the `userDoId`, including when the backend Worker
-   is reached directly. The endpoint rejects fetches, frames, cross-origin requests, duplicate
-   fields, malformed values, and wrong owners before it consumes anything.
-3. The endpoint atomically consumes the staged record and returns a `303` to the fixed claimed HTTPS
-   app link `https://os.cloudflare.app/oauthredirect?cfos_callback=install-connected&…` for mobile
-   (see below for desktop callback delivery). The native
-   app verifies the state, decrypts the envelope with its per-attempt private key, and validates the
-   credential before storing it in platform secure storage. A web page cannot claim this callback;
-   the app-domain association controls which installed native app receives it.
-
-The transfer is server-enforced as single-use and expires after two minutes, independently of the
-credential encrypted inside it. A password or gatekeeper-authenticated installation gets a new
-Workshop device session which remains unusable until the callback consumes the transfer and which
-the server expires after 30 days. A Cloudflare Access installation transfers its current Access
-JWT; that credential retains the Access policy and JWT `exp` chosen by the installation's Access
-configuration. The native app cannot refresh or extend it, and the user must complete Access again
-after it expires. The app also needs to preserve any Access binding cookie required by that
-installation's policy.
-
-The encrypted wire payload is a `DeviceSessionTransfer`: a discriminated credential plus the
-two-minute transfer deadline. Its `workshop` token is `<user-id>:<standard-base64-secret>` (the
-32-byte session secret is padded standard base64); its `cloudflare-access` token is the Access
-application JWT. The envelope's P-256 public key, salt, IV, and ciphertext are all unpadded
-base64url. Encryption uses ephemeral P-256 ECDH, HKDF-SHA-256, and AES-GCM with the opaque state as
-additional authenticated data. There is no central native-login relay, poller, or cross-install
-session store; each installation owns and consumes its transfers.
-
-Inside an installation's embedded web view, the native shell exposes the versioned
-`window.cloudflareOSNative` capability. The Workshop calls `loginReady()` only after its normal
-`whoami()` call confirms authentication. It may call `loginReady()` again after a reconnect, so the
-app treats that notification as idempotent. The Workshop offers **Back to installs** through
-`returnToInstalls()`.
-Notification enrollment is an optional capability on the same object. The legacy notification
-globals remain temporarily as a fallback for the currently distributed TestFlight build; new
-navigation and login behavior uses only the versioned object. These native hooks are available in
-every installation and are not conditioned on Cloudflare Access mode.
+[Read the canonical reference](https://github.com/factory-level/inferops/blob/develop/docs/agent/architecture/inferos/oauth-signin.md).
 
 ### Desktop callback delivery
 
-Desktop clients use the same encrypted device-session protocol and explicit browser confirmation.
-They bind a fresh IPv4 loopback listener before opening the system browser and use state of the
-form `desktop-v1.<port>.<43-character-base64url-nonce>`. The callback route recognizes only this
-reserved form, a port in 1024–65535, and the fixed destination
-`http://127.0.0.1:<port>/oauthredirect`; malformed desktop state fails before ticket consumption.
-All other state retains the claimed HTTPS mobile callback. No arbitrary redirect URL, host,
-scheme, or path is accepted. Only ciphertext crosses loopback, authenticated against the complete
-state and decryptable by that attempt's private key. Desktop listeners validate their exact Host,
-state, envelope and deadline, consume one response, and close on completion/cancellation/timeout.
-Like mobile shells, desktop clients commit the credential only after their origin-bound main-frame
-native bridge reports authenticated `loginReady`. App sign-in is separate from any local Computer
-Operator registration or permission grant. Access policies requiring an additional binding cookie
-still need that cookie; encrypted JWT transfer does not bypass those policies.
+[Read the canonical reference](https://github.com/factory-level/inferops/blob/develop/docs/agent/architecture/inferos/oauth-signin.md).
 
 ## Configuration
 
-```
-PUBLIC_BASE_URL=https://your-host
-AUTH_GATEKEEPERS=cloudflare,google,github   # which gatekeepers may sign users in (order = button order)
-
-# Optional: gatekeeper sign-in only (hide username/password).
-DISABLE_PASSWORD_AUTH=true
-```
-
-OAuth app credentials live on the **gatekeeper Workers**, not the backend. Register each gatekeeper's
-OAuth app with its own redirect URI:
-
-- Google: `${PUBLIC_BASE_URL}/gatekeeper/google/oauth`
-- GitHub: `${PUBLIC_BASE_URL}/gatekeeper/github/oauth`
-- Cloudflare: `${PUBLIC_BASE_URL}/gatekeeper/cloudflare/oauth`
-
-In local dev, `run-dev-server.ts` seeds each gatekeeper's `CLIENT_ID`/`CLIENT_SECRET` from
-`GOOGLE_*` / `GITHUB_*` / `CLOUDFLARE_OAUTH_*` shell vars.
+[Read the canonical reference](https://github.com/factory-level/inferops/blob/develop/docs/agent/architecture/inferos/oauth-signin.md).
 
 ## Storage / bindings
 
-- `PendingLogin` (DO) — short-lived bridge between a gatekeeper login pop-up and the browser that
-  started the attempt, reached via `ctx.exports` (no explicit binding) and named by the hash of the
-  attempt's nonce. Stores the delivered token under the ticket's hash until the pop-up's
-  `confirmLogin()` confirms it and the login tab's `receive()` consumes it; an alarm wipes an
-  unreceived result after two minutes.
+[Read the canonical reference](https://github.com/factory-level/inferops/blob/develop/docs/agent/architecture/inferos/oauth-signin.md).
 
 ## InferLab
 
-`packages/gatekeeper-inferlab` is sign-in only: it refuses any `connectAccount` but
-`scopes: "auth"`, lists no resources, and its account refuses every request for access, so signing
-in grants nothing. It runs InferLab central-auth's authorization-code + PKCE flow as the public
-client `inferos`: one `SignInAttempt` Durable Object per attempt holds the Workshop's callback, the
-kit's single-use initiation and OAuth nonces (`connect-handshake`) and the PKCE verifier; the
-redirect URI is exactly `<BASE_URL>/oauth`; `/authorize` carries `prompt=select_account`, InferLab's
-account chooser. The code is exchanged server-side, the InferLab session is ended at once, and a
-session in another company than `INFEROPS_COMPANY` is refused. It needs five settings, with no default or fallback for any of them:
-
-| Setting | Where | If missing or invalid |
-| --- | --- | --- |
-| `AUTH_GATEKEEPERS` including `inferlab` | backend | No "Continue with InferLab"; starting one is refused with `Sign-in via "inferlab" is not enabled on this deployment.` |
-| `AUTH_GATEKEEPER_ISSUERS` with `inferlab=<issuer>` | backend | Starting a sign-in is refused, and a callback that still arrives fails, with `Sign-in is off: ` and the parser's reason: `AUTH_GATEKEEPER_ISSUERS has no entry for "inferlab"…`, or `AUTH_GATEKEEPER_ISSUERS entry <n> (…) …` for a malformed or duplicate entry, which turns off every subject vendor |
-| `INFERLAB_AUTH_ORIGIN` (the issuer) | gatekeeper | `InferLab sign-in is off: INFERLAB_AUTH_ORIGIN is missing or isn't an https origin…` |
-| `INFEROPS_COMPANY` (a tenant id) | gatekeeper | `InferLab sign-in is off: INFEROPS_COMPANY is missing or isn't a tenant id.` |
-| `BASE_URL` ending in `/gatekeeper/inferlab` | gatekeeper | `InferLab sign-in is off: BASE_URL is missing, isn't https (or http on a loopback host), or doesn't end in /gatekeeper/inferlab.` |
-
-The redirect is then `<origin>/gatekeeper/inferlab/oauth`, the path InferOps registers. An issuer
-that is configured but differs from the subject's fails with `This sign-in came from an identity
-provider this deployment doesn't trust.` Messages name settings and entry positions, never values. Business access through InferOps is a separate connection (FAC-235). The
-package README holds the ledger of what was ported from the archived fork.
+[Read the canonical reference](https://github.com/factory-level/inferops/blob/develop/docs/agent/architecture/inferos/oauth-signin.md).
 
 ## Code layout
 
-```
-auth/
-├── config.ts         # AUTH_GATEKEEPERS allowlist; password-auth toggle
-├── auth-vendors.ts    # GATEKEEPER_<NAME> binding lookup helpers
-└── login-flow.ts      # PendingLogin DO + LoginConnectCallbackImpl
-```
-
-Client-side: `ServerConfigContext` exposes `authVendors` and `passwordAuthEnabled`;
-`components/auth/OAuthButtons` renders the sign-in options (disowned pop-up carrying the nonce, polled
-`attempt.receive()`); `ConnectHandoffPage` is the pop-up's landing page (`confirmLogin(ticket, nonce)`).
+[Read the canonical reference](https://github.com/factory-level/inferops/blob/develop/docs/agent/architecture/inferos/oauth-signin.md).
