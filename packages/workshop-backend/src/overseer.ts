@@ -12587,6 +12587,8 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
       config: chatMeta.aiModel!.config,
       initiator: this.impl.gadgetAuthorFor(chatMeta.profile),
       metadata: { source: "model-binding", gadgetId: this.impl.ctx.id.toString() },
+      // Whose daily limit a platform-funded call of this binding counts against (FAC-296).
+      ownerId: this.impl.ownerId,
     }
 
     let creationSpec: GatekeeperCreationSpec = {

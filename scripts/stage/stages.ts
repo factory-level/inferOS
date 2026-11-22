@@ -163,6 +163,11 @@ export function stageDefinitionProblems(stage: StageDefinition): string[] {
     problems.push(`inferops.company must be "internal" or a lowercase tenant id`);
   }
   const proxy = stage.inferops.authorizeOrigin;
+  // Dev only, structurally: a production stage (one that deploys only from a clean tree) never
+  // serves InferLab's sign-in pages from a hostname of its own.
+  if (proxy !== undefined && stage.requireCleanTree) {
+    problems.push("inferops.authorizeOrigin is for a dev stage only; a production stage can't have a sign-in proxy");
+  }
   if (proxy !== undefined) {
     if (!isBareHttpsOrigin(proxy) || proxy === stage.inferops.authOrigin) {
       problems.push(`inferops.authorizeOrigin "${proxy}" must be a bare https:// origin other than authOrigin`);

@@ -282,19 +282,42 @@ export function stageBackendSecrets({
 const EDGE_SECRET = /^[A-Za-z0-9_-]{32,}$/;
 
 /**
+ * The edge secret input for each stage: its own name, so one stage's value (a dev secret left in the
+ * shell) never deploys to another. Listed out, not built from the name, so env-passthrough.test.ts
+ * (which discovers env reads textually) sees each one.
+ */
+export function stageEdgeSecretInput(stageName: string): string | undefined {
+  const inputs: Record<string, string | undefined> = {
+    dev: process.env.INFEROPS_EDGE_SECRET_DEV,
+    prod: process.env.INFEROPS_EDGE_SECRET_PROD,
+  };
+  return inputs[stageName];
+}
+
+/** The input name {@link stageEdgeSecretInput} reads for a stage. */
+export const stageEdgeSecretName = (stageName: string): string => `INFEROPS_EDGE_SECRET_${stageName.toUpperCase()}`;
+
+/**
  * Each InferLab gatekeeper's secrets: `INFEROPS_EDGE_SECRET` when the stage has one, the shared
- * value InferLab's edge lets through (FAC-296 part 2). Both gatekeepers send it, to the InferLab
- * origin only. A value that isn't the WAF rule's shape stops the run rather than deploying a stage
- * InferLab will refuse; the value is never shown.
+ * value InferLab's edge lets through (FAC-296 part 2), from the stage's own input
+ * (`INFEROPS_EDGE_SECRET_<STAGE>`). Both gatekeepers send it, to the InferLab origin only. A value
+ * that isn't the WAF rule's shape stops the run rather than deploying a stage InferLab will refuse,
+ * and so does a bare `INFEROPS_EDGE_SECRET` in the shell, which names no stage. No value is shown.
  */
 export function stageGatekeeperSecrets({
-  edgeSecret = process.env.INFEROPS_EDGE_SECRET,
-}: { edgeSecret?: string } = {}): Record<string, Record<string, string>> {
+  stageName,
+  edgeSecret = stageEdgeSecretInput(stageName),
+  bareEdgeSecret = process.env.INFEROPS_EDGE_SECRET,
+}: { stageName: string; edgeSecret?: string; bareEdgeSecret?: string }): Record<string, Record<string, string>> {
+  if (bareEdgeSecret?.trim()) {
+    throw new Error(`INFEROPS_EDGE_SECRET names no stage; set ${stageEdgeSecretName(stageName)} for ` +
+        `this stage instead, and unset INFEROPS_EDGE_SECRET (its value is not shown)`);
+  }
   const value = edgeSecret?.trim();
   if (!value) return {};
   if (!EDGE_SECRET.test(value)) {
-    throw new Error("INFEROPS_EDGE_SECRET must be at least 32 characters of [A-Za-z0-9_-], the " +
-        "same value as InferLab's waf:inferosEdgeSecret (its value is not shown)");
+    throw new Error(`${stageEdgeSecretName(stageName)} must be at least 32 characters of [A-Za-z0-9_-], ` +
+        "the same value as InferLab's waf:inferosEdgeSecret (its value is not shown)");
   }
   return Object.fromEntries([INFERLAB_GATEKEEPER, INFERLABOPS_GATEKEEPER]
     .map((pkg) => [pkg, { INFEROPS_EDGE_SECRET: value }]));

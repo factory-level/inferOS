@@ -42,7 +42,7 @@ KV namespaces (`inferos-<stage>-<package>-<binding>`) are created when missing. 
    | `STAGE_ADMINS` | yes | Comma-separated emails of the stage's admins (`/admin`). Uploaded as the backend's `ADMINS` secret. |
    | `CF_AI_GATEWAY`, `CF_AI_GATEWAY_ACCOUNT_ID`, `CF_AI_GATEWAY_PROVIDERS`, … | no | Server-managed models through AI Gateway (`resolveAiGateway` in `scripts/preview/staging-config.ts`). Uploaded as backend secrets. Unset, each user brings their own model keys. |
    | `STAGE_ADMIN_CONFIG_SEED` | no | The Models tab the stage starts with (which models it offers, `userModelsEnabled`, …), a JSON object of the backend's `ADMIN_CONFIG_SEED` fields. Uploaded as the backend's `ADMIN_CONFIG_SEED` secret. |
-   | `INFEROPS_EDGE_SECRET` | no (yes for `dev` today) | The shared value InferLab's edge lets through. Dev InferLab's Cloud Armor admits only allow-listed addresses, so without it sign-in and every InferOps call from the stage get a 403. Use the same value as InferOps' `waf:inferosEdgeSecret`: at least 32 characters of `A-Za-z0-9_-`. Uploaded as a secret of `gatekeeper-inferlab` and `gatekeeper-inferlabops`, which send it as `x-inferos-edge`, to the InferLab origin only. |
+   | `INFEROPS_EDGE_SECRET_<STAGE>` (`_DEV`, `_PROD`) | no (yes for `dev` today) | The shared value InferLab's edge lets through, for **this** stage only: a dev value never deploys to prod. Dev InferLab's Cloud Armor admits only allow-listed addresses, so without it sign-in and every InferOps call from the stage get a 403. Use the same value as InferOps' `waf:inferosEdgeSecret`: at least 32 characters of `A-Za-z0-9_-`. Uploaded as the `INFEROPS_EDGE_SECRET` secret of `gatekeeper-inferlab` and `gatekeeper-inferlabops`, which send it as `x-inferos-edge`, to the InferLab origin only. A bare `INFEROPS_EDGE_SECRET` in the shell names no stage and stops the run. |
 
    No secret value is written into a config or printed. Each worker's secrets go up with its version (`--secrets-file`, a mode-600 file in a temporary directory, removed afterwards).
 
@@ -82,17 +82,27 @@ Dev InferLab's edge (Cloud Armor) admits only allow-listed addresses and request
   - The code, the subject and the session come from InferLab exactly as without the proxy.
   - InferLab answers on the proxy origin only because its `auth.sso.proxyOrigins` lists it, and the Google callback on that origin is registered on InferLab's Google client.
 - **The server's calls: the edge secret.** The code exchange, refresh, logout and every InferOps API call go straight to `INFERLAB_AUTH_ORIGIN`, carrying the edge secret.
-- **Production uses neither.** `prod` sets no proxy origin, and `INFEROPS_EDGE_SECRET` is optional there.
+- **Production has no proxy, structurally.** A stage that deploys only from a clean tree (`prod`) is refused if it names a proxy origin. Its edge secret, if it ever needs one, is its own input, `INFEROPS_EDGE_SECRET_PROD`.
 
-**Rotating the edge secret:** change both values (InferOps' `waf:inferosEdgeSecret` and this stage's `INFEROPS_EDGE_SECRET`) and redeploy both sides. Requests are refused between the two deploys. Leaving the variable out of a later deploy doesn't delete it, because a deploy without it keeps the previous version's secret. Delete it with `pnpm exec wrangler secret delete INFEROPS_EDGE_SECRET --name inferos-dev-gatekeeper-inferlab`, and the same for `-inferlabops`.
+**Rotating the edge secret:** change both values (InferOps' `waf:inferosEdgeSecret` and this stage's `INFEROPS_EDGE_SECRET_<STAGE>`) and redeploy both sides. Requests are refused between the two deploys. Leaving the variable out of a later deploy doesn't delete it, because a deploy without it keeps the previous version's secret. Delete it with `pnpm exec wrangler secret delete INFEROPS_EDGE_SECRET --name inferos-dev-gatekeeper-inferlab`, and the same for `-inferlabops`.
 
 ## The spend guard
 
-`dev` declares `agents: { dailyTurnLimit: 40 }` (`scripts/stage/stages.ts`). The backend gets `ENABLE_CLOUDFLARE_LIMITS=true` and `DAILY_LLM_CALL_LIMIT=40`:
-- before every agent turn, the overseer counts one call on the workspace owner's per-UTC-day counter;
-- it refuses the turn, with the reason shown in the chat, once 40 are used.
+`dev` declares `agents: { dailyTurnLimit: 40 }` (`scripts/stage/stages.ts`). The backend gets `ENABLE_CLOUDFLARE_LIMITS=true` and `DAILY_LLM_CALL_LIMIT=40`. That sets one counter per workspace owner per UTC day, reset at midnight UTC, with a limit of 40.
 
-A user who connects their own funded Cloudflare account bills that account instead. Which models the stage offers comes from `STAGE_ADMIN_CONFIG_SEED`, the Models tab it starts with. An admin can change that later in `/admin`. Neither is a dollar bound: that's the spend limit on the provider key the AI Gateway stores (the InferOS Anthropic key's is 60 USD a month). The archived stage's `MODEL_ALLOWLIST` and `DAILY_AGENT_TURN_LIMIT` have no reader on this line.
+**What it counts** (each item is one call):
+- **An agent turn,** counted before it starts (`overseer.ts`, `checkUsageAndBalance`). The model steps inside one turn are not counted separately: one turn is one call, however many steps it takes.
+- **A Gadget's model-binding call,** made through a binding to one of the stage's own (gateway) models: `LanguageModelBinding.run` or `DecisionModelBinding.decide`. It's counted before the model is called (`ai-gateway-billing/limits/binding-charge.ts`), against the binding's workspace owner, recorded when the binding was made.
+
+Once the day's 40 are used, a turn ends with the reason shown in the chat, and a binding call is refused with the same reason. A binding made before its owner was recorded is refused while the limit is on; bind the model again.
+
+**What it doesn't count:**
+- A model a user added with their own key: it costs the platform nothing.
+- An agent turn of a user who connected their own funded Cloudflare account: it bills that account (the clean line's billing rule).
+- The model steps within one turn, beyond the turn itself (above).
+- Anything when `ENABLE_CLOUDFLARE_LIMITS` is off, as on `prod` and every non-stage deployment.
+
+**Which models** the stage offers comes from `STAGE_ADMIN_CONFIG_SEED`, the Models tab it starts with. An admin can change that later in `/admin`. **None of this is a dollar bound:** that's the spend limit on the provider key the AI Gateway stores (the InferOS Anthropic key's is 60 USD a month). The archived stage's `MODEL_ALLOWLIST` and `DAILY_AGENT_TURN_LIMIT` have no reader on this line.
 
 ## What changed from the archived stage deploy
 

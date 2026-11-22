@@ -20,7 +20,8 @@
 //   CLOUDFLARE_ACCOUNT_ID                 required
 //   CF_AI_GATEWAY*                        optional, see preview/staging-config.ts resolveAiGateway
 //   STAGE_ADMIN_CONFIG_SEED               optional, the backend's ADMIN_CONFIG_SEED (the Models tab)
-//   INFEROPS_EDGE_SECRET                  optional, both InferLab gatekeepers' InferLab edge header
+//   INFEROPS_EDGE_SECRET_<STAGE>          optional, both InferLab gatekeepers' InferLab edge header,
+//                                         per stage (INFEROPS_EDGE_SECRET_DEV, _PROD)
 //
 // Ported to the clean line from the archived main (FAC-296). Not ported, because the clean line has
 // none of what they check or the deploy doesn't need them: `stage:delete`, the automated smoke
@@ -193,7 +194,7 @@ export function prepare(args: Pick<StageArgs, "stage" | "allowDestructiveMigrati
   }
   return {
     stageName, stage, accountId, packages: deployed, secrets: stageBackendSecrets(),
-    gatekeeperSecrets: stageGatekeeperSecrets(),
+    gatekeeperSecrets: stageGatekeeperSecrets({ stageName }),
   };
 }
 

@@ -47,7 +47,7 @@ function prepared(stage: StageDefinition): Prepared {
   return {
     stageName: "dev", stage, accountId: ACCOUNT, packages: stagePackages(stage, packages),
     secrets: stageBackendSecrets({ ...SECRET, adminConfigSeed: SEED }),
-    gatekeeperSecrets: stageGatekeeperSecrets({ edgeSecret: EDGE }),
+    gatekeeperSecrets: stageGatekeeperSecrets({ stageName: "dev", edgeSecret: EDGE, bareEdgeSecret: undefined }),
   };
 }
 
@@ -251,13 +251,15 @@ test("FAC-296 part 2: the dev sign-in proxy and the edge secret reach both Infer
     assert.equal(configs.get(pkg)?.vars?.INFEROPS_EDGE_SECRET, undefined, `${pkg}: a secret, never a var`);
   }
   assert.equal(configsFor(STAGES.prod).get(INFERLAB_GATEKEEPER)?.vars?.INFERLAB_AUTHORIZE_ORIGIN, undefined);
-  assert.deepEqual(stageGatekeeperSecrets({ edgeSecret: EDGE }), {
+  const devSecrets = (edgeSecret?: string, bareEdgeSecret?: string) =>
+    stageGatekeeperSecrets({ stageName: "dev", edgeSecret, bareEdgeSecret });
+  assert.deepEqual(devSecrets(EDGE), {
     [INFERLAB_GATEKEEPER]: { INFEROPS_EDGE_SECRET: EDGE },
     [INFERLABOPS_GATEKEEPER]: { INFEROPS_EDGE_SECRET: EDGE },
   });
-  assert.deepEqual(stageGatekeeperSecrets({ edgeSecret: "  " }), {});
-  assert.throws(() => stageGatekeeperSecrets({ edgeSecret: "too-short" }), (err: Error) =>
-    /INFEROPS_EDGE_SECRET must be/.test(err.message) && !err.message.includes("too-short"));
+  assert.deepEqual(devSecrets("  "), {});
+  assert.throws(() => devSecrets("too-short"), (err: Error) =>
+    /INFEROPS_EDGE_SECRET_DEV must be/.test(err.message) && !err.message.includes("too-short"));
   const everything = JSON.stringify([...configs.values()]);
   assert.ok(!everything.includes(EDGE), "the edge secret reached a config");
 });
@@ -293,4 +295,36 @@ test("FAC-296 part 2: the deploy ends with the smoke a person runs", () => {
     assert.match(steps, needle);
   }
   assert.doesNotMatch(stageSmokeSteps(STAGES.prod).join("\n"), /auth\.dev-os/);
+});
+
+test("FAC-296 r1: the proxy is refused on a production stage", () => {
+  const prodWithProxy: StageDefinition = {
+    ...STAGES.prod,
+    inferops: { ...STAGES.prod.inferops, authorizeOrigin: "https://auth.os.factorylevel.dev" },
+  };
+  assert.match(stageDefinitionProblems(prodWithProxy).join("\n"), /dev stage only/);
+  assert.deepEqual(stageDefinitionProblems(dev), []);
+});
+
+test("FAC-296 r1: the edge secret is each stage's own input; a bare one stops the run", () => {
+  // The dev input never reaches prod: each stage reads only its own name.
+  const saved = { ...process.env };
+  try {
+    process.env.INFEROPS_EDGE_SECRET_DEV = EDGE;
+    delete process.env.INFEROPS_EDGE_SECRET_PROD;
+    delete process.env.INFEROPS_EDGE_SECRET;
+    assert.deepEqual(Object.keys(stageGatekeeperSecrets({ stageName: "dev" })),
+      [INFERLAB_GATEKEEPER, INFERLABOPS_GATEKEEPER]);
+    assert.deepEqual(stageGatekeeperSecrets({ stageName: "prod" }), {});
+    process.env.INFEROPS_EDGE_SECRET = EDGE;
+    for (const stageName of ["dev", "prod"]) {
+      assert.throws(() => stageGatekeeperSecrets({ stageName }), (err: Error) =>
+        new RegExp(`set INFEROPS_EDGE_SECRET_${stageName.toUpperCase()}`).test(err.message) &&
+        !err.message.includes(EDGE));
+    }
+  } finally {
+    for (const name of ["INFEROPS_EDGE_SECRET_DEV", "INFEROPS_EDGE_SECRET_PROD", "INFEROPS_EDGE_SECRET"]) {
+      if (saved[name] === undefined) delete process.env[name]; else process.env[name] = saved[name];
+    }
+  }
 });
