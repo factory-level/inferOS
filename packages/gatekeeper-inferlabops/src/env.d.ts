@@ -18,5 +18,16 @@ declare namespace Cloudflare {
      * can be subscribed.
      */
     INFERLAB_EVENT_DESTINATIONS?: string;
+    /**
+     * Optional, dev only (FAC-296): the sign-in proxy's origin, served by gatekeeper-inferlab. The
+     * connect popup goes there; the code exchange and every API call still go to
+     * INFERLAB_AUTH_ORIGIN. Unset: the popup goes to INFERLAB_AUTH_ORIGIN directly.
+     */
+    INFERLAB_AUTHORIZE_ORIGIN?: string;
+    /**
+     * Optional secret: the shared value InferLab's edge lets through (`x-inferos-edge`), sent only
+     * to INFERLAB_AUTH_ORIGIN. Set it where that edge admits only allowlisted addresses.
+     */
+    INFEROPS_EDGE_SECRET?: string;
   }
 }

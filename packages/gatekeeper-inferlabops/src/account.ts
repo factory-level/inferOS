@@ -14,7 +14,8 @@ import {
   CredentialCoordinator, type CredentialsWithIdentity, type RejectionVerdict,
 } from "@gadgets/gatekeeper-kit/credentials";
 import type { GatekeeperConnectCallback } from "@gadgets/workshop-shared/gatekeeper";
-import { readConfig } from "./config";
+import type { InferLabTarget } from "@gadgets/gatekeeper-kit/inferlab-edge";
+import { inferLabTarget, readConfig } from "./config";
 import {
   type Company, type Grant, type Identity, InferOpsApiError, OTHER_COMPANY, apiRequest, companyOf,
   logout, refreshGrant,
@@ -27,10 +28,10 @@ const IDENTITY_KEY = "identity";
 /** What a facet or verifier gets for one call: a short-lived token and whose it is. */
 export type CallCredentials = { token: string; tenantId: string; subject: string };
 
-function originOrThrow(env: Cloudflare.Env): string {
+function originOrThrow(env: Cloudflare.Env): InferLabTarget {
   const config = readConfig(env);
   if ("off" in config) throw new Error(config.off);
-  return config.origin;
+  return inferLabTarget(config);
 }
 
 function companyOrThrow(env: Cloudflare.Env): string {
@@ -160,7 +161,7 @@ export class OperationsAccount extends DurableObject<Cloudflare.Env> {
     const config = readConfig(this.env);
     if (current && !("off" in config)) {
       try {
-        if (!await logout(config.origin, current.refreshToken)) {
+        if (!await logout(inferLabTarget(config), current.refreshToken)) {
           failures.push(new Error(
             "InferLab didn't confirm signing this connection out; its session may stay live until it expires."));
         }

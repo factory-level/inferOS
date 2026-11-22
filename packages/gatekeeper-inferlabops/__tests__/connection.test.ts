@@ -7,8 +7,10 @@ import worker from "../src/worker.js";
 import { visibleName } from "../src/label.js";
 import { ATTENTION_LABEL_CASES } from "./attention-label-cases.js";
 import {
-  GATEKEEPER_PATH, ISSUER_PATTERN, NOT_CONFIGURED, OPERATIONS_CALLBACK_PATH, readConfig, readDestinations, receivesEventsFor,
+  GATEKEEPER_PATH, ISSUER_PATTERN, NOT_CONFIGURED, OPERATIONS_CALLBACK_PATH, inferLabTarget, readConfig, readDestinations,
+  receivesEventsFor,
 } from "../src/config.js";
+import { apiRequest, exchangeCode, logout, refreshGrant } from "../src/inferops-api.js";
 import { CONTRACT_PATTERNS, MAX_EVENT_BYTES, TOLERANCE_SECONDS, isCommittedEvent, parseEnvelope } from "../src/events.js";
 import committedEventSchema from "../../../scripts/inferlab-contracts/schemas/inferlab.committed-event.v1.schema.json";
 import committedEventFixtures from "../../../scripts/inferlab-contracts/fixtures/inferlab.committed-event.v1.json";
@@ -265,7 +267,7 @@ describe("configuration", () => {
 
   it("fails closed on every missing or malformed setting", () => {
     const ok = { INFERLAB_AUTH_ORIGIN: ORIGIN, INFEROPS_COMPANY: COMPANY, BASE_URL: BASE };
-    expect(readConfig(ok)).toEqual({ origin: ORIGIN, tenantId: COMPANY, baseUrl: BASE });
+    expect(readConfig(ok)).toEqual({ origin: ORIGIN, tenantId: COMPANY, baseUrl: BASE, authorizeOrigin: null });
     expect(readConfig({ ...ok, INFERLAB_AUTH_ORIGIN: "http://evil.example" })).toEqual({ off: NOT_CONFIGURED.origin });
     expect(readConfig({ ...ok, INFEROPS_COMPANY: "acme" })).toEqual({ off: NOT_CONFIGURED.company });
     expect(readConfig({ ...ok, BASE_URL: "http://localhost:8787/gatekeeper/inferlab" })).toEqual({ off: NOT_CONFIGURED.baseUrl });
@@ -1146,5 +1148,80 @@ describe("hooks on a Project's events", () => {
     await drain();
     expect(await received()).toEqual([]);
     expect(await hooks().enableHook()).toBe("This InferLab operations connection has been disconnected.");
+  });
+});
+
+// ── FAC-296 part 2: the InferLab edge ─────────────────────────────────────────────────────────
+// The connect popup goes to the dev sign-in proxy when one is set (gatekeeper-inferlab serves it),
+// and every call to InferLab and InferOps carries the edge secret when the deployment has one:
+// the code exchange, refresh, logout and every API request. Same tokens, same pipeline.
+describe("the InferLab edge (FAC-296)", () => {
+  const PROXY = "http://127.0.0.1:23381";
+  const SECRET = "edge_secret-0123456789abcdefABCDEF0123";
+  const getWith = (url: string, e: Partial<Env>) =>
+    worker.fetch(new Request(url, { redirect: "manual" }), { ...env, ...e } as Env, ctx);
+
+  it("sends the connect popup to the proxy when set; the redirect URI stays this gatekeeper's", async () => {
+    const attemptId = env.CONNECT_ATTEMPT.newUniqueId().toString();
+    const nonce = (++counter).toString(16).padStart(64, "c");
+    await hooks().startAttempt(attemptId, nonce, `edge-${counter}`);
+    const first = await getWith(`${BASE}/${attemptId}/${nonce}`, { INFERLAB_AUTHORIZE_ORIGIN: PROXY });
+    expect(first.status).toBe(302);
+    const authorize = new URL(first.headers.get("location")!);
+    expect(authorize.origin).toBe(PROXY);
+    expect(authorize.pathname).toBe("/authorize");
+    expect(authorize.searchParams.get("redirect_uri")).toBe(`${BASE}/oauth`);
+  });
+
+  it("every call to InferLab carries the edge secret when set, and only then", async () => {
+    const seen: { path: string; edge: string | null }[] = [];
+    vi.stubGlobal("fetch", async (input: RequestInfo, init?: RequestInit) => {
+      const url = new URL(typeof input === "string" ? input : input.url);
+      seen.push({ path: url.pathname, edge: new Headers(init?.headers).get("x-inferos-edge") });
+      if (url.pathname === "/auth/token" || url.pathname === "/auth/refresh") {
+        return Response.json({
+          token: "a.eyJleHAiOjF9.s", refreshToken: "r2",
+          user: { id: "00000000-0000-4000-8000-000000000101", tenantId: COMPANY },
+        });
+      }
+      if (url.pathname === "/auth/logout") return new Response(null, { status: 204 });
+      return Response.json({ ok: true });
+    });
+    for (const edge of [SECRET, undefined]) {
+      seen.length = 0;
+      const target = { origin: ORIGIN, ...(edge ? { edge } : {}) };
+      const { grant, identity } = await exchangeCode(target, "code", "verifier", `${BASE}/oauth`);
+      expect(identity.issuer).toBe(ORIGIN);
+      await refreshGrant(target, grant);
+      await logout(target, "r2");
+      await apiRequest(target, "a", "/workspaces");
+      expect(seen.map(s => s.path)).toEqual(["/auth/token", "/auth/refresh", "/auth/logout", "/workspaces"]);
+      expect(seen.every(s => s.edge === (edge ?? null))).toBe(true);
+    }
+  });
+
+  it("a set but malformed proxy origin, or the InferLab origin itself, turns the connection off", () => {
+    const base = { INFERLAB_AUTH_ORIGIN: ORIGIN, INFEROPS_COMPANY: COMPANY, BASE_URL: BASE };
+    for (const bad of ["not a url", `${PROXY}/path`, ORIGIN]) {
+      expect(readConfig({ ...base, INFERLAB_AUTHORIZE_ORIGIN: bad }), bad)
+        .toEqual({ off: NOT_CONFIGURED.authorizeOrigin });
+    }
+    const config = readConfig({ ...base, INFERLAB_AUTHORIZE_ORIGIN: PROXY, INFEROPS_EDGE_SECRET: SECRET });
+    expect(config).toMatchObject({ authorizeOrigin: PROXY, edge: SECRET });
+    expect("off" in config ? null : inferLabTarget(config)).toEqual({ origin: ORIGIN, edge: SECRET });
+    expect(readConfig({ ...base, INFEROPS_EDGE_SECRET: "short" })).not.toHaveProperty("edge");
+  });
+
+  // Every request to InferLab goes through the kit's inferLabFetch: a new `fetch(` call in this
+  // package would reach InferLab without the edge header, so it fails here first.
+  it("no source file calls the global fetch directly", () => {
+    const sources = import.meta.glob("../src/**/*.ts", { query: "?raw", import: "default", eager: true }) as
+      Record<string, string>;
+    expect(Object.keys(sources).length).toBeGreaterThan(4);
+    const offenders = Object.entries(sources)
+      .filter(([path]) => !path.includes("/generated/"))
+      .filter(([, text]) => /(?<![.\w]|async )fetch\s*\(|globalThis\.fetch|=\s*fetch\b/m.test(text))
+      .map(([path]) => path);
+    expect(offenders).toEqual([]);
   });
 });

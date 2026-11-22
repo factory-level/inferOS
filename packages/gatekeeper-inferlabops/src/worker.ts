@@ -39,7 +39,7 @@ import type {
   ResourceDescription, SupportedResource, VendorDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
 import { type CallCredentials, OperationsAccount, SubjectIndex, VENDOR_ID, isDefiniteNo, subjectIndexName } from "./account";
-import { DESTINATION_KEY, EVENTS_PATH, GATEKEEPER_PATH, type OperationsConfig, readConfig, receivesEventsFor, redirectUriFor } from "./config";
+import { DESTINATION_KEY, EVENTS_PATH, GATEKEEPER_PATH, type OperationsConfig, inferLabTarget, readConfig, receivesEventsFor, redirectUriFor } from "./config";
 import {
   EVENTS_NOT_CONFIGURED, EVENT_TYPES, type ProjectEventDelivery, type ProjectEventHookTarget, type StoredEvent,
   eventHookDescription, forgetEventHooks, handleEventDelivery,
@@ -164,10 +164,10 @@ export class ConnectAttempt extends DurableObject<Cloudflare.Env> {
       if (!callback) return null;
       const config = readConfig(this.env);
       if ("off" in config) return { error: config.off };
-      const { grant, identity } = await exchangeCode(config.origin, code, flow.codeVerifier, flow.redirectUri);
+      const { grant, identity } = await exchangeCode(inferLabTarget(config), code, flow.codeVerifier, flow.redirectUri);
       if (identity.tenantId !== config.tenantId) {
         // InferOps already refuses this (ADR 0009 T6); a second check costs nothing.
-        await logout(config.origin, grant.refreshToken);
+        await logout(inferLabTarget(config), grant.refreshToken);
         logger.warn("InferLab session from another company refused", { event: "inferlabops.other_company" });
         throw new ConnectFailure(OTHER_COMPANY);
       }
@@ -503,7 +503,7 @@ export class ProjectGatekeeper extends DurableObject<Cloudflare.Env, ProjectProp
   } = {}): Promise<T> {
     const config = configOrThrow(this.env);
     try {
-      return await this.#creds.run(async creds => parse(await apiRequest(config.origin, creds.token, path, {
+      return await this.#creds.run(async creds => parse(await apiRequest(inferLabTarget(config), creds.token, path, {
         ...options, workspaceId: this.ctx.props.workspaceId,
       })), { replayable: (options.method ?? "GET") === "GET" || options.idempotencyKey !== undefined });
     } catch (error) {
@@ -1015,7 +1015,8 @@ export default {
       const redirectUri = redirectUriFor(config);
       const begun = await stub.begin(segments[1]!, redirectUri);
       if (!begun) return invalidLink();
-      const authorize = new URL("/authorize", config.origin);
+      // Through the dev sign-in proxy when there is one; the code still comes from the origin.
+      const authorize = new URL("/authorize", config.authorizeOrigin ?? config.origin);
       authorize.searchParams.set("client_id", INFERLAB_CLIENT_ID);
       authorize.searchParams.set("redirect_uri", redirectUri);
       authorize.searchParams.set("response_type", "code");
