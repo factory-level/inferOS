@@ -7,6 +7,7 @@
 // (archive/main-2026-11-14, 24f5d885, http-inferops.ts); see README.md.
 
 import { CredentialsExpiredError } from "@gadgets/gatekeeper-kit/credentials";
+import { type InferLabOriginLike, inferLabFetch, originOf } from "@gadgets/gatekeeper-kit/inferlab-edge";
 import { readTextCapped } from "@gadgets/gatekeeper-kit/response-body";
 
 /** InferLab's registered client id for InferOS: a public client, no secret. */
@@ -78,9 +79,9 @@ function errorCodeOf(body: string): string | null {
 }
 
 /** Exchanges an authorization code for the person's own tokens, never following a redirect. */
-export async function exchangeCode(origin: string, code: string, codeVerifier: string,
+export async function exchangeCode(origin: InferLabOriginLike, code: string, codeVerifier: string,
                                    redirectUri: string): Promise<{ grant: Grant; identity: Identity }> {
-  const response = await fetch(`${origin}/auth/token`, fetchInit({
+  const response = await inferLabFetch(origin)(`${originOf(origin)}/auth/token`, fetchInit({
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "application/json" },
     body: JSON.stringify({ clientId: INFERLAB_CLIENT_ID, code, codeVerifier, redirectUri }),
@@ -108,7 +109,7 @@ export async function exchangeCode(origin: string, code: string, codeVerifier: s
   }
   return {
     grant: { accessToken: parsed.token, refreshToken: parsed.refreshToken, accessExpiresAt: tokenExpiry(parsed.token) },
-    identity: { issuer: origin, subject: user.id, tenantId: user.tenantId.toLowerCase() },
+    identity: { issuer: originOf(origin), subject: user.id, tenantId: user.tenantId.toLowerCase() },
   };
 }
 
@@ -118,8 +119,8 @@ export async function exchangeCode(origin: string, code: string, codeVerifier: s
  * dead, reported as `CredentialsExpiredError` so the Workshop asks for a reconnect. Anything else
  * (an outage, a timeout, a 5xx) travels unchanged and kills nothing.
  */
-export async function refreshGrant(origin: string, current: Grant): Promise<Grant> {
-  const response = await fetch(`${origin}/auth/refresh`, fetchInit({
+export async function refreshGrant(origin: InferLabOriginLike, current: Grant): Promise<Grant> {
+  const response = await inferLabFetch(origin)(`${originOf(origin)}/auth/refresh`, fetchInit({
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "application/json" },
     body: JSON.stringify({ refreshToken: current.refreshToken }),
@@ -143,9 +144,9 @@ export async function refreshGrant(origin: string, current: Grant): Promise<Gran
  * revokes that one session and touches no other). Best effort: the tokens are deleted here either
  * way, so nothing can read with them again.
  */
-export async function logout(origin: string, refreshToken: string): Promise<boolean> {
+export async function logout(origin: InferLabOriginLike, refreshToken: string): Promise<boolean> {
   try {
-    const response = await fetch(`${origin}/auth/logout`, fetchInit({
+    const response = await inferLabFetch(origin)(`${originOf(origin)}/auth/logout`, fetchInit({
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ refreshToken }),
@@ -157,7 +158,7 @@ export async function logout(origin: string, refreshToken: string): Promise<bool
 }
 
 /** One InferOps API request as the person: their token, the workspace, an idempotency key for writes. */
-export async function apiRequest(origin: string, accessToken: string, path: string, options: {
+export async function apiRequest(origin: InferLabOriginLike, accessToken: string, path: string, options: {
   method?: "GET" | "POST";
   workspaceId?: string;
   idempotencyKey?: string;
@@ -167,7 +168,7 @@ export async function apiRequest(origin: string, accessToken: string, path: stri
   if (options.workspaceId) headers["X-Workspace-Id"] = options.workspaceId;
   if (options.idempotencyKey) headers["X-Idempotency-Key"] = options.idempotencyKey;
   if (options.body !== undefined) headers["Content-Type"] = "application/json";
-  const response = await fetch(`${origin}${path}`, fetchInit({
+  const response = await inferLabFetch(origin)(`${originOf(origin)}${path}`, fetchInit({
     method: options.method ?? "GET",
     headers,
     ...(options.body !== undefined ? { body: JSON.stringify(options.body) } : {}),
@@ -242,7 +243,7 @@ export type Company = { tenantId: string; slug: string; workspaces: { id: string
  * session alone) and the slugs of the workspaces they hold a live grant in. A workspace InferOps
  * lists without a grant of theirs is left out.
  */
-export async function companyOf(origin: string, accessToken: string): Promise<Company> {
+export async function companyOf(origin: InferLabOriginLike, accessToken: string): Promise<Company> {
   const [context, listed] = await Promise.all([
     apiRequest(origin, accessToken, "/auth/company"),
     apiRequest(origin, accessToken, "/workspaces"),
@@ -262,7 +263,7 @@ export async function companyOf(origin: string, accessToken: string): Promise<Co
 }
 
 /** Whether the person holds `permission` in `workspaceId` now, as InferOps' own guard decides. */
-export async function holdsPermission(origin: string, accessToken: string, workspaceId: string,
+export async function holdsPermission(origin: InferLabOriginLike, accessToken: string, workspaceId: string,
                                       permission: string): Promise<boolean> {
   const answer = await apiRequest(origin, accessToken,
     `/auth/permissions?permissions=${encodeURIComponent(permission)}`, { workspaceId });

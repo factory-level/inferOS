@@ -8,9 +8,10 @@ import { isGatekeeperPackage, readDeployablePackages } from "../release/manifest
 import { PACKAGES_DIR } from "../preview/staging-config.ts";
 import {
   buildStageConfigs, destructiveMigrations, formatStagePlan, resolveStageAdmins, stageBackendSecrets,
-  stageBucketName, stageKvNamespaces, stageKvTitle, stagePackages, stageTiers, stageWorkerName,
+  stageBucketName, stageGatekeeperSecrets, stageHostnames, stageKvNamespaces, stageKvTitle, stagePackages,
+  stageTiers, stageWorkerName,
 } from "./stage-config.ts";
-import { dryRunPlan, isAccessRedirect, parseStageArgs, type Prepared } from "./stage.ts";
+import { dryRunPlan, isAccessRedirect, parseStageArgs, stageSmokeSteps, type Prepared } from "./stage.ts";
 import {
   INFERLAB_GATEKEEPER, INFERLABOPS_GATEKEEPER, STAGES, STAGE_GATEKEEPERS, resolveStage,
   stageDefinitionProblems, stageDeployBlockers, type StageDefinition,
@@ -26,6 +27,10 @@ const SECRET = {
     CF_AI_GATEWAY_PROVIDERS: "anthropic-sentinel-value",
   },
 };
+/** The InferLab edge secret's sentinel: the WAF rule's shape, so it is accepted. */
+const EDGE = "edge_sentinel-0123456789abcdefABCDEF0123";
+/** The Models-tab seed's sentinel. */
+const SEED = { ADMIN_CONFIG_SEED: JSON.stringify({ userModelsEnabled: false, modelOrder: ["seed-sentinel-model"] }) };
 const packages = readDeployablePackages(PACKAGES_DIR);
 const dev: StageDefinition = STAGES.dev;
 /** dev, as it is once InferOps maps dev-os to a tenant id. */
@@ -41,7 +46,8 @@ function configsFor(stage: StageDefinition) {
 function prepared(stage: StageDefinition): Prepared {
   return {
     stageName: "dev", stage, accountId: ACCOUNT, packages: stagePackages(stage, packages),
-    secrets: stageBackendSecrets(SECRET),
+    secrets: stageBackendSecrets({ ...SECRET, adminConfigSeed: SEED }),
+    gatekeeperSecrets: stageGatekeeperSecrets({ stageName: "dev", edgeSecret: EDGE, bareEdgeSecret: undefined }),
   };
 }
 
@@ -59,17 +65,24 @@ test("a stage deploys the backend, the router and exactly its gatekeepers, under
   ]);
 });
 
-test("only the router has a hostname: no workers.dev, no preview URL, no route anywhere else", () => {
-  for (const [pkg, config] of configsFor(dev)) {
-    assert.equal(config.workers_dev, false, pkg);
-    assert.equal(config.preview_urls, false, pkg);
-    assert.equal(config.previews, undefined, pkg);
-    if (pkg === "router") {
-      assert.deepEqual(config.routes, [{ pattern: "dev-os.factorylevel.dev", custom_domain: true }]);
-    } else {
-      assert.equal(config.routes, undefined, pkg);
+test("only the router, and on dev the sign-in proxy, have a hostname: no workers.dev, no preview URL", () => {
+  for (const [stage, proxy] of [[dev, "auth.dev-os.factorylevel.dev"], [STAGES.prod, null]] as const) {
+    for (const [pkg, config] of configsFor(stage)) {
+      assert.equal(config.workers_dev, false, pkg);
+      assert.equal(config.preview_urls, false, pkg);
+      assert.equal(config.previews, undefined, pkg);
+      if (pkg === "router") {
+        assert.deepEqual(config.routes, [{ pattern: stage.hostname, custom_domain: true }]);
+      } else if (pkg === INFERLAB_GATEKEEPER && proxy) {
+        assert.deepEqual(config.routes, [{ pattern: proxy, custom_domain: true }]);
+      } else {
+        assert.equal(config.routes, undefined, `${stage.hostname} ${pkg}`);
+      }
     }
   }
+  // Every hostname a stage serves is checked against Access after a deploy.
+  assert.deepEqual(stageHostnames(dev), ["dev-os.factorylevel.dev", "auth.dev-os.factorylevel.dev"]);
+  assert.deepEqual(stageHostnames(STAGES.prod), ["os.factorylevel.dev"]);
 });
 
 test("the backend binds every stage gatekeeper by its stage worker name, and the router binds them all", () => {
@@ -151,8 +164,14 @@ test("the dry run lists every worker and the backend's secret names, with no val
   }
   assert.match(plan,
     /inferos-dev-workshop-backend, secrets: ADMINS, CF_AI_GATEWAY, CF_AI_GATEWAY_ACCOUNT_ID, CF_AI_GATEWAY_PROVIDERS/);
-  assert.equal(plan.match(/\(custom domain\)/g)?.length, 1);
+  assert.equal(plan.match(/\(custom domain\)/g)?.length, 2);
   assert.match(plan, /inferos-dev-router at dev-os\.factorylevel\.dev \(custom domain\)/);
+  assert.match(plan, /inferos-dev-gatekeeper-inferlab at auth\.dev-os\.factorylevel\.dev \(custom domain\), secrets: INFEROPS_EDGE_SECRET/);
+  assert.match(plan, /inferos-dev-gatekeeper-inferlabops, secrets: INFEROPS_EDGE_SECRET/);
+  assert.match(plan, /CF_AI_GATEWAY_PROVIDERS, ADMIN_CONFIG_SEED/);
+  for (const value of [EDGE, "seed-sentinel-model"]) {
+    assert.ok(!plan.includes(value), `the plan printed a value: ${value}`);
+  }
   for (const value of [...SECRET.admins, ...Object.values(SECRET.aiGateway), ACCOUNT]) {
     assert.ok(!plan.includes(value), `the plan printed a value: ${value}`);
   }
@@ -223,4 +242,89 @@ test("the plan formats what it is given", () => {
   });
   assert.match(plan, /^stage "dev" -> https:\/\/dev-os\.factorylevel\.dev/);
   assert.match(plan, /R2 buckets:/);
+});
+
+test("FAC-296 part 2: the dev sign-in proxy and the edge secret reach both InferLab gatekeepers", () => {
+  const configs = configsFor(dev);
+  for (const pkg of [INFERLAB_GATEKEEPER, INFERLABOPS_GATEKEEPER]) {
+    assert.equal(configs.get(pkg)?.vars?.INFERLAB_AUTHORIZE_ORIGIN, "https://auth.dev-os.factorylevel.dev", pkg);
+    assert.equal(configs.get(pkg)?.vars?.INFEROPS_EDGE_SECRET, undefined, `${pkg}: a secret, never a var`);
+  }
+  assert.equal(configsFor(STAGES.prod).get(INFERLAB_GATEKEEPER)?.vars?.INFERLAB_AUTHORIZE_ORIGIN, undefined);
+  const devSecrets = (edgeSecret?: string, bareEdgeSecret?: string) =>
+    stageGatekeeperSecrets({ stageName: "dev", edgeSecret, bareEdgeSecret });
+  assert.deepEqual(devSecrets(EDGE), {
+    [INFERLAB_GATEKEEPER]: { INFEROPS_EDGE_SECRET: EDGE },
+    [INFERLABOPS_GATEKEEPER]: { INFEROPS_EDGE_SECRET: EDGE },
+  });
+  assert.deepEqual(devSecrets("  "), {});
+  assert.throws(() => devSecrets("too-short"), (err: Error) =>
+    /INFEROPS_EDGE_SECRET_DEV must be/.test(err.message) && !err.message.includes("too-short"));
+  const everything = JSON.stringify([...configs.values()]);
+  assert.ok(!everything.includes(EDGE), "the edge secret reached a config");
+});
+
+test("FAC-296 part 2: the spend guard caps agent turns per owner per day on dev", () => {
+  const vars = configsFor(dev).get("workshop-backend")?.vars ?? {};
+  assert.equal(vars.ENABLE_CLOUDFLARE_LIMITS, "true");
+  assert.equal(vars.DAILY_LLM_CALL_LIMIT, "40");
+  const prod = configsFor(STAGES.prod).get("workshop-backend")?.vars ?? {};
+  assert.equal(prod.ENABLE_CLOUDFLARE_LIMITS, undefined);
+  // The Models tab the stage starts with travels as a secret, and only when given.
+  assert.deepEqual(Object.keys(stageBackendSecrets({ ...SECRET, adminConfigSeed: SEED })),
+    ["ADMINS", "CF_AI_GATEWAY", "CF_AI_GATEWAY_ACCOUNT_ID", "CF_AI_GATEWAY_PROVIDERS", "ADMIN_CONFIG_SEED"]);
+  assert.equal(JSON.stringify([...configsFor(dev).values()]).includes("seed-sentinel-model"), false);
+});
+
+test("FAC-296 part 2: a malformed proxy origin or turn limit is refused before anything is built", () => {
+  const withProxy = (authorizeOrigin: string): StageDefinition =>
+    ({ ...dev, inferops: { ...dev.inferops, authorizeOrigin } });
+  for (const bad of ["http://auth.dev-os.factorylevel.dev", "https://auth.dev-os.factorylevel.dev/x",
+    dev.inferops.authOrigin, "https://dev-os.factorylevel.dev"]) {
+    assert.notDeepEqual(stageDefinitionProblems(withProxy(bad)), [], bad);
+  }
+  for (const limit of [0, -1, 1.5]) {
+    assert.notDeepEqual(stageDefinitionProblems({ ...dev, agents: { dailyTurnLimit: limit } }), [], String(limit));
+  }
+});
+
+test("FAC-296 part 2: the deploy ends with the smoke a person runs", () => {
+  const steps = stageSmokeSteps(dev).join("\n");
+  for (const needle of [/Cloudflare Access/, /Sign in with InferLab/, /seat of the stage's company/,
+    /auth\.dev-os\.factorylevel\.dev/, /board/, /model picker shows an agent/]) {
+    assert.match(steps, needle);
+  }
+  assert.doesNotMatch(stageSmokeSteps(STAGES.prod).join("\n"), /auth\.dev-os/);
+});
+
+test("FAC-296 r1: the proxy is refused on a production stage", () => {
+  const prodWithProxy: StageDefinition = {
+    ...STAGES.prod,
+    inferops: { ...STAGES.prod.inferops, authorizeOrigin: "https://auth.os.factorylevel.dev" },
+  };
+  assert.match(stageDefinitionProblems(prodWithProxy).join("\n"), /dev stage only/);
+  assert.deepEqual(stageDefinitionProblems(dev), []);
+});
+
+test("FAC-296 r1: the edge secret is each stage's own input; a bare one stops the run", () => {
+  // The dev input never reaches prod: each stage reads only its own name.
+  const saved = { ...process.env };
+  try {
+    process.env.INFEROPS_EDGE_SECRET_DEV = EDGE;
+    delete process.env.INFEROPS_EDGE_SECRET_PROD;
+    delete process.env.INFEROPS_EDGE_SECRET;
+    assert.deepEqual(Object.keys(stageGatekeeperSecrets({ stageName: "dev" })),
+      [INFERLAB_GATEKEEPER, INFERLABOPS_GATEKEEPER]);
+    assert.deepEqual(stageGatekeeperSecrets({ stageName: "prod" }), {});
+    process.env.INFEROPS_EDGE_SECRET = EDGE;
+    for (const stageName of ["dev", "prod"]) {
+      assert.throws(() => stageGatekeeperSecrets({ stageName }), (err: Error) =>
+        new RegExp(`set INFEROPS_EDGE_SECRET_${stageName.toUpperCase()}`).test(err.message) &&
+        !err.message.includes(EDGE));
+    }
+  } finally {
+    for (const name of ["INFEROPS_EDGE_SECRET_DEV", "INFEROPS_EDGE_SECRET_PROD", "INFEROPS_EDGE_SECRET"]) {
+      if (saved[name] === undefined) delete process.env[name]; else process.env[name] = saved[name];
+    }
+  }
 });

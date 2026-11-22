@@ -38,6 +38,8 @@ import {
   type AiGatewayLogRoute,
 } from "./ai-gateway.js";
 import { completeText } from "./ai-invoke.js";
+import { chargeBindingCall } from "./ai-gateway-billing/limits/binding-charge.js";
+import type { UserDurableObject } from "./user.js";
 import { bridgePdfAttachments } from "./chat-attachment-pdf.js";
 import {
   estimateSharedHeadTokens, hasGpt56PromptCaching, splitSystemPrompt,
@@ -1189,6 +1191,12 @@ export type AiModelGatekeeperProps = {
   config: AiModelConfig,
   initiator: AiChatAuthorInfo,
   metadata?: GatewayMetadataContext,
+  /**
+   * The workspace owner's UserDurableObject id: whose daily limit a platform-funded call of this
+   * binding counts against when ENABLE_CLOUDFLARE_LIMITS is on (binding-charge.ts). Absent on a
+   * binding made before it was recorded, which is then refused while the limits are on.
+   */
+  ownerId?: string,
 };
 
 /**
@@ -1200,7 +1208,8 @@ export type AiModelGatekeeperProps = {
  * a binding for any other model: one a user added, or one the admin added and removed.
  */
 async function bindingConfig(
-    env: Cloudflare.Env, props: AiModelGatekeeperProps): Promise<AiModelConfig> {
+    env: Cloudflare.Env, props: AiModelGatekeeperProps)
+    : Promise<{ config: AiModelConfig, platformFunded: boolean }> {
   let models = await getGatewayModels(env);
   let { autoRouterPool, ...config } = props.config;
   if (models?.get(config.model)?.provider !== config.provider) {
@@ -1210,11 +1219,20 @@ async function bindingConfig(
       throw new Error("The Auto Router model is no longer offered on this deployment.");
     }
     models?.refuseUserModel(props.displayName);
-    return config;
+    // A user's own model, on their own key: the platform pays nothing for its calls.
+    return { config, platformFunded: false };
   }
   models.refuseDisabled(config.model);
   let pool = models.runConfig(config.model)?.autoRouterPool;
-  return pool ? { ...config, autoRouterPool: pool } : config;
+  // One of the deployment's own (gateway) models: its calls are the platform's spend.
+  return { config: pool ? { ...config, autoRouterPool: pool } : config, platformFunded: true };
+}
+
+/** Counts one call of this binding against its owner's daily limit, when the platform pays for it. */
+function bindingCharge(
+    env: Cloudflare.Env, users: () => DurableObjectNamespace<UserDurableObject>,
+    props: AiModelGatekeeperProps, platformFunded: boolean): () => Promise<void> {
+  return () => chargeBindingCall(env, users, { ownerId: props.ownerId, platformFunded });
 }
 
 export class LanguageModelGatekeeper
@@ -1249,11 +1267,12 @@ export class LanguageModelGatekeeper
       : Promise<LanguageModelBinding> {
     // A binding makes one-shot calls, which ask for no reasoning level. Without the level it was
     // minted with, its model is described as one with none set, whatever the admin has set since.
-    let { reasoning, ...config } = await bindingConfig(this.env, this.ctx.props);
+    let { config: { reasoning, ...config }, platformFunded } = await bindingConfig(this.env, this.ctx.props);
     let model = getModel(this.env, config, this.ctx.props.initiator, {
       metadata: this.ctx.props.metadata,
     });
-    return new LanguageModelBindingImpl(model);
+    return new LanguageModelBindingImpl(model,
+        bindingCharge(this.env, () => this.ctx.exports.UserDurableObject, this.ctx.props, platformFunded));
   }
 
   applyAction(action: number): Promise<void> {
@@ -1279,11 +1298,13 @@ export class LanguageModelGatekeeper
 
 @validateRpc()
 class LanguageModelBindingImpl extends RpcTarget implements LanguageModelBinding {
-  constructor(private model: ModelHandle) {
+  constructor(private model: ModelHandle, private charge: () => Promise<void>) {
     super();
   }
 
   async run(options: {prompt: string, systemPrompt?: string}): Promise<string> {
+    // The daily limit, before the model is called (FAC-296; a refusal costs nothing).
+    await this.charge();
     // TODO: Should we be calling authorizeObservation() here? It's not really observing anything,
     //   but you might want the audit logs?
     // TODO: Account LLM costs back to the calling gadget.
@@ -1321,8 +1342,9 @@ export class DecisionModelGatekeeper
   async startSession(approvalQueue: RpcStub<ApprovalQueue>)
       : Promise<DecisionModelBinding> {
     let { initiator, metadata } = this.ctx.props;
-    let config = await bindingConfig(this.env, this.ctx.props);
-    return new DecisionModelBindingImpl(getDecisionModel(this.env, config, initiator, metadata));
+    let { config, platformFunded } = await bindingConfig(this.env, this.ctx.props);
+    return new DecisionModelBindingImpl(getDecisionModel(this.env, config, initiator, metadata),
+        bindingCharge(this.env, () => this.ctx.exports.UserDurableObject, this.ctx.props, platformFunded));
   }
 
   applyAction(action: number): Promise<void> {
@@ -1348,11 +1370,13 @@ export class DecisionModelGatekeeper
 
 @validateRpc()
 class DecisionModelBindingImpl extends RpcTarget implements DecisionModelBinding {
-  constructor(private model: DecisionModel) {
+  constructor(private model: DecisionModel, private charge: () => Promise<void>) {
     super();
   }
 
   async decide(request: DecisionRequest): Promise<Record<string, DecisionAnswer>> {
+    // The daily limit, before the model is called (FAC-296; a refusal costs nothing).
+    await this.charge();
     let result = await this.model(request);
     // pi reports a failure in the result; gadget code expects a rejection, as completeText()
     // gives the LLM binding.

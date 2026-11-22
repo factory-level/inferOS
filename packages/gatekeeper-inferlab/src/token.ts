@@ -2,6 +2,7 @@
 // Ported from the archived fork's `custom-gatekeepers/gatekeeper-inferops/src/inferlab-login.ts`
 // (24f5d885), sign-in only: no workspace list, no stored session, no InferOps API call.
 
+import { type InferLabOriginLike, inferLabFetch, originOf } from "@gadgets/gatekeeper-kit/inferlab-edge";
 import { readTextCapped } from "@gadgets/gatekeeper-kit/response-body";
 import type { GatekeeperSubject } from "@gadgets/workshop-shared/gatekeeper";
 
@@ -61,10 +62,14 @@ export function signedInFrom(issuer: string, body: string): SignedIn {
   };
 }
 
-/** Exchanges an authorization code at InferLab, never following a redirect. */
-export async function exchangeCode(issuer: string, code: string, codeVerifier: string,
+/**
+ * Exchanges an authorization code at InferLab, never following a redirect. `target` is the issuer,
+ * with InferLab's edge secret when the deployment has one (FAC-296).
+ */
+export async function exchangeCode(target: InferLabOriginLike, code: string, codeVerifier: string,
                                    redirectUri: string): Promise<SignedIn> {
-  const response = await fetch(`${issuer}/auth/token`, {
+  const issuer = originOf(target);
+  const response = await inferLabFetch(target)(`${issuer}/auth/token`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "application/json" },
     body: JSON.stringify({ clientId: INFERLAB_CLIENT_ID, code, codeVerifier, redirectUri }),
@@ -87,9 +92,9 @@ export async function exchangeCode(issuer: string, code: string, codeVerifier: s
  * Ends the InferLab session a sign-in opened, since signing in grants nothing to keep. Best effort:
  * the caller already has what it needs, and a failure only leaves the session to expire.
  */
-export async function endSession(issuer: string, refreshToken: string): Promise<boolean> {
+export async function endSession(target: InferLabOriginLike, refreshToken: string): Promise<boolean> {
   try {
-    const response = await fetch(`${issuer}/auth/logout`, {
+    const response = await inferLabFetch(target)(`${originOf(target)}/auth/logout`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ refreshToken }),

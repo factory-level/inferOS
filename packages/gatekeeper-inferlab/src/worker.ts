@@ -34,7 +34,8 @@ import type {
   GatekeeperSubject, GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor as GatekeeperVendorIface,
   ResourceConfiguratorFrame, SupportedResource, VendorDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
-import { type InferLabConfig, basePathOf, readConfig, redirectUriFor } from "./config";
+import { handleInferLabAuthProxy } from "@gadgets/gatekeeper-kit/inferlab-edge";
+import { type InferLabConfig, basePathOf, inferLabTarget, readConfig, redirectUriFor } from "./config";
 import { INFERLAB_CLIENT_ID, OTHER_COMPANY, SignInFailure, endSession, exchangeCode } from "./token";
 
 const logger = createLogger<{ vendorId: string }>({
@@ -112,9 +113,9 @@ export class SignInAttempt extends DurableObject<Cloudflare.Env> {
       if ("off" in config) return { error: config.off };
       // The redirect URI is the one the authorize request named, so a change of BASE_URL mid-flow
       // can't make the exchange name another.
-      const signedIn = await exchangeCode(config.issuer, code, flow.codeVerifier, flow.redirectUri);
+      const signedIn = await exchangeCode(inferLabTarget(config), code, flow.codeVerifier, flow.redirectUri);
       // Signing in keeps no InferLab session, whatever happens next.
-      if (!await endSession(config.issuer, signedIn.refreshToken)) {
+      if (!await endSession(inferLabTarget(config), signedIn.refreshToken)) {
         logger.warn("InferLab logout failed", { event: "inferlab.signin.logout_failed" });
       }
       if (signedIn.tenantId !== config.tenantId) {
@@ -269,6 +270,10 @@ export default {
     if ("off" in config) {
       return htmlResponse(errorPageHtml("InferLab sign-in is not configured", config.off), 503);
     }
+    // The dev sign-in proxy (FAC-296): a request for INFERLAB_AUTHORIZE_ORIGIN is one of InferLab's
+    // own sign-in pages, forwarded with the edge secret. Any other host goes on as before.
+    const proxied = await handleInferLabAuthProxy(request, config.authorizeOrigin, inferLabTarget(config));
+    if (proxied) return proxied;
     const url = new URL(request.url);
     const prefix = basePathOf(config);
     if (request.method !== "GET" || !url.pathname.startsWith(`${prefix}/`)) {
@@ -282,7 +287,8 @@ export default {
       const redirectUri = redirectUriFor(config);
       const begun = await stub.begin(segments[1]!, redirectUri);
       if (!begun) return invalidLink();
-      const authorize = new URL("/authorize", config.issuer);
+      // Through the dev sign-in proxy when there is one; the code still comes from the issuer.
+      const authorize = new URL("/authorize", config.authorizeOrigin ?? config.issuer);
       authorize.searchParams.set("client_id", INFERLAB_CLIENT_ID);
       authorize.searchParams.set("redirect_uri", redirectUri);
       authorize.searchParams.set("response_type", "code");

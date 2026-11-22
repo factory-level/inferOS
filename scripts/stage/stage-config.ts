@@ -19,8 +19,8 @@ import {
   type DeployablePackage, type ObservabilityConfig,
 } from "../release/manifest-lib.ts";
 import {
-  R2_MAX_BUCKET_NAME_LENGTH, backendGatekeeperServices, resolveAiGateway, routerGatekeeperServices,
-  type StagingConfig,
+  R2_MAX_BUCKET_NAME_LENGTH, backendGatekeeperServices, resolveAdminConfigSeed, resolveAiGateway,
+  routerGatekeeperServices, type StagingConfig,
 } from "../preview/staging-config.ts";
 import {
   INFERLAB_GATEKEEPER, INFERLAB_LOGIN_VENDOR, INFERLABOPS_GATEKEEPER, type StageDefinition,
@@ -117,17 +117,28 @@ export function inferLabGatekeeperVars(stage: StageDefinition): Record<string, s
   return {
     INFERLAB_AUTH_ORIGIN: stage.inferops.authOrigin,
     INFEROPS_COMPANY: stage.inferops.company,
+    // The dev sign-in proxy (FAC-296 part 2): gatekeeper-inferlab serves it, and both send the
+    // browser there. Not a secret: it's a hostname of the stage.
+    ...(stage.inferops.authorizeOrigin ? { INFERLAB_AUTHORIZE_ORIGIN: stage.inferops.authorizeOrigin } : {}),
   };
 }
 
-/** The one hostname a stage worker is reachable at, or null: only the router has one. */
+/**
+ * The one hostname a stage worker is reachable at, or null. The router owns the stage's hostname;
+ * on a stage with a sign-in proxy, gatekeeper-inferlab owns the proxy's. Nothing else has one.
+ */
 export function stageWorkerHost(stage: StageDefinition, pkgName: string): string | null {
-  return pkgName === "router" ? stage.hostname : null;
+  if (pkgName === "router") return stage.hostname;
+  if (pkgName === INFERLAB_GATEKEEPER && stage.inferops.authorizeOrigin) {
+    return new URL(stage.inferops.authorizeOrigin).hostname;
+  }
+  return null;
 }
 
 /** Every hostname a stage serves, each of which must be behind Cloudflare Access. */
 export function stageHostnames(stage: StageDefinition): string[] {
-  return [stage.hostname];
+  return [stage.hostname,
+    ...(stage.inferops.authorizeOrigin ? [new URL(stage.inferops.authorizeOrigin).hostname] : [])];
 }
 
 /** The backend's plain vars. Nothing here is secret: Wrangler prints every var's value. */
@@ -140,6 +151,12 @@ export function backendVars(stage: StageDefinition, origin: string): Record<stri
     AUTH_GATEKEEPERS: INFERLAB_LOGIN_VENDOR,
     AUTH_GATEKEEPER_ISSUERS: `${INFERLAB_LOGIN_VENDOR}=${stage.inferops.authOrigin}`,
     DISABLE_PASSWORD_AUTH: "true",
+    // The spend guard (FAC-296 part 2): agent turns per workspace owner per UTC day, refused once
+    // used (workshop-backend ai-gateway-billing/limits, checked before every turn).
+    ...(stage.agents ? {
+      ENABLE_CLOUDFLARE_LIMITS: "true",
+      DAILY_LLM_CALL_LIMIT: String(stage.agents.dailyTurnLimit),
+    } : {}),
   };
 }
 
@@ -175,8 +192,8 @@ export function buildStageConfigs({
     Object.assign(config, {
       name: workerName(pkg.name),
       account_id: accountId,
-      // Only the router is reachable, and only at its custom domain behind Access: a workers.dev or
-      // preview URL would be a way around Access.
+      // Only the router (and, on dev, gatekeeper-inferlab's sign-in proxy) is reachable, and only at
+      // its custom domain behind Access: a workers.dev or preview URL would be a way around Access.
       workers_dev: false,
       preview_urls: false,
       observability: stageObservability(config),
@@ -209,6 +226,8 @@ export function buildStageConfigs({
         ...(pkg.name === INFERLAB_GATEKEEPER || pkg.name === INFERLABOPS_GATEKEEPER
           ? inferLabGatekeeperVars(stage) : {}),
       };
+      const host = stageWorkerHost(stage, pkg.name);
+      if (host) config.routes = [{ pattern: host, custom_domain: true }];
       for (const name of FORBIDDEN_GATEKEEPER_VARS) {
         if (config.vars[name] !== undefined) throw new Error(`${pkg.name} must not carry ${name} in a stage`);
       }
@@ -242,15 +261,66 @@ export function resolveStageAdmins({ list = process.env.STAGE_ADMINS }: { list?:
 }
 
 /**
- * The backend's secrets: `ADMINS` and the AI Gateway names (preview/staging-config.ts
- * `resolveAiGateway`), never the Cloudflare Access pair (see stages.ts `StageAuthMode`). Uploaded
- * with the worker's version, never written into a config or printed.
+ * The backend's secrets: `ADMINS`, the AI Gateway names (preview/staging-config.ts
+ * `resolveAiGateway`) and, when `STAGE_ADMIN_CONFIG_SEED` is set, `ADMIN_CONFIG_SEED` (the Models
+ * tab the stage starts with: which models it offers). Never the Cloudflare Access pair (see
+ * stages.ts `StageAuthMode`). Uploaded with the worker's version, never written into a config or
+ * printed.
  */
 export function stageBackendSecrets({
   admins = resolveStageAdmins(),
   aiGateway = resolveAiGateway(),
-}: { admins?: string[]; aiGateway?: Record<string, string> } = {}): Record<string, string> {
-  return { ADMINS: JSON.stringify(admins), ...aiGateway };
+  // `?? ""`: an unset stage seed must not fall back to the preview's PREVIEW_ADMIN_CONFIG_SEED default.
+  adminConfigSeed = resolveAdminConfigSeed({ seed: process.env.STAGE_ADMIN_CONFIG_SEED ?? "" }),
+}: {
+  admins?: string[]; aiGateway?: Record<string, string>; adminConfigSeed?: Record<string, string>;
+} = {}): Record<string, string> {
+  return { ADMINS: JSON.stringify(admins), ...aiGateway, ...adminConfigSeed };
+}
+
+/** The edge secret's shape: what InferLab's WAF rule accepts (inferops `waf:inferosEdgeSecret`). */
+const EDGE_SECRET = /^[A-Za-z0-9_-]{32,}$/;
+
+/**
+ * The edge secret input for each stage: its own name, so one stage's value (a dev secret left in the
+ * shell) never deploys to another. Listed out, not built from the name, so env-passthrough.test.ts
+ * (which discovers env reads textually) sees each one.
+ */
+export function stageEdgeSecretInput(stageName: string): string | undefined {
+  const inputs: Record<string, string | undefined> = {
+    dev: process.env.INFEROPS_EDGE_SECRET_DEV,
+    prod: process.env.INFEROPS_EDGE_SECRET_PROD,
+  };
+  return inputs[stageName];
+}
+
+/** The input name {@link stageEdgeSecretInput} reads for a stage. */
+export const stageEdgeSecretName = (stageName: string): string => `INFEROPS_EDGE_SECRET_${stageName.toUpperCase()}`;
+
+/**
+ * Each InferLab gatekeeper's secrets: `INFEROPS_EDGE_SECRET` when the stage has one, the shared
+ * value InferLab's edge lets through (FAC-296 part 2), from the stage's own input
+ * (`INFEROPS_EDGE_SECRET_<STAGE>`). Both gatekeepers send it, to the InferLab origin only. A value
+ * that isn't the WAF rule's shape stops the run rather than deploying a stage InferLab will refuse,
+ * and so does a bare `INFEROPS_EDGE_SECRET` in the shell, which names no stage. No value is shown.
+ */
+export function stageGatekeeperSecrets({
+  stageName,
+  edgeSecret = stageEdgeSecretInput(stageName),
+  bareEdgeSecret = process.env.INFEROPS_EDGE_SECRET,
+}: { stageName: string; edgeSecret?: string; bareEdgeSecret?: string }): Record<string, Record<string, string>> {
+  if (bareEdgeSecret?.trim()) {
+    throw new Error(`INFEROPS_EDGE_SECRET names no stage; set ${stageEdgeSecretName(stageName)} for ` +
+        `this stage instead, and unset INFEROPS_EDGE_SECRET (its value is not shown)`);
+  }
+  const value = edgeSecret?.trim();
+  if (!value) return {};
+  if (!EDGE_SECRET.test(value)) {
+    throw new Error(`${stageEdgeSecretName(stageName)} must be at least 32 characters of [A-Za-z0-9_-], ` +
+        "the same value as InferLab's waf:inferosEdgeSecret (its value is not shown)");
+  }
+  return Object.fromEntries([INFERLAB_GATEKEEPER, INFERLABOPS_GATEKEEPER]
+    .map((pkg) => [pkg, { INFEROPS_EDGE_SECRET: value }]));
 }
 
 /** One tier of a stage deploy: packages deployed together. */
@@ -273,11 +343,14 @@ export function stageTiers(configs: ReadonlyMap<string, StagingConfig>): StageTi
 }
 
 /** The plan a dry run prints: names only, never a secret value or a company's tenant id. */
-export function formatStagePlan({ stageName, stage, configs, secretNames, kv, blockers = [] }: {
+export function formatStagePlan({
+  stageName, stage, configs, secretNames, gatekeeperSecretNames = {}, kv, blockers = [],
+}: {
   stageName: string;
   stage: StageDefinition;
   configs: ReadonlyMap<string, StagingConfig>;
   secretNames: readonly string[];
+  gatekeeperSecretNames?: Readonly<Record<string, readonly string[]>>;
   kv: readonly StageKvNamespace[];
   blockers?: readonly string[];
 }): string {
@@ -295,7 +368,9 @@ export function formatStagePlan({ stageName, stage, configs, secretNames, kv, bl
       const host = stageWorkerHost(stage, pkgName);
       const services = (config.services ?? []).map((s) => (s as { service: string }).service);
       const extra = (host ? ` at ${host} (custom domain)` : "") +
-        (pkgName === "workshop-backend" ? `, secrets: ${secretNames.join(", ")}` : "") +
+        (pkgName === "workshop-backend" ? `, secrets: ${secretNames.join(", ")}` :
+          (gatekeeperSecretNames[pkgName] ?? []).length > 0
+            ? `, secrets: ${(gatekeeperSecretNames[pkgName] ?? []).join(", ")}` : "") +
         (services.length > 0 ? `, binds: ${services.join(", ")}` : "");
       lines.push(`    ${config.name}${extra}${vars ? ` [vars: ${vars}]` : ""}`);
     }

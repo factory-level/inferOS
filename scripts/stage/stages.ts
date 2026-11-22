@@ -8,9 +8,11 @@
 // - Both refuse `INFEROPS_COMPANY = "internal"` (config.ts: anything but a tenant id turns sign-in
 //   off). A stage whose company is `internal` therefore plans and builds, but its deploy is refused
 //   until it names the tenant id InferOps maps its origin to (see {@link stageDeployBlockers}).
-// - The archived sign-in proxy (`authorizeOrigin`), the InferLab edge secret, the optional resource
-//   switches and the model bounds (`MODEL_ALLOWLIST`, `DAILY_AGENT_TURN_LIMIT`) have no reader on
-//   the clean line, so they aren't declared.
+// - The sign-in proxy (`inferops.authorizeOrigin`) and the InferLab edge secret are the clean line's
+//   own (FAC-296 part 2, `@gadgets/gatekeeper-kit/inferlab-edge`), served and sent by both InferLab
+//   gatekeepers. The archived optional resource switches have no reader here and aren't declared.
+// - The spend guard (`agents`) is the clean line's daily limit, not the archived
+//   `MODEL_ALLOWLIST`/`DAILY_AGENT_TURN_LIMIT`, which nothing here reads: see {@link StageDefinition}.
 
 /** How people sign in to a stage. */
 export type StageAuthMode =
@@ -48,7 +50,25 @@ export interface StageDefinition {
      * it, so a stage naming it can't be deployed (see {@link stageDeployBlockers}).
      */
     company: "internal" | string;
+    /**
+     * Optional, dev only: a second hostname of this stage, served by `gatekeeper-inferlab`, that
+     * forwards InferLab's sign-in pages (`INFERLAB_AUTHORIZE_ORIGIN`). Set it when InferLab's edge
+     * admits only allowlisted addresses, so a browser elsewhere can still sign in. It exposes the
+     * persona picker, so the stage's Access application must cover it (the deploy checks), and
+     * InferLab must list it in `auth.sso.proxyOrigins`. It resolves the same subject into the same
+     * pipeline; an origin InferLab doesn't list is ignored there.
+     */
+    authorizeOrigin?: string;
   };
+  /**
+   * Optional spend guard on the platform's own models. `dailyTurnLimit` agent turns per workspace
+   * owner per UTC day (`ENABLE_CLOUDFLARE_LIMITS=true` with `DAILY_LLM_CALL_LIMIT`: the overseer
+   * checks it before every turn and refuses the turn once the day's are used). Which models are
+   * offered comes from the optional `STAGE_ADMIN_CONFIG_SEED` input (the backend's
+   * `ADMIN_CONFIG_SEED`, the Models tab). Neither is a dollar bound: that's the provider's spend
+   * limit on the key the gateway stores.
+   */
+  agents?: { dailyTurnLimit: number };
   /**
    * The gatekeepers this stage deploys. A gatekeeper left out is neither deployed nor bound, so it
    * is absent from the Workshop rather than offered and broken: the third-party gatekeepers need an
@@ -84,9 +104,14 @@ export const STAGES = {
     resourcePrefix: "inferos-dev-",
     auth: { mode: "inferlab" },
     // `internal` until InferOps maps dev-os to a tenant id (FAC-296 park point): the deploy refuses.
-    inferops: { authOrigin: "https://auth.dev.inferlab.io", company: "internal" },
+    inferops: {
+      authOrigin: "https://auth.dev.inferlab.io",
+      company: "internal",
+      authorizeOrigin: "https://auth.dev-os.factorylevel.dev",
+    },
     gatekeepers: STAGE_GATEKEEPERS,
     requireCleanTree: false,
+    agents: { dailyTurnLimit: 40 },
   },
   prod: {
     hostname: "os.factorylevel.dev",
@@ -136,6 +161,22 @@ export function stageDefinitionProblems(stage: StageDefinition): string[] {
   }
   if (!isDeploymentCompany(stage.inferops.company)) {
     problems.push(`inferops.company must be "internal" or a lowercase tenant id`);
+  }
+  const proxy = stage.inferops.authorizeOrigin;
+  // Dev only, structurally: a production stage (one that deploys only from a clean tree) never
+  // serves InferLab's sign-in pages from a hostname of its own.
+  if (proxy !== undefined && stage.requireCleanTree) {
+    problems.push("inferops.authorizeOrigin is for a dev stage only; a production stage can't have a sign-in proxy");
+  }
+  if (proxy !== undefined) {
+    if (!isBareHttpsOrigin(proxy) || proxy === stage.inferops.authOrigin) {
+      problems.push(`inferops.authorizeOrigin "${proxy}" must be a bare https:// origin other than authOrigin`);
+    } else if (new URL(proxy).hostname === stage.hostname || !HOSTNAME.test(new URL(proxy).hostname)) {
+      problems.push(`inferops.authorizeOrigin must name its own lowercase hostname, not the stage's`);
+    }
+  }
+  if (stage.agents && !(Number.isInteger(stage.agents.dailyTurnLimit) && stage.agents.dailyTurnLimit > 0)) {
+    problems.push("agents.dailyTurnLimit must be a positive whole number");
   }
   for (const required of [INFERLAB_GATEKEEPER, INFERLABOPS_GATEKEEPER]) {
     if (!stage.gatekeepers.includes(required)) problems.push(`gatekeepers must include ${required}`);

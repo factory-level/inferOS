@@ -19,11 +19,15 @@
 //   STAGE_ADMINS                          required, comma-separated admin emails
 //   CLOUDFLARE_ACCOUNT_ID                 required
 //   CF_AI_GATEWAY*                        optional, see preview/staging-config.ts resolveAiGateway
+//   STAGE_ADMIN_CONFIG_SEED               optional, the backend's ADMIN_CONFIG_SEED (the Models tab)
+//   INFEROPS_EDGE_SECRET_<STAGE>          optional, both InferLab gatekeepers' InferLab edge header,
+//                                         per stage (INFEROPS_EDGE_SECRET_DEV, _PROD)
 //
 // Ported to the clean line from the archived main (FAC-296). Not ported, because the clean line has
-// none of what they check or the deploy doesn't need them: `stage:delete`, the post-deploy smoke
+// none of what they check or the deploy doesn't need them: `stage:delete`, the automated smoke
 // through an Access service token, the InferOps pin and board-schema gate, a company wrapper's
-// deploy (`inferos:deploy`) and company storage. The Access redirect check after a deploy is kept.
+// deploy (`inferos:deploy`) and company storage. The Access redirect check after a deploy is kept,
+// and the deploy ends by printing the smoke a person runs ({@link stageSmokeSteps}).
 
 import { execFileSync, spawn } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -37,7 +41,8 @@ import { readDeployablePackages, type DeployablePackage } from "../release/manif
 import { PACKAGES_DIR, ROOT, type StagingConfig } from "../preview/staging-config.ts";
 import {
   buildStageConfigs, destructiveMigrations, formatStagePlan, stageBackendSecrets, stageConfigDigest,
-  stageConfigFileName, stageHostnames, stageKvNamespaces, stagePackages, stageTiers, stageWorkerHost,
+  stageConfigFileName, stageGatekeeperSecrets, stageHostnames, stageKvNamespaces, stagePackages, stageTiers,
+  stageWorkerHost,
 } from "./stage-config.ts";
 import {
   deployTargetProblem, parseDeployTargets, parseKvNamespaceList, retryWhileDnsPending,
@@ -166,6 +171,8 @@ export interface Prepared {
   accountId: string;
   packages: DeployablePackage[];
   secrets: Record<string, string>;
+  /** Each InferLab gatekeeper's secrets (the edge secret), by package. */
+  gatekeeperSecrets: Record<string, Record<string, string>>;
 }
 
 /**
@@ -185,7 +192,10 @@ export function prepare(args: Pick<StageArgs, "stage" | "allowDestructiveMigrati
     throw new Error("Durable Object migrations that destroy or move state, which wrangler rollback " +
         `never undoes:\n  - ${destructive.join("\n  - ")}\nPass --allow-destructive-migrations to deploy them.`);
   }
-  return { stageName, stage, accountId, packages: deployed, secrets: stageBackendSecrets() };
+  return {
+    stageName, stage, accountId, packages: deployed, secrets: stageBackendSecrets(),
+    gatekeeperSecrets: stageGatekeeperSecrets({ stageName }),
+  };
 }
 
 /** The dry-run plan: built with placeholder KV ids, so it needs no network. */
@@ -196,6 +206,8 @@ export function dryRunPlan(prepared: Prepared): string {
   const configs = buildStageConfigs({ stage, packages, accountId, kvIds: placeholderIds });
   return `dry-run plan (no network):\n${formatStagePlan({
     stageName, stage, configs, secretNames: Object.keys(secrets), kv, blockers: stageDeployBlockers(stage),
+    gatekeeperSecretNames: Object.fromEntries(Object.entries(prepared.gatekeeperSecrets)
+      .map(([pkg, values]) => [pkg, Object.keys(values)])),
   })}`;
 }
 
@@ -213,9 +225,10 @@ async function deployWorker(
 ): Promise<void> {
   const outputFile = join(scratch, `${pkg.name}.output.ndjson`);
   const args = ["deploy", "-c", stageConfigFileName(prepared.stageName), "--message", message];
-  if (pkg.name === "workshop-backend" && Object.keys(prepared.secrets).length > 0) {
+  const secrets = pkg.name === "workshop-backend" ? prepared.secrets : prepared.gatekeeperSecrets[pkg.name];
+  if (secrets && Object.keys(secrets).length > 0) {
     const secretsFile = join(scratch, `${pkg.name}.secrets.json`);
-    writeFileSync(secretsFile, JSON.stringify(prepared.secrets), { mode: 0o600 });
+    writeFileSync(secretsFile, JSON.stringify(secrets), { mode: 0o600 });
     args.push("--secrets-file", secretsFile);
   }
   console.log(`deploying ${config.name}`);
@@ -252,6 +265,22 @@ async function assertBehindAccess(stage: StageDefinition): Promise<void> {
     }
     console.log(`https://${hostname}/ redirects to Cloudflare Access without credentials`);
   }
+}
+
+/**
+ * The smoke a person runs after a deploy (FAC-296 part 2), printed as the deploy's last lines: the
+ * sign-in only a real browser and a real seat can prove.
+ */
+export function stageSmokeSteps(stage: StageDefinition): string[] {
+  return [
+    `Open https://${stage.hostname} and pass Cloudflare Access.`,
+    `Choose "Sign in with InferLab" and sign in as a seat of the stage's company` +
+      (stage.inferops.authorizeOrigin
+        ? ` (the sign-in page is served from ${new URL(stage.inferops.authorizeOrigin).hostname}).`
+        : "."),
+    "Open that company's board (inferops://<tenant>.<workspace>/project/board/<KEY>): it renders.",
+    "Open a chat: the model picker shows an agent, and one message gets an answer.",
+  ];
 }
 
 async function deploy(args: StageArgs): Promise<void> {
@@ -299,8 +328,9 @@ async function deploy(args: StageArgs): Promise<void> {
   console.log(JSON.stringify({ deployRecord: {
     inferosSha: tree.sha,
     configDigest: stageConfigDigest(configs),
-    smoke: { skipped: true, reason: "not ported to the clean line; accept by hand (docs/wiki/stage-deploy.md)" },
+    smoke: { automated: false, reason: "run by a person: the steps below (docs/stage-deploy.md)" },
   } }, null, 2));
+  console.log(`\nNow run the smoke, by hand:\n${stageSmokeSteps(stage).map((s, i) => `  ${i + 1}. ${s}`).join("\n")}`);
 }
 
 async function configure(args: StageArgs): Promise<void> {

@@ -2277,3 +2277,67 @@ describe("getDecisionModel routing", () => {
     });
   });
 });
+
+// FAC-296 part 2, fix round 1: with the stage's limits on, each call of a binding to one of the
+// deployment's own models counts on its owner's daily counter, and the call over the limit is
+// refused before any request reaches the model. A user's own-key model isn't counted.
+describe("a model binding's calls against the daily limit (FAC-296)", () => {
+  const MODEL_ID = "claude-opus-5-5";
+  const LIMIT_MESSAGE = "Free usage limit reached. Connect your Cloudflare account to continue.";
+
+  function session(config: AiModelConfig, opts: { ownerId?: string; limit: number }) {
+    let used = 0;
+    const counted: string[] = [];
+    const users = {
+      idFromString: (id: string) => id,
+      get: (id: string) => ({
+        consumeDailyLlmCall: async (limit: number) => {
+          counted.push(id);
+          if (used >= limit) return { withinLimits: false };
+          used += 1;
+          return { withinLimits: true };
+        },
+      }),
+    };
+    const gatekeeper = Object.create(LanguageModelGatekeeper.prototype) as LanguageModelGatekeeper;
+    Object.assign(gatekeeper, {
+      env: env({
+        BLUEPRINTS: { get: async () => serializeAdminConfig(DEFAULT_ADMIN_CONFIG) } as unknown as KVNamespace,
+        CF_AI_GATEWAY_PROVIDERS: "anthropic",
+        ENABLE_CLOUDFLARE_LIMITS: "true",
+        DAILY_LLM_CALL_LIMIT: String(opts.limit),
+      }),
+      ctx: {
+        props: { displayName: "Model", config, initiator: GADGET_INITIATOR, ownerId: opts.ownerId },
+        exports: { UserDurableObject: users },
+      },
+    });
+    return { binding: gatekeeper.startSession(undefined as never), counted };
+  }
+
+  it("counts a platform model's calls and refuses the one over the limit before the model is called", async () => {
+    vi.stubGlobal("fetch", fetchStub);
+    try {
+      const { binding, counted } = session(
+          { provider: "anthropic", model: MODEL_ID, apiToken: "" }, { ownerId: "owner-1", limit: 1 });
+      const live = await binding;
+      const run = (options: { prompt: string }) => live.run(options);
+      const failure = (p: Promise<unknown>) => p.then(() => "resolved", (err: Error) => err.message);
+      // Within the limit the call goes on to the model, which fails here for want of a gateway.
+      const first = await failure(run({ prompt: "hello" }));
+      expect(first).not.toBe(LIMIT_MESSAGE);
+      // Over it, the binding refuses with the reason a refused turn gives; the counter was asked
+      // first both times (binding-charge.ts runs before completeText).
+      expect(await failure(run({ prompt: "hello again" }))).toBe(LIMIT_MESSAGE);
+      expect(counted).toEqual(["owner-1", "owner-1"]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("refuses a platform model binding with no recorded owner while the limits are on", async () => {
+    const { binding, counted } = session({ provider: "anthropic", model: MODEL_ID, apiToken: "" }, { limit: 40 });
+    await expect((await binding).run({ prompt: "hello" })).rejects.toThrow(/bind the model again/);
+    expect(counted).toEqual([]);
+  });
+});

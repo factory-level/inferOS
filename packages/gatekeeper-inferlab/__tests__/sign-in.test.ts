@@ -5,10 +5,18 @@ import { env } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import worker from "../src/worker.js";
 import {
-  ISSUER_MAX_LENGTH, ISSUER_PATTERN, NOT_CONFIGURED, SIGN_IN_CALLBACK_PATH, parseOrigin, readConfig,
+  ISSUER_MAX_LENGTH, ISSUER_PATTERN, NOT_CONFIGURED, SIGN_IN_CALLBACK_PATH, inferLabTarget, parseOrigin, readConfig,
 } from "../src/config.js";
+import { endSession, exchangeCode } from "../src/token.js";
 // The InferLab contract, pinned from inferops (scripts/inferlab-contracts).
 import subjectSchema from "../../../scripts/inferlab-contracts/schemas/inferlab.stable-subject.v1.schema.json";
+
+// Vite's static `import.meta.glob` (the source guard below), which this package's worker types don't declare.
+declare global {
+  interface ImportMeta {
+    glob(pattern: string, options: { query: "?raw"; import: "default"; eager: true }): Record<string, string>;
+  }
+}
 
 const ISSUER = "http://localhost:23380";
 const BASE = "http://localhost:8787/gatekeeper/inferlab";
@@ -335,5 +343,97 @@ describe("what InferLab answers is checked", () => {
     const { text } = await signIn();
     expect(text).toContain("InferLab refused the sign-in (HTTP 400).");
     expect(text).not.toContain("secret detail");
+  });
+});
+
+// FAC-296 part 2: reaching an InferLab edge that admits only known callers. The dev sign-in proxy
+// sends the browser to INFERLAB_AUTHORIZE_ORIGIN, which this gatekeeper serves by forwarding to the
+// issuer; the code exchange and the logout carry the edge secret. Same subject, same pipeline.
+describe("the InferLab edge (FAC-296)", () => {
+  const PROXY = "http://127.0.0.1:23381";
+  const SECRET = "edge_secret-0123456789abcdefABCDEF0123";
+  type Sent = { url: string; headers: Headers };
+  let sent: Sent[] = [];
+
+  beforeEach(() => {
+    sent = [];
+    const inner = globalThis.fetch;
+    vi.stubGlobal("fetch", async (input: RequestInfo, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.url;
+      sent.push({ url, headers: new Headers(init?.headers) });
+      if (new URL(url).pathname === "/authorize") return new Response("sign-in page", { status: 200 });
+      return inner(input, init);
+    });
+  });
+
+  it("sends the browser to the proxy when set, and exchanges the code at the issuer", async () => {
+    const attempt = await started();
+    const link = await get(`${BASE}/${attempt.attemptId}/${attempt.nonce}`, { INFERLAB_AUTHORIZE_ORIGIN: PROXY });
+    expect(link.status).toBe(302);
+    const auth = new URL(link.headers.get("location")!);
+    expect(auth.origin).toBe(PROXY);
+    expect(auth.pathname).toBe("/authorize");
+    expect(auth.searchParams.get("redirect_uri")).toBe(REDIRECT_URI);
+    const callback = await get(`${REDIRECT_URI}?code=the-code&state=${auth.searchParams.get("state")}`,
+      { INFERLAB_AUTHORIZE_ORIGIN: PROXY });
+    expect(callback.status).toBe(200);
+    expect(sent.map(s => new URL(s.url).origin)).toEqual([ISSUER, ISSUER]);
+  });
+
+  it("serves the proxy host by forwarding the sign-in page to the issuer, with the edge header", async () => {
+    const page = await get(`${PROXY}/authorize?client_id=inferos&state=s`,
+      { INFERLAB_AUTHORIZE_ORIGIN: PROXY, INFEROPS_EDGE_SECRET: SECRET });
+    expect(await page.text()).toBe("sign-in page");
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.url).toBe(`${ISSUER}/authorize?client_id=inferos&state=s`);
+    expect(sent[0]!.headers.get("x-inferos-edge")).toBe(SECRET);
+    expect(sent[0]!.headers.get("x-inferos-authorize-origin")).toBe(PROXY);
+    // Anything but central-auth's browser legs is a 404, and InferLab isn't called.
+    expect((await get(`${PROXY}/workspaces`, { INFERLAB_AUTHORIZE_ORIGIN: PROXY })).status).toBe(404);
+    expect(sent).toHaveLength(1);
+  });
+
+  it("without a proxy origin, the proxy host is not served", async () => {
+    const response = await get(`${PROXY}/authorize?client_id=inferos`);
+    expect(response.status).toBe(404);
+    expect(sent).toHaveLength(0);
+  });
+
+  it("the code exchange and the logout carry the edge secret when set, and only then", async () => {
+    // The Durable Object that completes a sign-in calls these with inferLabTarget(readConfig(env)).
+    for (const edge of [SECRET, undefined]) {
+      sent = [];
+      const target = { origin: ISSUER, ...(edge ? { edge } : {}) };
+      const signedIn = await exchangeCode(target, "the-code", "verifier", REDIRECT_URI);
+      expect(signedIn.subject).toEqual({ issuer: ISSUER, subject: PRINCIPAL });
+      await endSession(target, signedIn.refreshToken);
+      expect(sent.map(s => new URL(s.url).pathname)).toEqual(["/auth/token", "/auth/logout"]);
+      expect(sent.map(s => s.headers.get("x-inferos-edge"))).toEqual(edge ? [SECRET, SECRET] : [null, null]);
+    }
+    const config = readConfig({
+      INFERLAB_AUTH_ORIGIN: ISSUER, INFEROPS_COMPANY: COMPANY, BASE_URL: BASE, INFEROPS_EDGE_SECRET: SECRET,
+    });
+    expect("off" in config ? null : inferLabTarget(config)).toEqual({ origin: ISSUER, edge: SECRET });
+  });
+
+  it("a set but malformed proxy origin, or the issuer itself, turns sign-in off", () => {
+    const base = { INFERLAB_AUTH_ORIGIN: ISSUER, INFEROPS_COMPANY: COMPANY, BASE_URL: BASE };
+    for (const bad of ["not a url", `${PROXY}/path`, ISSUER, "ftp://127.0.0.1"]) {
+      expect(readConfig({ ...base, INFERLAB_AUTHORIZE_ORIGIN: bad }), bad).toEqual({ off: NOT_CONFIGURED.authorizeOrigin });
+    }
+    expect(readConfig({ ...base, INFERLAB_AUTHORIZE_ORIGIN: PROXY })).toMatchObject({ authorizeOrigin: PROXY });
+    expect(readConfig(base)).toMatchObject({ authorizeOrigin: null });
+    expect(readConfig({ ...base, INFEROPS_EDGE_SECRET: "too-short" })).not.toHaveProperty("edge");
+  });
+
+  // Every request to InferLab goes through the kit's inferLabFetch. A new `fetch(` call in this
+  // package would reach InferLab without the edge header, so it fails here first.
+  it("no source file calls the global fetch directly", () => {
+    const sources = import.meta.glob("../src/**/*.ts", { query: "?raw", import: "default", eager: true });
+    expect(Object.keys(sources).length).toBeGreaterThan(2);
+    const offenders = Object.entries(sources)
+      .filter(([, text]) => /(?<![.\w]|async )fetch\s*\(|globalThis\.fetch|=\s*fetch\b/m.test(text))
+      .map(([path]) => path);
+    expect(offenders).toEqual([]);
   });
 });

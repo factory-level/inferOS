@@ -2,6 +2,8 @@
 // sign-in off with a reason, instead of sending people somewhere else or admitting another company.
 // There is no fallback: no default issuer, company or base URL, no demo company, no password path.
 
+import { type InferLabTarget, edgeSecretOf } from "@gadgets/gatekeeper-kit/inferlab-edge";
+
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
 const TENANT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -23,7 +25,10 @@ export const GATEKEEPER_PATH = "/gatekeeper/inferlab";
 export const SIGN_IN_CALLBACK_PATH = `${GATEKEEPER_PATH}/oauth`;
 
 /** The settings this file reads. */
-export type InferLabEnv = { INFERLAB_AUTH_ORIGIN?: string; INFEROPS_COMPANY?: string; BASE_URL?: string };
+export type InferLabEnv = {
+  INFERLAB_AUTH_ORIGIN?: string; INFEROPS_COMPANY?: string; BASE_URL?: string;
+  INFERLAB_AUTHORIZE_ORIGIN?: string; INFEROPS_EDGE_SECRET?: string;
+};
 
 /** What sign-in runs with, once every setting is valid. */
 export type InferLabConfig = {
@@ -33,6 +38,13 @@ export type InferLabConfig = {
   tenantId: string;
   /** This gatekeeper's base URL, without a trailing slash. */
   baseUrl: string;
+  /**
+   * The dev sign-in proxy's origin (FAC-296), where the browser is sent to sign in, or null to send
+   * it to the issuer. Never the issuer itself.
+   */
+  authorizeOrigin: string | null;
+  /** InferLab's edge secret, sent to the issuer only; undefined when the deployment has none. */
+  edge?: string;
 };
 
 /** Why sign-in is off, in words an administrator can act on. Names settings, never values. */
@@ -42,6 +54,8 @@ export const NOT_CONFIGURED = {
   company: "InferLab sign-in is off: INFEROPS_COMPANY is missing or isn't a tenant id.",
   baseUrl: "InferLab sign-in is off: BASE_URL is missing, isn't https (or http on a loopback host), " +
     `or doesn't end in ${GATEKEEPER_PATH}.`,
+  authorizeOrigin: "InferLab sign-in is off: INFERLAB_AUTHORIZE_ORIGIN is set but isn't an https " +
+    "origin other than INFERLAB_AUTH_ORIGIN.",
 } as const;
 
 /** A bare origin under the contract's issuer rule. Anything else is null. */
@@ -80,8 +94,19 @@ export function readConfig(env: InferLabEnv): InferLabConfig | { off: string } {
   if (!TENANT_ID.test(company)) return { off: NOT_CONFIGURED.company };
   const baseUrl = parseBaseUrl(env.BASE_URL);
   if (!baseUrl) return { off: NOT_CONFIGURED.baseUrl };
-  return { issuer, tenantId: company.toLowerCase(), baseUrl };
+  // A set but malformed proxy origin turns sign-in off rather than quietly skipping the proxy.
+  let authorizeOrigin: string | null = null;
+  if (env.INFERLAB_AUTHORIZE_ORIGIN?.trim()) {
+    authorizeOrigin = parseOrigin(env.INFERLAB_AUTHORIZE_ORIGIN);
+    if (!authorizeOrigin || authorizeOrigin === issuer) return { off: NOT_CONFIGURED.authorizeOrigin };
+  }
+  const edge = edgeSecretOf(env);
+  return { issuer, tenantId: company.toLowerCase(), baseUrl, authorizeOrigin, ...(edge ? { edge } : {}) };
 }
+
+/** Where calls to InferLab go: the issuer, with the edge secret when there is one. */
+export const inferLabTarget = (config: InferLabConfig): InferLabTarget =>
+  ({ origin: config.issuer, ...(config.edge ? { edge: config.edge } : {}) });
 
 /** The exact redirect URI InferLab must have registered for the `inferos` client. */
 export const redirectUriFor = (config: InferLabConfig): string => `${config.baseUrl}/oauth`;
