@@ -15,7 +15,9 @@ The stages are declared in `scripts/stage/stages.ts`. Never change a stage's `wo
 
 1. **The stage's gatekeepers**, concurrently: `gatekeeper-inferlab` (InferLab sign-in), `gatekeeper-inferlabops` (InferOps data with the person's own InferLab session), `gatekeeper-context`, `gatekeeper-scheduler` and `gatekeeper-mcp`. The other gatekeepers need OAuth apps a stage doesn't configure, so they are neither deployed nor bound, and the Workshop doesn't offer them.
 2. **`workshop-backend`**, which binds each gatekeeper by its stage worker name.
-3. **`router`**, which binds the backend and every gatekeeper, and is the only worker with a hostname: the stage's, as a custom domain. Every other worker has `workers_dev: false` and `preview_urls: false`, and the deploy checks Wrangler reported no other URL.
+3. **`router`**, which binds the backend and every gatekeeper, and owns the stage's hostname as a custom domain.
+
+Only two workers are reachable. The router has the stage's hostname. On `dev`, `gatekeeper-inferlab` also has the sign-in proxy's hostname (below). Every worker has `workers_dev: false` and `preview_urls: false`, and the deploy checks Wrangler reported no other URL.
 
 The bindings, each gatekeeper's `BASE_URL` and the Context gatekeeper's `sharingDomain` are built by the same functions a per-PR preview uses (`scripts/preview/staging-config.ts`). A stage needs no preview ids: a service binding names a worker, and each tier only has to exist before the next binds it.
 
@@ -24,7 +26,7 @@ KV namespaces (`inferos-<stage>-<package>-<binding>`) are created when missing. 
 ## Before the first deploy
 
 1. **Account.** The account holding the `factorylevel.dev` zone, on Workers Paid. Nothing may already use the stage hostname as a DNS record or another Worker's custom domain.
-2. **Access application** for the hostname (Zero Trust, Access, Applications, Self-hosted), created **before** the first deploy so the hostname is never reachable without it, with an Allow policy for the people who may reach the stage. The deploy can't create it. It checks afterwards that an unauthenticated request is redirected to Access, and fails loudly if not.
+2. **Access application** for the hostname (Zero Trust, Access, Applications, Self-hosted), created **before** the first deploy so the hostname is never reachable without it, with an Allow policy for the people who may reach the stage. On `dev`, put the sign-in proxy's hostname `auth.dev-os.factorylevel.dev` in the **same** application: it serves InferLab's sign-in pages, including the persona picker. The deploy can't create the application. Afterwards it checks that an unauthenticated request to every stage hostname is redirected to Access, and fails loudly if not.
 3. **InferLab registration.** In InferOps' config for that environment (`config/development.js` for `dev`, `config/production.js` for `prod`), the stage origin must be:
    - in `auth.sso.inferosOrigins`;
    - mapped in `auth.sso.inferosCompanies` to a **tenant id**.
@@ -39,8 +41,10 @@ KV namespaces (`inferos-<stage>-<package>-<binding>`) are created when missing. 
    | `CLOUDFLARE_ACCOUNT_ID` | yes | The account to deploy to. |
    | `STAGE_ADMINS` | yes | Comma-separated emails of the stage's admins (`/admin`). Uploaded as the backend's `ADMINS` secret. |
    | `CF_AI_GATEWAY`, `CF_AI_GATEWAY_ACCOUNT_ID`, `CF_AI_GATEWAY_PROVIDERS`, … | no | Server-managed models through AI Gateway (`resolveAiGateway` in `scripts/preview/staging-config.ts`). Uploaded as backend secrets. Unset, each user brings their own model keys. |
+   | `STAGE_ADMIN_CONFIG_SEED` | no | The Models tab the stage starts with (which models it offers, `userModelsEnabled`, …), a JSON object of the backend's `ADMIN_CONFIG_SEED` fields. Uploaded as the backend's `ADMIN_CONFIG_SEED` secret. |
+   | `INFEROPS_EDGE_SECRET` | no (yes for `dev` today) | The shared value InferLab's edge lets through. Dev InferLab's Cloud Armor admits only allow-listed addresses, so without it sign-in and every InferOps call from the stage get a 403. Use the same value as InferOps' `waf:inferosEdgeSecret`: at least 32 characters of `A-Za-z0-9_-`. Uploaded as a secret of `gatekeeper-inferlab` and `gatekeeper-inferlabops`, which send it as `x-inferos-edge`, to the InferLab origin only. |
 
-   No secret value is written into a config or printed: the backend's secrets go up with its version (`--secrets-file`, a mode-600 file in a temporary directory, removed afterwards).
+   No secret value is written into a config or printed. Each worker's secrets go up with its version (`--secrets-file`, a mode-600 file in a temporary directory, removed afterwards).
 
 ## Steps
 
@@ -54,7 +58,13 @@ KV namespaces (`inferos-<stage>-<package>-<binding>`) are created when missing. 
    - `dev` refuses a dirty tree unless `--allow-dirty`; `prod` always refuses one.
    - It refuses Durable Object migrations that delete, rename or move a class unless `--allow-destructive-migrations`, because `wrangler rollback` never undoes them.
    - It prints a JSON deploy record: the InferOS commit and the config digest.
-3. **Accept it by hand.** Sign in through Access, choose "Sign in with InferLab", and open a board you hold. A config that validates is not acceptance.
+3. **Run the smoke by hand.** The deploy's last lines print it:
+   1. Open the stage and pass Access.
+   2. Choose "Sign in with InferLab" and sign in as a seat of the stage's company. On `dev`, the sign-in page is served from `auth.dev-os.factorylevel.dev`.
+   3. Open that company's board.
+   4. Open a chat. The model picker should show an agent, and a message should get an answer.
+
+   A config that validates is not acceptance.
 4. **Re-deploying** is the same command.
 
 `pnpm stage:config <stage>` checks the Wrangler login reaches the account and lists which KV namespaces exist. When all exist, it writes the configs without deploying.
@@ -63,18 +73,38 @@ KV namespaces (`inferos-<stage>-<package>-<binding>`) are created when missing. 
 
 `pnpm exec wrangler rollback --name inferos-<stage>-<package>` returns one worker to an earlier version. Roll the router, backend and gatekeepers back as one compatible set, then check the Access redirect. A rollback never undoes a Durable Object migration.
 
+## Signing in through dev InferLab's edge
+
+Dev InferLab's edge (Cloud Armor) admits only allow-listed addresses and requests carrying the edge secret, so the clean line's two InferLab gatekeepers handle both cases (`@gadgets/gatekeeper-kit/inferlab-edge`):
+
+- **The browser's sign-in pages: the dev sign-in proxy.** `INFERLAB_AUTHORIZE_ORIGIN` is `https://auth.dev-os.factorylevel.dev`, `gatekeeper-inferlab`'s second custom domain. Both gatekeepers send the browser's `/authorize` there, and the proxy forwards it to InferLab with the edge secret.
+  - Only central-auth's browser legs are forwarded: `GET /authorize`, `POST /authorize/persona`, `GET /logout`, and Google's `POST /auth/oauth/sign-in/social` and `GET /auth/oauth/callback/google`.
+  - The code, the subject and the session come from InferLab exactly as without the proxy.
+  - InferLab answers on the proxy origin only because its `auth.sso.proxyOrigins` lists it, and the Google callback on that origin is registered on InferLab's Google client.
+- **The server's calls: the edge secret.** The code exchange, refresh, logout and every InferOps API call go straight to `INFERLAB_AUTH_ORIGIN`, carrying the edge secret.
+- **Production uses neither.** `prod` sets no proxy origin, and `INFEROPS_EDGE_SECRET` is optional there.
+
+**Rotating the edge secret:** change both values (InferOps' `waf:inferosEdgeSecret` and this stage's `INFEROPS_EDGE_SECRET`) and redeploy both sides. Requests are refused between the two deploys. Leaving the variable out of a later deploy doesn't delete it, because a deploy without it keeps the previous version's secret. Delete it with `pnpm exec wrangler secret delete INFEROPS_EDGE_SECRET --name inferos-dev-gatekeeper-inferlab`, and the same for `-inferlabops`.
+
+## The spend guard
+
+`dev` declares `agents: { dailyTurnLimit: 40 }` (`scripts/stage/stages.ts`). The backend gets `ENABLE_CLOUDFLARE_LIMITS=true` and `DAILY_LLM_CALL_LIMIT=40`:
+- before every agent turn, the overseer counts one call on the workspace owner's per-UTC-day counter;
+- it refuses the turn, with the reason shown in the chat, once 40 are used.
+
+A user who connects their own funded Cloudflare account bills that account instead. Which models the stage offers comes from `STAGE_ADMIN_CONFIG_SEED`, the Models tab it starts with. An admin can change that later in `/admin`. Neither is a dollar bound: that's the spend limit on the provider key the AI Gateway stores (the InferOS Anthropic key's is 60 USD a month). The archived stage's `MODEL_ALLOWLIST` and `DAILY_AGENT_TURN_LIMIT` have no reader on this line.
+
 ## What changed from the archived stage deploy
 
 The clean line's gatekeepers and backend differ from the archived `main`, so these archived pieces have nothing to configure here, and dev-os depends on some of them:
 
 - **The InferOps gatekeeper is two:** `gatekeeper-inferlab` and `gatekeeper-inferlabops`, in place of `gatekeeper-inferops`. Their Durable Objects are new, so nothing in the archived `inferos-dev-gatekeeper-inferops` carries over.
-- **No sign-in proxy.** The archived `auth.dev-os.factorylevel.dev` (`auth-proxy.ts`, `INFERLAB_AUTHORIZE_ORIGIN`) let a browser sign in to dev InferLab from an address its edge doesn't allow. The new gatekeepers send `/authorize` straight to `INFERLAB_AUTH_ORIGIN`.
-- **No InferLab edge secret.** The archived `INFEROPS_EDGE_SECRET` / `x-inferos-edge`, which dev InferLab's Cloud Armor lets through, isn't read or sent.
+- **The sign-in proxy and the edge secret** are ported (above), served and sent by both InferLab gatekeepers.
 - **No `internal` company.** `INFEROPS_COMPANY` must be a tenant id.
-- **No model bounds.** The backend no longer reads `MODEL_ALLOWLIST` or `DAILY_AGENT_TURN_LIMIT`.
+- **The spend guard** is the clean line's own daily limit (above), not `MODEL_ALLOWLIST` or `DAILY_AGENT_TURN_LIMIT`.
 - **Not ported:**
   - `stage:delete`;
-  - the post-deploy smoke through an Access service token;
+  - the automated smoke through an Access service token (a person runs it from the deploy's printed steps);
   - the InferOps pin and board-schema gate;
   - a company wrapper's deploy (`inferos:deploy`);
   - company storage.

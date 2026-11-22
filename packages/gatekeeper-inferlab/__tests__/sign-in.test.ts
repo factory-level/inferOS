@@ -11,6 +11,13 @@ import { endSession, exchangeCode } from "../src/token.js";
 // The InferLab contract, pinned from inferops (scripts/inferlab-contracts).
 import subjectSchema from "../../../scripts/inferlab-contracts/schemas/inferlab.stable-subject.v1.schema.json";
 
+// Vite's static `import.meta.glob` (the source guard below), which this package's worker types don't declare.
+declare global {
+  interface ImportMeta {
+    glob(pattern: string, options: { query: "?raw"; import: "default"; eager: true }): Record<string, string>;
+  }
+}
+
 const ISSUER = "http://localhost:23380";
 const BASE = "http://localhost:8787/gatekeeper/inferlab";
 const REDIRECT_URI = `${BASE}/oauth`;
@@ -422,8 +429,7 @@ describe("the InferLab edge (FAC-296)", () => {
   // Every request to InferLab goes through the kit's inferLabFetch. A new `fetch(` call in this
   // package would reach InferLab without the edge header, so it fails here first.
   it("no source file calls the global fetch directly", () => {
-    const sources = import.meta.glob("../src/**/*.ts", { query: "?raw", import: "default", eager: true }) as
-      Record<string, string>;
+    const sources = import.meta.glob("../src/**/*.ts", { query: "?raw", import: "default", eager: true });
     expect(Object.keys(sources).length).toBeGreaterThan(2);
     const offenders = Object.entries(sources)
       .filter(([, text]) => /(?<![.\w]|async )fetch\s*\(|globalThis\.fetch|=\s*fetch\b/m.test(text))

@@ -16,6 +16,13 @@ import committedEventSchema from "../../../scripts/inferlab-contracts/schemas/in
 import committedEventFixtures from "../../../scripts/inferlab-contracts/fixtures/inferlab.committed-event.v1.json";
 import { ISSUER_PATTERN as SIGN_IN_ISSUER_PATTERN } from "../../gatekeeper-inferlab/src/config.js";
 
+// Vite's static `import.meta.glob` (the FAC-296 source guard), which this package's worker types don't declare.
+declare global {
+  interface ImportMeta {
+    glob(pattern: string, options: { query: "?raw"; import: "default"; eager: true }): Record<string, string>;
+  }
+}
+
 const ORIGIN = "http://localhost:23380";
 const BASE = `http://localhost:8787${GATEKEEPER_PATH}`;
 const COMPANY = "00000000-0000-4000-8000-000000000001";
@@ -1215,8 +1222,7 @@ describe("the InferLab edge (FAC-296)", () => {
   // Every request to InferLab goes through the kit's inferLabFetch: a new `fetch(` call in this
   // package would reach InferLab without the edge header, so it fails here first.
   it("no source file calls the global fetch directly", () => {
-    const sources = import.meta.glob("../src/**/*.ts", { query: "?raw", import: "default", eager: true }) as
-      Record<string, string>;
+    const sources = import.meta.glob("../src/**/*.ts", { query: "?raw", import: "default", eager: true });
     expect(Object.keys(sources).length).toBeGreaterThan(4);
     const offenders = Object.entries(sources)
       .filter(([path]) => !path.includes("/generated/"))
