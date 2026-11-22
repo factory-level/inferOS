@@ -49,3 +49,8 @@ wrangler.dev.jsonc
 .dev.vars.*
 **/.dev.vars
 **/.dev.vars.*
+
+# Persistent stage deploys (scripts/stage): generated configs and local inputs. The vars file holds
+# secret inputs; never commit it.
+wrangler.stage-*.jsonc
+.stage-*.vars

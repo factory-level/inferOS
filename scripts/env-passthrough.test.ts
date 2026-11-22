@@ -124,6 +124,8 @@ const EXPECTED: Record<string, ExpectedArea> = {
       "CLOUDFLARE_OS_DEPLOYMENT", "GITHUB_REPOSITORY", "GITHUB_TOKEN", "PREVIEW_ADMIN_CONFIG_SEED", "PREVIEW_ADMINS",
       "PREVIEW_GITHUB_CLIENT_ID", "PREVIEW_GITHUB_CLIENT_SECRET", "PREVIEW_NAME", "PREVIEW_PR_NUMBER",
       "PREVIEW_WORKERS_DEV_HOST", "PREVIEW_WRANGLER", "VITE_BACKEND_HOST",
+      // The persistent stage deploy's admin list (`stage/stage-config.ts`), read by the deploy script.
+      "STAGE_ADMINS",
       // Read by `vp/concurrency.ts` in the wrapper before `vp` starts, never inside a task.
       "VP_RUN_CONCURRENCY_LIMIT",
     ],
