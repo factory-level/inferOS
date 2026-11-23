@@ -2,10 +2,10 @@
 
 How to deploy and update the two persistent InferOS instances, each behind Cloudflare Access and connected to its own InferLab environment. Ported to this line from the archived `main` (`docs/wiki/stage-deploy.md` there) for FAC-296. What this line does differently is listed under [What changed from the archived stage deploy](#what-changed-from-the-archived-stage-deploy).
 
-| Stage | Hostname | InferLab |
-| --- | --- | --- |
-| `dev` | `https://dev-os.factorylevel.dev` | `auth.dev.inferlab.io` |
-| `prod` | `https://os.factorylevel.dev` | `auth.inferlab.io` |
+| Stage | Hostname | InferLab | Company (`inferops.company`) |
+| --- | --- | --- | --- |
+| `dev` | `https://dev-os.factorylevel.dev` | `auth.dev.inferlab.io` | Brightwire Electrical, `9b7d4aaf-ba34-4f12-b281-9cbc8356b77e` (FAC-297): one customer's instance |
+| `prod` | `https://os.factorylevel.dev` | `auth.inferlab.io` | `internal`, so its deploy is still refused (below) |
 
 The stages are declared in `scripts/stage/stages.ts`. Never change a stage's `workerPrefix` or `resourcePrefix` there: the next deploy would create a new, empty instance and abandon the old one.
 
