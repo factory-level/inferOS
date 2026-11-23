@@ -33,8 +33,10 @@ const EDGE = "edge_sentinel-0123456789abcdefABCDEF0123";
 const SEED = { ADMIN_CONFIG_SEED: JSON.stringify({ userModelsEnabled: false, modelOrder: ["seed-sentinel-model"] }) };
 const packages = readDeployablePackages(PACKAGES_DIR);
 const dev: StageDefinition = STAGES.dev;
-/** dev, as it is once InferOps maps dev-os to a tenant id. */
+/** dev with a test tenant id, so no plan assertion depends on the real company's id. */
 const devWithCompany: StageDefinition = { ...dev, inferops: { ...dev.inferops, company: TENANT } };
+/** dev as it was before FAC-297, naming `internal`: the shape the deploy refuses. */
+const devInternal: StageDefinition = { ...dev, inferops: { ...dev.inferops, company: "internal" } };
 
 function configsFor(stage: StageDefinition) {
   const kv = stageKvNamespaces(stage, packages);
@@ -185,9 +187,20 @@ test("a company's tenant id never appears in the plan", () => {
 });
 
 test('a stage whose company is "internal" plans, but the plan says the deploy refuses it', () => {
-  assert.equal(stageDeployBlockers(dev).length, 1);
+  assert.equal(stageDeployBlockers(devInternal).length, 1);
   assert.deepEqual(stageDeployBlockers(devWithCompany), []);
-  assert.match(dryRunPlan(prepared(dev)), /REFUSED[\s\S]*INFEROPS_COMPANY must be a tenant id/);
+  assert.match(dryRunPlan(prepared(devInternal)), /REFUSED[\s\S]*INFEROPS_COMPANY must be a tenant id/);
+});
+
+test("dev-os belongs to Brightwire Electrical, so its deploy isn't refused; prod stays internal (FAC-297)", () => {
+  // The same tenant id InferOps' config/development.js maps https://dev-os.factorylevel.dev to.
+  assert.equal(STAGES.dev.inferops.company, "9b7d4aaf-ba34-4f12-b281-9cbc8356b77e");
+  assert.deepEqual(stageDeployBlockers(dev), []);
+  const plan = dryRunPlan(prepared(dev));
+  assert.doesNotMatch(plan, /REFUSED/);
+  assert.ok(!plan.includes(STAGES.dev.inferops.company), "the plan printed the tenant id");
+  assert.equal(STAGES.prod.inferops.company, "internal");
+  assert.equal(stageDeployBlockers(STAGES.prod).length, 1);
 });
 
 test("stage definitions are checked before anything is generated", () => {

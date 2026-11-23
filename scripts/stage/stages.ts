@@ -103,10 +103,11 @@ export const STAGES = {
     workerPrefix: "inferos-dev-",
     resourcePrefix: "inferos-dev-",
     auth: { mode: "inferlab" },
-    // `internal` until InferOps maps dev-os to a tenant id (FAC-296 park point): the deploy refuses.
+    // dev-os is one customer's instance (FAC-297): Brightwire Electrical's tenant, the id InferOps'
+    // config/development.js auth.sso.inferosCompanies maps https://dev-os.factorylevel.dev to.
     inferops: {
       authOrigin: "https://auth.dev.inferlab.io",
-      company: "internal",
+      company: "9b7d4aaf-ba34-4f12-b281-9cbc8356b77e",
       authorizeOrigin: "https://auth.dev-os.factorylevel.dev",
     },
     gatekeepers: STAGE_GATEKEEPERS,
