@@ -40,9 +40,9 @@ import { mapConcurrent } from "../map-concurrent.ts";
 import { readDeployablePackages, type DeployablePackage } from "../release/manifest-lib.ts";
 import { PACKAGES_DIR, ROOT, type StagingConfig } from "../preview/staging-config.ts";
 import {
-  buildStageConfigs, destructiveMigrations, formatStagePlan, stageBackendSecrets, stageConfigDigest,
-  stageConfigFileName, stageGatekeeperSecrets, stageHostnames, stageKvNamespaces, stagePackages, stageTiers,
-  stageWorkerHost,
+  buildStageConfigs, describeStep, destructiveMigrations, formatStagePlan, stageBackendSecrets,
+  stageConfigDigest, stageConfigFileName, stageGatekeeperSecrets, stageHostnames, stageKvNamespaces,
+  stagePackages, stageTiers, stageWorkerHost, type StageDestructiveMigrations,
 } from "./stage-config.ts";
 import {
   deployTargetProblem, parseDeployTargets, parseKvNamespaceList, retryWhileDnsPending,
@@ -101,7 +101,8 @@ function wranglerEntry(): string {
   return entry;
 }
 
-interface WranglerResult {
+/** What one Wrangler run returned. */
+export interface WranglerResult {
   status: number | null;
   stdout: string;
   stderr: string;
@@ -173,6 +174,22 @@ export interface Prepared {
   secrets: Record<string, string>;
   /** Each InferLab gatekeeper's secrets (the edge secret), by package. */
   gatekeeperSecrets: Record<string, Record<string, string>>;
+  /** The destructive Durable Object migrations the stage would deploy (stage-config.ts). */
+  destructive: StageDestructiveMigrations;
+  /** `--allow-destructive-migrations`: deploy the refused ones too. */
+  allowDestructiveMigrations: boolean;
+}
+
+/**
+ * Why the destructive migrations stop this run, or nothing. The lineage deletion a stage declares
+ * by name (do-lineage.ts) never does; any other delete, rename or transfer does unless
+ * `--allow-destructive-migrations`.
+ */
+export function destructiveMigrationBlockers(prepared: Pick<Prepared, "destructive" | "allowDestructiveMigrations">): string[] {
+  const { refused } = prepared.destructive;
+  if (refused.length === 0 || prepared.allowDestructiveMigrations) return [];
+  return ["Durable Object migrations that destroy or move state, which wrangler rollback never undoes: " +
+    `${refused.map(describeStep).join("; ")}. Pass --allow-destructive-migrations to deploy them.`];
 }
 
 /**
@@ -187,15 +204,19 @@ export function prepare(args: Pick<StageArgs, "stage" | "allowDestructiveMigrati
   const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
   if (!accountId) throw new Error("CLOUDFLARE_ACCOUNT_ID must be set to the account the stage deploys to");
   const deployed = stagePackages(stage, packages);
-  const destructive = destructiveMigrations(deployed);
-  if (destructive.length > 0 && !args.allowDestructiveMigrations) {
-    throw new Error("Durable Object migrations that destroy or move state, which wrangler rollback " +
-        `never undoes:\n  - ${destructive.join("\n  - ")}\nPass --allow-destructive-migrations to deploy them.`);
-  }
   return {
     stageName, stage, accountId, packages: deployed, secrets: stageBackendSecrets(),
     gatekeeperSecrets: stageGatekeeperSecrets({ stageName }),
+    // Also checks a declared lineage against the backend's own history, so a mismatch stops even a
+    // dry run.
+    destructive: destructiveMigrations(stageName, stage, deployed),
+    allowDestructiveMigrations: args.allowDestructiveMigrations,
   };
+}
+
+/** Everything that stops a deploy of this stage: the stage's own blockers and its migrations'. */
+export function deployBlockers(prepared: Prepared): string[] {
+  return [...stageDeployBlockers(prepared.stage), ...destructiveMigrationBlockers(prepared)];
 }
 
 /** The dry-run plan: built with placeholder KV ids, so it needs no network. */
@@ -205,7 +226,8 @@ export function dryRunPlan(prepared: Prepared): string {
   const placeholderIds = new Map(kv.map((ns) => [ns.title, "<resolved at deploy>"]));
   const configs = buildStageConfigs({ stage, packages, accountId, kvIds: placeholderIds });
   return `dry-run plan (no network):\n${formatStagePlan({
-    stageName, stage, configs, secretNames: Object.keys(secrets), kv, blockers: stageDeployBlockers(stage),
+    stageName, stage, configs, secretNames: Object.keys(secrets), kv, blockers: deployBlockers(prepared),
+    declared: prepared.destructive.declared,
     gatekeeperSecretNames: Object.fromEntries(Object.entries(prepared.gatekeeperSecrets)
       .map(([pkg, values]) => [pkg, Object.keys(values)])),
   })}`;
@@ -231,15 +253,63 @@ async function deployWorker(
     writeFileSync(secretsFile, JSON.stringify(secrets), { mode: 0o600 });
     args.push("--secrets-file", secretsFile);
   }
-  console.log(`deploying ${config.name}`);
-  const result = await runWrangler(pkg.dir, args, { WRANGLER_OUTPUT_FILE_PATH: outputFile });
-  if (result.stdout) process.stdout.write(`[${config.name}]\n${result.stdout}`);
-  if (result.stderr) process.stderr.write(`[${config.name}]\n${result.stderr}`);
-  if (result.status !== 0) throw new Error(`wrangler deploy failed for ${config.name} with exit code ${result.status}`);
+  await deployRetryingFirstDeploy(config.name as string, async () => {
+    console.log(`deploying ${config.name}`);
+    rmSync(outputFile, { force: true });
+    const result = await runWrangler(pkg.dir, args, { WRANGLER_OUTPUT_FILE_PATH: outputFile });
+    if (result.stdout) process.stdout.write(`[${config.name}]\n${result.stdout}`);
+    if (result.stderr) process.stderr.write(`[${config.name}]\n${result.stderr}`);
+    return result;
+  });
   const targets = parseDeployTargets(existsSync(outputFile) ? readFileSync(outputFile, "utf8") : "");
   if (targets === null) throw new Error(`wrangler reported no deployment for ${config.name}`);
   const problem = deployTargetProblem(config.name as string, targets, stageWorkerHost(prepared.stage, pkg.name));
   if (problem) throw new Error(problem);
+}
+
+/** How many times a worker's first deploy is tried when it races its own creation, and the waits between. */
+export const FIRST_DEPLOY_ATTEMPTS = 3;
+const FIRST_DEPLOY_WAITS_MS = [5_000, 15_000];
+
+/**
+ * Whether a failed `wrangler deploy` is the first-deploy race: the upload created the worker, and
+ * the next call (the version's secrets, with `--secrets-file`) was answered 10007, "This Worker does
+ * not exist on your account". Seen on dev-os on 2026-11-23 for the two gatekeepers that run created;
+ * a plain retry deployed both. A worker that existed before the run is never answered 10007, and an
+ * output without "Uploaded" didn't create anything, so neither is retried.
+ */
+export function isFirstDeployRace(result: Pick<WranglerResult, "status" | "stdout" | "stderr">): boolean {
+  if (result.status === 0) return false;
+  const output = `${result.stdout}\n${result.stderr}`;
+  return /^\s*Uploaded\s/m.test(output) &&
+    /This Worker does not exist on your account|code"?:\s*10007\b|\[code: 10007\]/i.test(output);
+}
+
+/**
+ * Run one worker's deploy, retrying it (bounded, {@link FIRST_DEPLOY_ATTEMPTS}) only when it fails
+ * with the first-deploy race. Any other failure, or the race on the last attempt, throws. A retry
+ * uploads a new version with the same config and secrets: the worker exists by then.
+ */
+export async function deployRetryingFirstDeploy(
+  workerName: string,
+  attempt: () => Promise<WranglerResult>,
+  sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
+): Promise<WranglerResult> {
+  for (let n = 1; ; n++) {
+    const result = await attempt();
+    if (result.status === 0) return result;
+    if (!isFirstDeployRace(result)) {
+      throw new Error(`wrangler deploy failed for ${workerName} with exit code ${result.status}`);
+    }
+    if (n >= FIRST_DEPLOY_ATTEMPTS) {
+      throw new Error(`wrangler deploy failed for ${workerName}: still "This Worker does not exist" (10007) ` +
+          `after ${n} attempts; the worker was uploaded, so check it in the dashboard and re-run the deploy`);
+    }
+    const wait = FIRST_DEPLOY_WAITS_MS[n - 1] ?? FIRST_DEPLOY_WAITS_MS.at(-1) ?? 0;
+    console.log(`${workerName} was just created and isn't visible yet (10007); retrying in ${wait / 1000}s ` +
+        `(attempt ${n + 1} of ${FIRST_DEPLOY_ATTEMPTS})`);
+    await sleep(wait);
+  }
 }
 
 /** Whether a response is Cloudflare Access's redirect to its login. */
@@ -290,9 +360,12 @@ async function deploy(args: StageArgs): Promise<void> {
     return;
   }
   const { stageName, stage, accountId, packages } = prepared;
-  const blockers = stageDeployBlockers(stage);
+  const blockers = deployBlockers(prepared);
   if (blockers.length > 0) {
     throw new Error(`stage "${stageName}" can't be deployed yet:\n  - ${blockers.join("\n  - ")}`);
+  }
+  for (const step of prepared.destructive.declared) {
+    console.log(`this deploy applies the declared lineage deletion (do-lineage.ts): ${describeStep(step)}`);
   }
   const tree = workingTreeState();
   if (tree.dirty && (stage.requireCleanTree || !args.allowDirty)) {
@@ -340,6 +413,8 @@ async function configure(args: StageArgs): Promise<void> {
     return;
   }
   const { stage, accountId, packages } = prepared;
+  const refused = destructiveMigrationBlockers(prepared);
+  if (refused.length > 0) throw new Error(refused.join("\n"));
   const kv = stageKvNamespaces(stage, packages);
   const whoami = await runWrangler(ROOT, ["whoami"]);
   if (whoami.status !== 0) throw new Error(`wrangler whoami failed; run pnpm exec wrangler login:\n${whoami.stderr}`);

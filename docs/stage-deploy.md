@@ -21,7 +21,7 @@ Only two workers are reachable. The router has the stage's hostname. On `dev`, `
 
 The bindings, each gatekeeper's `BASE_URL` and the Context gatekeeper's `sharingDomain` are built by the same functions a per-PR preview uses (`scripts/preview/staging-config.ts`). A stage needs no preview ids: a service binding names a worker, and each tier only has to exist before the next binds it.
 
-KV namespaces (`inferos-<stage>-<package>-<binding>`) are created when missing. The R2 bucket (`inferos-<stage>-<binding>`) and every Durable Object are kept across deploys.
+KV namespaces (`inferos-<stage>-<package>-<binding>`) are created when missing. The R2 bucket (`inferos-<stage>-<binding>`) and every Durable Object are kept across deploys, except the two classes the backend's lineage deletes once (see [The backend's Durable Object lineage](#the-backends-durable-object-lineage)).
 
 ## Before the first deploy
 
@@ -56,7 +56,8 @@ KV namespaces (`inferos-<stage>-<package>-<binding>`) are created when missing. 
    - It builds the workspace (the frontend in non-Access mode), creates any missing KV namespace and writes `wrangler.stage-dev.jsonc` beside each package (gitignored).
    - It deploys the three tiers, then checks the Access redirect on the stage hostname.
    - `dev` refuses a dirty tree unless `--allow-dirty`; `prod` always refuses one.
-   - It refuses Durable Object migrations that delete, rename or move a class unless `--allow-destructive-migrations`, because `wrangler rollback` never undoes them.
+   - It refuses Durable Object migrations that delete, rename or move a class unless `--allow-destructive-migrations`, because `wrangler rollback` never undoes them. The one exception is the deletion a stage declares in its backend's lineage, allowed by name on `dev` only (below).
+   - A worker deployed for the first time can fail right after "Uploaded" with 10007 "This Worker does not exist on your account" (below). That worker is retried, at most three attempts in all.
    - It prints a JSON deploy record: the InferOS commit and the config digest.
 3. **Run the smoke by hand.** The deploy's last lines print it:
    1. Open the stage and pass Access.
@@ -69,9 +70,64 @@ KV namespaces (`inferos-<stage>-<package>-<binding>`) are created when missing. 
 
 `pnpm stage:config <stage>` checks the Wrangler login reaches the account and lists which KV namespaces exist. When all exist, it writes the configs without deploying.
 
+## The backend's Durable Object lineage
+
+Cloudflare keeps a worker's Durable Objects across deploys, and records the last migration tag it applied. Each deploy must include that tag in its history, and every class the worker has must be exported or explicitly deleted.
+
+Both stages' backends were last deployed from the archived `main`, whose history diverges from this line's at v4:
+
+| Tag | Both lines | Archived `main` only | This line only |
+| --- | --- | --- | --- |
+| v0 | `UserDurableObject`, `OverseerDurableObject` | | |
+| v1 | `AdminSettings` | | |
+| v2 | `PendingLogin` | | |
+| v3 | `UserDirectoryDurableObject` | | |
+| v4 | | `SubjectPresenceDurableObject` | `AdminAuditDurableObject` |
+| v5 | | `AuthoredWidgetBuildDurableObject` | |
+
+Deploying this line's history onto dev-os failed on 2026-11-23. The published tag "v5" wasn't in it, so Wrangler tried to create `UserDurableObject` again (error 10074). Calvin decided to migrate in place, keeping the worker and its data.
+
+**The rule:**
+
+- **A stage names the lineage its deployed backend has** (`backendLineage` in `scripts/stage/stages.ts`; the history is in `scripts/stage/do-lineage.ts`). Its generated `wrangler.stage-<stage>.jsonc` carries that lineage's applied migrations, then one continuation:
+  - v0 to v5, exactly as the archived line declared them. They are already applied on the stage, and are listed so the tags line up.
+  - **v6:** `new_sqlite_classes` `AdminAuditDurableObject` (what this line's v4 adds), and `deleted_classes` `SubjectPresenceDurableObject` and `AuthoredWidgetBuildDurableObject`.
+- **`packages/workshop-backend/wrangler.jsonc` is unchanged.** Previews and every fresh deployment keep this line's own history.
+- **The lineage is checked against this line's history on every run, dry runs included:**
+  - the two lines share v0 to v3, migration for migration;
+  - after that, both only add classes;
+  - v6 adds exactly this line's classes and deletes exactly the archived line's, and nothing else.
+
+  So a new migration on this line stops the stage's deploy until the lineage declares its next step.
+- **A stage with a lineage nobody has verified plans, but its deploy is refused.** "Verified" means someone read the deployed backend's published migration tag; `backendLineage.verified` says how.
+  - `dev` is verified: on 2026-11-23 the manager's deploy reported the published tag "v5".
+  - `prod` is not.
+
+**The deletion.** v6 destroys the storage of the two deleted classes, and no rollback brings it back. This line neither exports nor binds either class:
+
+- `SubjectPresenceDurableObject`: who was looking at an Operate subject.
+- `AuthoredWidgetBuildDurableObject`: an authored widget's isolated build.
+
+The class names are pinned in `do-lineage.ts` (`ARCHIVED_MAIN_DELETED_CLASSES`) and in its test. The deletion is allowed without `--allow-destructive-migrations` on the stages named in `LINEAGE_DELETION_STAGES`, which is `dev` only.
+
+Every other delete, rename or transfer is still refused. That includes:
+- a different set of classes;
+- another package;
+- the same lineage on another stage.
+
+The dry run's "Durable Object migrations" section shows the plan, and the deploy prints the declared deletion before it starts.
+
+**prod** names the same lineage, but its deploy stays refused. The lineage is unverified, its company is `internal`, and it isn't allowed the deletion. The continuation would also work if prod's published tag is any earlier archived tag, since Wrangler applies only the migrations after the published one. A tag outside the lineage would not work. Read prod's tag before making it deployable.
+
+## A worker's first deploy
+
+With `--secrets-file`, a worker's first deploy can race its own creation. The upload creates the worker ("Uploaded …"), then the call that sets the version's secrets is answered 10007, "This Worker does not exist on your account". On 2026-11-23 this hit the two gatekeepers dev-os had never had, and a plain retry deployed both.
+
+The deploy now retries that worker, waiting 5 s and then 15 s, with at most three attempts. It retries only when the output shows the upload happened and then a 10007: a worker that already existed is never answered 10007. Any other failure is not retried. Each retry uploads a new version with the same config and secrets.
+
 ## Rollback
 
-`pnpm exec wrangler rollback --name inferos-<stage>-<package>` returns one worker to an earlier version. Roll the router, backend and gatekeepers back as one compatible set, then check the Access redirect. A rollback never undoes a Durable Object migration.
+`pnpm exec wrangler rollback --name inferos-<stage>-<package>` returns one worker to an earlier version. Roll the router, backend and gatekeepers back as one compatible set, then check the Access redirect. A rollback never undoes a Durable Object migration. After the backend's v6 (above), rolling it back to a version from the archived line is untested: that version exports the two classes v6 deleted.
 
 ## Signing in through dev InferLab's edge
 
