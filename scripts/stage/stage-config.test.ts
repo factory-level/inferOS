@@ -7,7 +7,7 @@ import { test } from "node:test";
 import { isGatekeeperPackage, readDeployablePackages } from "../release/manifest-lib.ts";
 import { PACKAGES_DIR } from "../preview/staging-config.ts";
 import {
-  buildStageConfigs, destructiveMigrations, formatStagePlan, resolveStageAdmins, stageBackendSecrets,
+  buildStageConfigs, describeStep, destructiveMigrations, formatStagePlan, resolveStageAdmins, stageBackendSecrets,
   stageBucketName, stageGatekeeperSecrets, stageHostnames, stageKvNamespaces, stageKvTitle, stagePackages,
   stageTiers, stageWorkerName,
 } from "./stage-config.ts";
@@ -50,6 +50,8 @@ function prepared(stage: StageDefinition): Prepared {
     stageName: "dev", stage, accountId: ACCOUNT, packages: stagePackages(stage, packages),
     secrets: stageBackendSecrets({ ...SECRET, adminConfigSeed: SEED }),
     gatekeeperSecrets: stageGatekeeperSecrets({ stageName: "dev", edgeSecret: EDGE, bareEdgeSecret: undefined }),
+    destructive: destructiveMigrations("dev", stage, stagePackages(stage, packages)),
+    allowDestructiveMigrations: false,
   };
 }
 
@@ -200,7 +202,8 @@ test("dev-os belongs to Brightwire Electrical, so its deploy isn't refused; prod
   assert.doesNotMatch(plan, /REFUSED/);
   assert.ok(!plan.includes(STAGES.dev.inferops.company), "the plan printed the tenant id");
   assert.equal(STAGES.prod.inferops.company, "internal");
-  assert.equal(stageDeployBlockers(STAGES.prod).length, 1);
+  // internal, and (FAC-296 part 3) its backend lineage is unverified.
+  assert.equal(stageDeployBlockers(STAGES.prod).length, 2);
 });
 
 test("stage definitions are checked before anything is generated", () => {
@@ -226,10 +229,13 @@ test("the stage's gatekeepers are deployable packages here, and the rest are lef
 });
 
 test("destructive Durable Object migrations are named", () => {
-  assert.deepEqual(destructiveMigrations(stagePackages(dev, packages)), []);
-  assert.deepEqual(destructiveMigrations([{ name: "x", config: {
+  // dev's only one is its declared lineage deletion (FAC-296 part 3, do-lineage.test.ts).
+  assert.deepEqual(destructiveMigrations("dev", dev, stagePackages(dev, packages)).refused, []);
+  const found = destructiveMigrations("dev", dev, [{ name: "x", config: {
     name: "x", migrations: [{ tag: "v9", deleted_classes: ["Old"] }],
-  } as never }]), ["x migration v9: deleted_classes"]);
+  } as never }]);
+  assert.deepEqual(found.declared, []);
+  assert.deepEqual(found.refused.map(describeStep), ["x migration v9: deleted_classes Old"]);
 });
 
 test("arguments: config and deploy, a named stage, and only the known flags", () => {

@@ -16,12 +16,15 @@
 import { createHash } from "node:crypto";
 import {
   gatekeeperShortName, isGatekeeperPackage,
-  type DeployablePackage, type ObservabilityConfig,
+  type DeployablePackage, type DurableObjectMigration, type ObservabilityConfig,
 } from "../release/manifest-lib.ts";
 import {
   R2_MAX_BUCKET_NAME_LENGTH, backendGatekeeperServices, resolveAdminConfigSeed, resolveAiGateway,
   routerGatekeeperServices, type StagingConfig,
 } from "../preview/staging-config.ts";
+import {
+  continueLineage, destructiveSteps, isDeclaredDeletion, type DestructiveStep,
+} from "./do-lineage.ts";
 import {
   INFERLAB_GATEKEEPER, INFERLAB_LOGIN_VENDOR, INFERLABOPS_GATEKEEPER, type StageDefinition,
 } from "./stages.ts";
@@ -82,20 +85,43 @@ export function stageKvNamespaces(stage: StageDefinition, packages: readonly Pac
 }
 
 /**
- * Durable Object migrations that delete, rename or move a class: `wrangler rollback` never undoes
- * them, so the deploy refuses them unless asked.
+ * The Durable Object history a package is deployed with in a stage: its own, except the backend of
+ * a stage that names a deployed lineage, which continues that lineage (do-lineage.ts). Throws when
+ * the lineage no longer matches the package's own history.
  */
-export function destructiveMigrations(packages: readonly PackageConfig[]): string[] {
-  const found: string[] = [];
+export function stageMigrations(stage: StageDefinition, pkg: PackageConfig): DurableObjectMigration[] {
+  const own = pkg.config.migrations ?? [];
+  return pkg.name === "workshop-backend" && stage.backendLineage
+    ? continueLineage(own, stage.backendLineage.lineage) : structuredClone(own);
+}
+
+/** A stage's destructive Durable Object migrations, split into the declared one and the rest. */
+export interface StageDestructiveMigrations {
+  /** The lineage's declared deletion, on a stage allowed to apply it (do-lineage.ts). */
+  declared: DestructiveStep[];
+  /** Every other delete, rename or transfer: refused unless `--allow-destructive-migrations`. */
+  refused: DestructiveStep[];
+}
+
+/** One destructive step, as the plan and the refusal print it. */
+export function describeStep(step: DestructiveStep): string {
+  return `${step.pkgName} migration ${step.tag}: ${step.operation} ${step.classes.join(", ")}`;
+}
+
+/**
+ * Durable Object migrations that delete, rename or move a class, in the histories the stage would
+ * deploy: `wrangler rollback` never undoes them. Only the declared lineage deletion of a stage
+ * allowed it by name is `declared`; anything else is `refused`.
+ */
+export function destructiveMigrations(stageName: string, stage: StageDefinition,
+    packages: readonly PackageConfig[]): StageDestructiveMigrations {
+  const result: StageDestructiveMigrations = { declared: [], refused: [] };
   for (const pkg of packages) {
-    for (const migration of pkg.config.migrations ?? []) {
-      for (const key of ["deleted_classes", "renamed_classes", "transferred_classes"] as const) {
-        const value = (migration as Record<string, unknown>)[key];
-        if (Array.isArray(value) && value.length > 0) found.push(`${pkg.name} migration ${migration.tag}: ${key}`);
-      }
+    for (const step of destructiveSteps(pkg.name, stageMigrations(stage, pkg))) {
+      (isDeclaredDeletion(stageName, stage.backendLineage?.lineage, step) ? result.declared : result.refused).push(step);
     }
   }
-  return found;
+  return result;
 }
 
 // Persistent instances keep the committed observability settings, except that invocation logs are
@@ -200,6 +226,7 @@ export function buildStageConfigs({
     });
     delete config.routes;
     delete config.previews;
+    if (config.migrations) config.migrations = stageMigrations(stage, pkg);
 
     if (config.kv_namespaces) {
       config.kv_namespaces = config.kv_namespaces.map(({ binding }) => {
@@ -342,9 +369,36 @@ export function stageTiers(configs: ReadonlyMap<string, StagingConfig>): StageTi
   ];
 }
 
+/**
+ * Each worker's Durable Object migrations, as the plan prints them: the tags, and for a backend that
+ * continues a deployed lineage, which tags are already applied and what the continuation does.
+ */
+export function formatMigrationPlan(stage: StageDefinition, configs: ReadonlyMap<string, StagingConfig>,
+    declared: readonly DestructiveStep[] = []): string[] {
+  const lines = ["  Durable Object migrations:"];
+  for (const [pkgName, config] of [...configs].toSorted(([a], [b]) => a.localeCompare(b))) {
+    const migrations = config.migrations ?? [];
+    if (migrations.length === 0) continue;
+    const lineage = pkgName === "workshop-backend" ? stage.backendLineage : undefined;
+    if (!lineage) {
+      lines.push(`    ${config.name}: ${migrations.map((m) => m.tag).join(", ")} (this line's own history)`);
+      continue;
+    }
+    const { applied, continuation } = lineage.lineage;
+    const added = (continuation.new_sqlite_classes ?? []).join(", ");
+    const deleted = ((continuation.deleted_classes as string[] | undefined) ?? []).join(", ");
+    lines.push(`    ${config.name}: ${migrations.map((m) => m.tag).join(", ")}, continuing the ` +
+        `${lineage.lineage.name} lineage (${lineage.verified ? "verified" : "UNVERIFIED"})`,
+      `      already applied there: ${applied.map((m) => `${m.tag} ${(m.new_sqlite_classes ?? []).join(" + ")}`).join("; ")}`,
+      `      ${continuation.tag} adds ${added || "nothing"}` + (deleted ? `; DELETES ${deleted} and their storage` +
+        (declared.some((step) => step.tag === continuation.tag) ? " (declared for this stage)" : "") : ""));
+  }
+  return lines;
+}
+
 /** The plan a dry run prints: names only, never a secret value or a company's tenant id. */
 export function formatStagePlan({
-  stageName, stage, configs, secretNames, gatekeeperSecretNames = {}, kv, blockers = [],
+  stageName, stage, configs, secretNames, gatekeeperSecretNames = {}, kv, blockers = [], declared = [],
 }: {
   stageName: string;
   stage: StageDefinition;
@@ -353,6 +407,8 @@ export function formatStagePlan({
   gatekeeperSecretNames?: Readonly<Record<string, readonly string[]>>;
   kv: readonly StageKvNamespace[];
   blockers?: readonly string[];
+  /** The declared lineage deletion this stage may apply (see {@link destructiveMigrations}). */
+  declared?: readonly DestructiveStep[];
 }): string {
   // The company is named only when it's `internal`: a company's tenant id goes to
   // `INFEROPS_COMPANY` alone, never into a plan meant to be pasted into a PR or a log.
@@ -379,6 +435,7 @@ export function formatStagePlan({
   const buckets = [...new Set([...configs.values()].flatMap((config) =>
     (config.r2_buckets ?? []).map((bucket) => (bucket as { bucket_name?: string }).bucket_name)))];
   lines.push("  R2 buckets:", ...buckets.map((name) => `    ${name}`));
+  lines.push(...formatMigrationPlan(stage, configs, declared));
   if (blockers.length > 0) {
     lines.push("  REFUSED: the deploy would stop here:", ...blockers.map((b) => `    - ${b}`));
   }

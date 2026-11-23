@@ -13,6 +13,11 @@
 //   gatekeepers. The archived optional resource switches have no reader here and aren't declared.
 // - The spend guard (`agents`) is the clean line's daily limit, not the archived
 //   `MODEL_ALLOWLIST`/`DAILY_AGENT_TURN_LIMIT`, which nothing here reads: see {@link StageDefinition}.
+// - Both stages' backends were last deployed from the archived line, whose Durable Object history
+//   diverges from this line's at v4, so each names that lineage (`backendLineage`, FAC-296 part 3,
+//   do-lineage.ts) and its generated config continues it instead of starting this line's history.
+
+import { ARCHIVED_MAIN_BACKEND_LINEAGE, type DeployedLineage } from "./do-lineage.ts";
 
 /** How people sign in to a stage. */
 export type StageAuthMode =
@@ -77,6 +82,20 @@ export interface StageDefinition {
   gatekeepers: readonly string[];
   /** Refuse to deploy from a dirty or detached working tree. */
   requireCleanTree: boolean;
+  /**
+   * The Durable Object history the stage's deployed backend already has, when it came from another
+   * line (do-lineage.ts). The generated backend config carries that history and its continuation
+   * instead of this line's own; packages/workshop-backend/wrangler.jsonc is untouched. Absent for a
+   * stage whose backend has only ever been deployed from this line.
+   */
+  backendLineage?: {
+    lineage: DeployedLineage;
+    /**
+     * How we know the deployed backend's last applied tag is in `lineage.applied`, or null when
+     * nobody has checked. A stage with an unverified lineage plans but doesn't deploy.
+     */
+    verified: string | null;
+  };
 }
 
 /** The gatekeeper that signs people in with InferLab, and its vendor id. */
@@ -113,6 +132,11 @@ export const STAGES = {
     gatekeepers: STAGE_GATEKEEPERS,
     requireCleanTree: false,
     agents: { dailyTurnLimit: 40 },
+    backendLineage: {
+      lineage: ARCHIVED_MAIN_BACKEND_LINEAGE,
+      verified: "2026-11-23 ~11:15Z, the manager's deploy from d4a4d00e0: wrangler deploy of " +
+        'inferos-dev-workshop-backend reported the published migration tag "v5"',
+    },
   },
   prod: {
     hostname: "os.factorylevel.dev",
@@ -122,6 +146,11 @@ export const STAGES = {
     inferops: { authOrigin: "https://auth.inferlab.io", company: "internal" },
     gatekeepers: STAGE_GATEKEEPERS,
     requireCleanTree: true,
+    // Assumed from the archived stage deploy, not checked: nobody has read inferos-prod-workshop-
+    // backend's published tag. Any archived tag up to v5 would continue correctly, but until someone
+    // reads it the deploy is refused (stageDeployBlockers), and prod may not apply the deletion
+    // either (do-lineage.ts LINEAGE_DELETION_STAGES).
+    backendLineage: { lineage: ARCHIVED_MAIN_BACKEND_LINEAGE, verified: null },
   },
 } as const satisfies Record<string, StageDefinition>;
 
@@ -191,12 +220,18 @@ export function stageDefinitionProblems(stage: StageDefinition): string[] {
  * rehearsal says what the deploy would refuse.
  */
 export function stageDeployBlockers(stage: StageDefinition): string[] {
-  if (stage.inferops.company !== "internal") return [];
-  return [
-    'inferops.company is "internal", which gatekeeper-inferlab and gatekeeper-inferlabops refuse ' +
+  const blockers: string[] = [];
+  if (stage.inferops.company === "internal") {
+    blockers.push('inferops.company is "internal", which gatekeeper-inferlab and gatekeeper-inferlabops refuse ' +
       "(INFEROPS_COMPANY must be a tenant id there, or sign-in is off). Set it to the tenant id " +
-      "InferOps' auth.sso.inferosCompanies maps this origin to, once InferOps maps it to one.",
-  ];
+      "InferOps' auth.sso.inferosCompanies maps this origin to, once InferOps maps it to one.");
+  }
+  if (stage.backendLineage && stage.backendLineage.verified === null) {
+    blockers.push(`the backend's ${stage.backendLineage.lineage.name} Durable Object lineage is unverified: ` +
+      "nobody has read the deployed workshop-backend's published migration tag. Read it (the tag a " +
+      "deploy reports, or the worker's settings), then record how in backendLineage.verified.");
+  }
+  return blockers;
 }
 
 /** Resolve a stage by name, or say which exist. */
