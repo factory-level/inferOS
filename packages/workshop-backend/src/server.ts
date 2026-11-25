@@ -39,7 +39,6 @@ import { deploymentOutputForBlueprint, listFormatOffers, readAdminConfig } from 
 // Re-export the optional-feature Durable Objects + entrypoints so they can be bound in wrangler.
 export { PendingLogin, LoginConnectCallbackImpl };
 export { AuthoredWidgetBuildDurableObject } from "./authored-widget-build.js";
-export { ConsoleDurableObject } from "./console-object.js";
 import { GatekeeperUiFrame, type SharedConfigurationAction, type WidgetSearchAnswer } from "@gadgets/workshop-shared/gatekeeper";
 import { LanguageModelGatekeeper } from "./ai-models";
 import { ArtifactPublisherGatekeeper } from "./artifact-publisher";
