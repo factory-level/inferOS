@@ -351,8 +351,24 @@ export class InferOpsCredentials extends DurableObject<Cloudflare.Env> {
     const current = this.#coordinator.stored();
     const staged = discardStagedCredentials<InferOpsConnection>(this.ctx.storage.kv);
     const fetcher = inferLabFetch(this.env);
-    if (staged) await logoutInferLabSession(origin, staged.grant.refreshToken, fetcher);
-    if (current) await signOutInferLabEverywhere(origin, current.refreshToken, fetcher);
+    // The sign-out everywhere goes first, under its own short bound, so a slow logout of a staged
+    // reconnect can never use up the user DO's wait before it is even sent. The staged session (it
+    // may be another InferLab account's) is logged out after, whatever the sign-out answered; the
+    // sign-out's own failure is the one reported.
+    let failure: unknown;
+    try {
+      if (current) await signOutInferLabEverywhere(origin, current.refreshToken, fetcher);
+    } catch (err) {
+      failure = err;
+    }
+    if (staged) {
+      try {
+        await logoutInferLabSession(origin, staged.grant.refreshToken, fetcher);
+      } catch (err) {
+        failure ??= err;
+      }
+    }
+    if (failure !== undefined) throw failure;
   }
 
   /** Signs the session out at InferLab and forgets everything held for this account. */
