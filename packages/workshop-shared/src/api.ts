@@ -113,10 +113,16 @@ export interface PublicApi extends RpcTarget {
    * Workshop's own /connect/handoff page, which calls `confirmLogin(ticket, nonce)`. The vendor must
    * be auth-capable and allowlisted (see ServerConfig.authVendors); throws otherwise.
    *
+   * `options.chooseAccount` is passed on to a vendor that offers an account chooser
+   * (`AuthVendorInfo.chooseAccountLabel`): `true` asks the provider for its chooser, `false` asks it
+   * to reuse a sign-in the browser already holds without showing a page (see
+   * `GatekeeperConnectOptions.chooseAccount`). Other vendors ignore it.
+   *
    * Dispose `attempt` to abandon the sign-in (e.g. the user closed the popup). Nothing is cancelled
    * server-side: the browser just stops polling, and an unreceived token expires on its own.
    */
-  startGatekeeperLogin(vendorId: string): Promise<{ url: string; nonce: string; attempt: RpcStub<LoginAttempt> }>;
+  startGatekeeperLogin(vendorId: string, options?: { chooseAccount?: boolean })
+      : Promise<{ url: string; nonce: string; attempt: RpcStub<LoginAttempt> }>;
 
   /**
    * Confirm a finished sign-in flow. Called by the /connect/handoff page in the sign-in popup, which
@@ -129,7 +135,12 @@ export interface PublicApi extends RpcTarget {
    */
   confirmLogin(ticket: string, nonce: string): Promise<void>;
 
-  /** Authenticates the user using an auth token (typically stored in localStorage). */
+  /**
+   * Authenticates the user using an auth token (typically stored in localStorage). Refuses, with
+   * `AUTH_ERROR_CODES.invalidSessionToken`, a token whose session has ended: signed out
+   * (`AuthenticatedApi.signOut`), past its expiry, or backed by a provider sign-in that has ended
+   * (`VendorDescription.signInConnects`), which is checked at most every few minutes.
+   */
   authenticate(token: string): Promise<AuthenticatedApi>;
 
   /**
@@ -446,6 +457,32 @@ export const createAuthError = authErrors.create;
 
 /** Reads the machine-readable code from an authentication failure. */
 export const getAuthErrorCode = authErrors.getCode;
+
+/** Stable error codes attached to a sign-out that ended the session but not all it should have. */
+export const SIGN_OUT_ERROR_CODES = {
+  /** The provider sign-in backing the session could not be ended everywhere (`signOut`). */
+  providerSignOutFailed: "PROVIDER_SIGN_OUT_FAILED",
+} as const;
+
+/** An expected sign-out failure code. */
+export type SignOutErrorCode = typeof SIGN_OUT_ERROR_CODES[keyof typeof SIGN_OUT_ERROR_CODES];
+
+/**
+ * Messages for sign-out failures, as the codes are created with. The text is load-bearing: native
+ * RPC from a Durable Object keeps an error's message but not its code, so the Workshop matches the
+ * message to restore the code before the client sees it. Change it only with that match.
+ */
+export const SIGN_OUT_ERROR_MESSAGES: Record<SignOutErrorCode, string> = {
+  [SIGN_OUT_ERROR_CODES.providerSignOutFailed]: "The sign-in provider could not end the sign-in everywhere.",
+};
+
+const signOutErrors = codedErrorFamily(SIGN_OUT_ERROR_MESSAGES);
+
+/** Creates a sign-out failure with a machine-readable code. */
+export const createSignOutError = signOutErrors.create;
+
+/** Reads the machine-readable code from a sign-out failure. */
+export const getSignOutErrorCode = signOutErrors.getCode;
 
 /** One new, non-resumable read chat, optionally preceded by sequence-checked board navigation. */
 export type OperateReadRun = {
@@ -931,6 +968,17 @@ export interface AuthenticatedApi extends RpcTarget {
    * `Overseer.addCollaborator()` still works then.
    */
   searchUsers(query: string, excludeIds: string[]): Promise<UserDirectoryRecord[]>;
+
+  /**
+   * Signs out: ends the session this API was authenticated with, so its token is refused from now
+   * on. When a provider sign-in backs the session (`VendorDescription.signInConnects`), that sign-in
+   * is ended too, everywhere it is live, and with it every session of this account it backs. When the
+   * provider could not end it, the session is ended anyway and this rejects with
+   * `SIGN_OUT_ERROR_CODES.providerSignOutFailed`. Once this has settled, the connection it was
+   * called on is closed shortly afterwards, so nothing authenticated with the session goes on
+   * working on it. A Cloudflare Access session has no token, and nothing here ends it. Idempotent.
+   */
+  signOut(): Promise<void>;
 
   /**
    * Change the user's password, if using password-based authentication.
@@ -1862,6 +1910,13 @@ export type AuthVendorInfo = {
   displayName: string;
   logo?: AvatarImage;
   color?: string;
+  /** The button's whole text when the vendor names one (VendorDescription.signInLabel). */
+  signInLabel?: string;
+  /**
+   * The text of a second button that asks the provider for its account chooser, when the vendor
+   * offers one (VendorDescription.chooseAccountLabel); see `startGatekeeperLogin`'s `chooseAccount`.
+   */
+  chooseAccountLabel?: string;
 };
 
 /**

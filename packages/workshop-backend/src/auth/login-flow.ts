@@ -33,6 +33,10 @@
 // keeps this callback for that account's lifetime. The PendingLogin DO therefore also records which
 // user and account the sign-in produced (`link`), outliving the login result, so expiry notices and
 // reconnects for the account reach its user DO.
+//
+// A vendor that declares `signInConnects` (InferOps, FAC-300) links its account the same way, and the
+// session the sign-in mints is backed by that account's provider sign-in: the user DO checks it on
+// authenticate and ends it on sign-out (UserDurableObject.authenticate / signOut).
 
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import { ConnectHandoff, GatekeeperConnectCallback, GatekeeperUser } from "@gadgets/workshop-shared/gatekeeper";
@@ -179,7 +183,11 @@ export class PendingLogin extends DurableObject<Cloudflare.Env> {
  * `subject`: the vendor declares `providesSubject`, so the account is keyed on the subject its
  * sign-in yields (ADR 0019), not on the email.
  */
-type LoginCallbackProps = { pendingId: string; vendorId: string; subject?: boolean };
+type LoginCallbackProps = {
+  pendingId: string; vendorId: string; subject?: boolean;
+  /** The vendor declares `signInConnects`: the account is kept, and its sign-in backs the session. */
+  connects?: boolean;
+};
 
 export class LoginConnectCallbackImpl
     extends WorkerEntrypoint<Cloudflare.Env, LoginCallbackProps>
@@ -212,7 +220,7 @@ export class LoginConnectCallbackImpl
     // The email's local-part seeds the initial display name, like the Cloudflare Access flow.
     try {
       if (this.ctx.props.subject) {
-        await this.#deliverBySubject(account, pending, ticketHash, loginLogger);
+        await this.#deliverBySubject(account, expiresAt, pending, ticketHash, loginLogger);
         return;
       }
       const email = await account.getAuthenticatedEmail();
@@ -278,38 +286,68 @@ export class LoginConnectCallbackImpl
    * A sign-in keyed on the subject the vendor yields (ADR 0019): the account the directory resolves
    * for it (`resolveSubjectAccount`), signed in through it. An email the provider vouches for may bind
    * an email-keyed account once, and is recorded as the account's current address; without one the
-   * sign-in still proceeds, and the address is not used.
+   * sign-in still proceeds, and the address is not used. A vendor whose sign-in connects has its
+   * account linked, and that account backs the session.
    */
-  async #deliverBySubject(account: Fetcher<GatekeeperUser>, pending: DurableObjectStub<PendingLogin>,
-                          ticketHash: string, loginLogger: ReturnType<typeof logger.with>): Promise<void> {
-    const found = await (account as unknown as Required<Pick<GatekeeperUser, "getAuthenticatedSubject">>).getAuthenticatedSubject();
-    if (!found) {
-      loginLogger.info("gatekeeper login finished", { event: "gatekeeper.login.finished", outcome: "no_subject" });
-      await pending.fail("This account has no person behind it, so it can't be used to sign in.");
-      return;
-    }
-    const subject = subjectAccountName(found);
-    // The address exactly as the provider vouches for it: an email-keyed account was named by it
-    // unchanged (the email sign-in above), so a mixed-case address still finds its account. Only the
-    // directory's emails index folds case (`recordEmail`).
-    const email = (await account.getAuthenticatedEmail()) || null;
+  async #deliverBySubject(account: Fetcher<GatekeeperUser>, expiresAt: Date | undefined,
+                          pending: DurableObjectStub<PendingLogin>, ticketHash: string,
+                          loginLogger: ReturnType<typeof logger.with>): Promise<void> {
+    const connects = this.ctx.props.connects === true;
+    // Until it is linked, a connecting sign-in's account is held by nothing here, so a sign-in that
+    // stops short revokes it rather than leave its provider session behind.
+    const discard = async () => {
+      if (!connects) return;
+      try {
+        await account.revoke();
+      } catch (error) {
+        loginLogger.warn("failed to revoke an unlinked sign-in account", {
+          event: "gatekeeper.login.revoke.failed", error,
+        });
+      }
+    };
     const users = this.ctx.exports.UserDurableObject;
     const directory = this.ctx.exports.UserDirectoryDurableObject;
-    const name = await resolveSubjectAccount({ users, directory }, subject, email);
-    const userStub = users.get(users.idFromName(name));
-    const signupsEnabled = (await readAdminConfig(this.env)).signupsEnabled;
-    const secret = await userStub.loginOrCreateViaSubject(name, subject, email, signupsEnabled);
-    if (secret === null) {
+    let name: string;
+    let email: string | null;
+    let userStub: DurableObjectStub<UserDurableObject>;
+    let signedIn: Awaited<ReturnType<UserDurableObject["loginOrCreateViaSubject"]>>;
+    try {
+      const found = await (account as unknown as Required<Pick<GatekeeperUser, "getAuthenticatedSubject">>).getAuthenticatedSubject();
+      if (!found) {
+        loginLogger.info("gatekeeper login finished", { event: "gatekeeper.login.finished", outcome: "no_subject" });
+        await discard();
+        await pending.fail("This account has no person behind it, so it can't be used to sign in.");
+        return;
+      }
+      const subject = subjectAccountName(found);
+      // The address exactly as the provider vouches for it: an email-keyed account was named by it
+      // unchanged (the email sign-in above), so a mixed-case address still finds its account. Only
+      // the directory's emails index folds case (`recordEmail`).
+      email = (await account.getAuthenticatedEmail()) || null;
+      name = await resolveSubjectAccount({ users, directory }, subject, email);
+      userStub = users.get(users.idFromName(name));
+      const signupsEnabled = (await readAdminConfig(this.env)).signupsEnabled;
+      signedIn = await userStub.loginOrCreateViaSubject(name, subject, email, signupsEnabled,
+          connects ? { account, vendorId: this.ctx.props.vendorId, expiresAt } : undefined);
+    } catch (error) {
+      await discard();
+      throw error;
+    }
+    if (signedIn === null) {
       loginLogger.info("gatekeeper login finished", { event: "gatekeeper.login.finished", outcome: "signups_disabled" });
+      await discard();
       await pending.fail("New sign-ups are currently disabled on this deployment.");
       return;
     }
+    // The gatekeeper keeps this callback for the linked account's lifetime (see `link`).
+    if (signedIn.accountId !== undefined) await pending.link(userStub.id.toString(), signedIn.accountId);
     if (email) await directory.getByName("").recordEmail(email, name);
-    await pending.deliver(`${name}:${secret}`, ticketHash);
+    await pending.deliver(`${name}:${signedIn.secret}`, ticketHash);
     loginLogger.info("gatekeeper login finished", { event: "gatekeeper.login.finished", outcome: "ok" });
   }
 
-  // The user DO and account id a sign-in linked (Cloudflare), or null for a transient sign-in
+  // The user DO and account id a sign-in linked (Cloudflare, or a vendor whose sign-in connects),
+  // or null for a transient sign-in
   // grant, which persists nothing there is to update.
   async #linked(): Promise<{ user: DurableObjectStub<UserDurableObject>; accountId: number } | null> {
     const link = await this.#pending().getLink();

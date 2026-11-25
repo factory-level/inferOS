@@ -1,6 +1,6 @@
 ---
 title: Set up the grokbot tenant for dev-os
-updated: 2026-11-02
+updated: 2026-11-25
 ---
 
 # Set up the grokbot tenant for dev-os
@@ -46,7 +46,7 @@ Check these in order. Each one, when missing, breaks sign-in in a different way.
 1. **Stub auth.** `curl -s https://api.dev.inferlab.io/auth/public-config` names mode `stub`.
    Otherwise the persona picker does not exist.
 2. **Origin registered.** `https://dev-os.factorylevel.dev` is in `auth.sso.inferosOrigins` in
-   InferOps `config/development.js`. Otherwise InferLab refuses "Sign in with InferLab".
+   InferOps `config/development.js`. Otherwise InferLab refuses "Sign in with Google".
 3. **Edge secret.** `INFEROPS_EDGE_SECRET` is deployed on `inferos-dev-gatekeeper-inferops` and
    equals InferOps' `waf:inferosEdgeSecret` ([edge secret](stage-deploy.md#inferlab-edge-secret)).
    Otherwise sign-in and every InferOps call get a 403.
@@ -63,19 +63,27 @@ Check these in order. Each one, when missing, breaks sign-in in a different way.
 ## Sign an agent in
 
 1. Open `https://dev-os.factorylevel.dev` and pass Access with the agent's own mailbox.
-2. Choose "Continue with InferOps". The popup opens the persona picker on
-   `auth.dev-os.factorylevel.dev`.
-3. Choose the persona, finish onboarding, then connect the InferOps account from the same picker.
+2. Choose **Use a different Google account** (the first time, or to change persona). The popup
+   opens the persona picker on `auth.dev-os.factorylevel.dev`. **Sign in with Google** reuses the
+   persona already signed in on that host without showing any page, or opens the picker when none
+   is.
+3. Choose the persona and finish onboarding. Signing in also connects the persona's InferOps
+   account; there is no separate connect step.
 4. Open the GROK board or the Wiki by the references above.
 
-**Switching persona.** Every sign-in, connect and reconnect through `auth.dev-os` asks InferLab for
-the sign-in page (`prompt=select_account`), so the picker is shown each time
-([sign-in proxy](../architecture/inferops-gatekeeper.md#sign-in-proxy)). Reconnecting the account
-as another persona replaces its session. Do not open `https://auth.dev-os.factorylevel.dev/logout`
-to switch: it ends the InferLab session behind every InferOps account connected through that host,
-which then shows "Credentials expired" until it is reconnected.
+**Switching persona.** Sign out of InferOS (the account menu), then sign in again: the first
+sign-in after a sign-out asks InferLab for the picker (`prompt=select_account`), as **Use a
+different Google account** always does
+([one Google sign-in](../architecture/inferops-gatekeeper.md#one-google-sign-in-fac-300)). Signing
+out ends the persona's InferLab sign-in everywhere, on `auth.dev-os` and `auth.dev.inferlab.io`
+alike, so the persona is signed out of InferOps, InferMind, the console and InferWork too. Signing in
+again as the same persona replaces its InferOps account's session rather than adding an account.
 
-**Signing in as yourself with Google.** The same page's "Continue with Google" works through
+**Automatic sign-in.** On dev, InferOS's central-auth sign-in lives on `auth.dev-os`, apart from the
+one on `auth.dev.inferlab.io` the other apps share, so being signed in to the console does not sign
+InferOS in, and the reverse. Each app's first sign-in still goes straight to the provider.
+
+**Signing in as yourself with Google.** InferLab's Google sign-in works through
 `auth.dev-os` once three things hold: dev InferLab lists `https://auth.dev-os.factorylevel.dev` in
 `auth.sso.proxyOrigins` (factory-level/inferops#2528), dev's Google OAuth client (inferlab-dev) has
 `https://auth.dev-os.factorylevel.dev/auth/oauth/callback/google` as an authorized redirect URI, and

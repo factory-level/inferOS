@@ -208,3 +208,76 @@ export class FakeSubjectAccount extends WorkerEntrypoint<unknown, { issuer: stri
     return this.ctx.props.subject === null ? null : { issuer: this.ctx.props.issuer, subject: this.ctx.props.subject };
   }
 }
+
+/**
+ * What each FakeSignInAccount answers `checkSignIn()`, the calls it took, and the hold its
+ * `checkSignIn()` waits on, by its `key` prop.
+ */
+const signInAnswers = new Map<string, "live" | "ended" | "down">();
+const signInCalls = new Map<string, string[]>();
+const signInHolds = new Map<string, { held: Promise<void>; release: () => void }>();
+
+/**
+ * A sign-in account whose vendor declares `signInConnects` (FAC-300): it yields a subject and an
+ * email like FakeSubjectAccount, and answers `checkSignIn()` as its key's answer says (`setAnswer`,
+ * "live" until told otherwise); "down" is a provider that cannot be reached, for `endSignIn()` too.
+ * `hold()` keeps `checkSignIn()` and `endSignIn()` from answering until `release()`. Every call is recorded
+ * by `props.key` (`calls()`).
+ */
+export class FakeSignInAccount extends WorkerEntrypoint<unknown, { key: string; issuer: string; subject: string; email: string }> {
+  #record(call: string) {
+    const calls = signInCalls.get(this.ctx.props.key) ?? [];
+    calls.push(call);
+    signInCalls.set(this.ctx.props.key, calls);
+  }
+
+  async describe(): Promise<AccountDescription> {
+    return { displayName: "InferOps", uniqueName: this.ctx.props.email };
+  }
+
+  async getAuthenticatedEmail(): Promise<string | null> {
+    return this.ctx.props.email;
+  }
+
+  async getAuthenticatedSubject(): Promise<{ issuer: string; subject: string }> {
+    return { issuer: this.ctx.props.issuer, subject: this.ctx.props.subject };
+  }
+
+  async checkSignIn(): Promise<boolean> {
+    this.#record("checkSignIn");
+    await signInHolds.get(this.ctx.props.key)?.held;
+    const answer = signInAnswers.get(this.ctx.props.key) ?? "live";
+    if (answer === "down") throw new Error("InferLab could not be reached");
+    return answer === "live";
+  }
+
+  async endSignIn(): Promise<void> {
+    this.#record("endSignIn");
+    await signInHolds.get(this.ctx.props.key)?.held;
+    if (signInAnswers.get(this.ctx.props.key) === "down") throw new Error("InferLab refused to sign out (HTTP 503).");
+    signInAnswers.set(this.ctx.props.key, "ended");
+  }
+
+  async hold(): Promise<void> {
+    let release = () => {};
+    const held = new Promise<void>(resolve => { release = resolve; });
+    signInHolds.set(this.ctx.props.key, { held, release });
+  }
+
+  async release(): Promise<void> {
+    signInHolds.get(this.ctx.props.key)?.release();
+    signInHolds.delete(this.ctx.props.key);
+  }
+
+  async revoke(): Promise<void> {
+    this.#record("revoke");
+  }
+
+  async setAnswer(answer: "live" | "ended" | "down"): Promise<void> {
+    signInAnswers.set(this.ctx.props.key, answer);
+  }
+
+  async calls(): Promise<string[]> {
+    return signInCalls.get(this.ctx.props.key) ?? [];
+  }
+}

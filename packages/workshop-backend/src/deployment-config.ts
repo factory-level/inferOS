@@ -32,7 +32,11 @@ export async function getAuthVendors(env: Cloudflare.Env): Promise<AuthVendorInf
     try {
       const desc = await binding.describe();
       if (!desc.providesAuth) return null;
-      return { vendorId, displayName: desc.displayName, logo: desc.logo, color: desc.color };
+      return {
+        vendorId, displayName: desc.displayName, logo: desc.logo, color: desc.color,
+        ...(desc.signInLabel ? { signInLabel: desc.signInLabel } : {}),
+        ...(desc.chooseAccountLabel ? { chooseAccountLabel: desc.chooseAccountLabel } : {}),
+      };
     } catch (err) {
       logger.error("failed to describe auth gatekeeper", {
         event: "auth.gatekeeper.describe.failed", vendorId, error: err,

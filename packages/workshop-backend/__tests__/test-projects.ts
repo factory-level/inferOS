@@ -197,4 +197,5 @@ export const BACKEND_RESTART: readonly string[] = [
  */
 export const BACKEND_SIGN_IN: readonly string[] = [
   "account-subject.test.ts",
+  "session-sign-in.test.ts",
 ];

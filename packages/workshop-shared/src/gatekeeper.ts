@@ -83,6 +83,29 @@ export type VendorDescription = {
   providesSubject?: boolean;
 
   /**
+   * True if this vendor's sign-in also connects the account it signs in with, and the provider
+   * sign-in behind that account backs the Workshop session (FAC-300): the Workshop asks for it with
+   * `GatekeeperConnectOptions.connect`, persists the account as a connect would, checks that sign-in
+   * through `GatekeeperUser.checkSignIn()` and ends it through `GatekeeperUser.endSignIn()`, which
+   * such a vendor's accounts must implement. A sign-in without `connect` stays transient, as for any
+   * other vendor. Only meaningful with `providesSubject`. Defaults to false.
+   */
+  signInConnects?: boolean;
+
+  /**
+   * The sign-in button's whole text, e.g. "Sign in with Google", for a vendor whose button should
+   * not read "Continue with <displayName>". Only meaningful with `providesAuth`.
+   */
+  signInLabel?: string;
+
+  /**
+   * When set, the vendor honours `GatekeeperConnectOptions.chooseAccount`, and the Workshop offers a
+   * second sign-in button with this text (e.g. "Use a different Google account") that asks the
+   * provider for its account chooser. Only meaningful with `providesAuth`.
+   */
+  chooseAccountLabel?: string;
+
+  /**
    * If set, this vendor can mint a connected account with no OAuth flow (see
    * GatekeeperVendor.createAccount) and recommends the Workshop auto-provision one account per user.
    * The account — not the vendor — declares whether it provides an agent singleton and/or a
@@ -598,6 +621,19 @@ export type ResourceConfiguratorFrame = GatekeeperUiFrame;
 export type GatekeeperConnectOptions = {
   scopes?: "auth" | "full";
   resourceUrlPatterns?: string[];
+  /**
+   * Only for a vendor that declares `chooseAccountLabel`. `true` asks the provider for its account
+   * chooser; `false` asks it to reuse a sign-in the browser already holds without showing a page,
+   * falling back to its normal sign-in when there is none. Unset leaves the vendor's default.
+   */
+  chooseAccount?: boolean;
+  /**
+   * Only for a vendor that declares `VendorDescription.signInConnects`: the sign-in connects the
+   * account it signs in with, as a connect does, and its provider sign-in is kept. Without it a
+   * sign-in (`scopes: "auth"`) is transient and keeps nothing, so a Workshop that predates
+   * `signInConnects` is never handed an account it would not hold.
+   */
+  connect?: boolean;
 };
 
 /**
@@ -909,6 +945,21 @@ export interface GatekeeperUser extends WorkerEntrypoint {
    * Null when the account has no person behind it. Called only on vendors that declare it.
    */
   getAuthenticatedSubject?(): Promise<GatekeeperSubject | null>;
+
+  /**
+   * For vendors that declare `signInConnects`: whether the provider sign-in behind this account is
+   * still live, asked of the provider now. False once the provider has confirmed it ended (signed
+   * out anywhere, expired, revoked); throws when the provider could not answer, which says nothing
+   * either way. Called only on vendors that declare it.
+   */
+  checkSignIn?(): Promise<boolean>;
+
+  /**
+   * For vendors that declare `signInConnects`: ends the person's provider sign-in everywhere it is
+   * live, not only this account's session, so every app signed in through it is signed out. The
+   * account's credentials are dead afterwards. Idempotent. Called only on vendors that declare it.
+   */
+  endSignIn?(): Promise<void>;
 
   /** Get a `GatekeeperUserVerifier` representing this user. */
   getVerifier(): Promise<Fetcher<GatekeeperUserVerifier>>;
