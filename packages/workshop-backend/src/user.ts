@@ -84,9 +84,11 @@ export const SIGN_IN_UNCONFIRMED_LIMIT_MS = 24 * 60 * 60_000;
 
 /**
  * How long `signOut` waits for a backing account's `endSignIn()` before treating the provider's
- * sign-out as failed (`SIGN_OUT_ERROR_CODES.providerSignOutFailed`): a person is waiting on it. A
- * little over the InferLab gatekeeper's own 5-second bound, so its answer wins when it has one, and
- * inside the frontend's 8-second wait, so the person is told the provider's sign-out failed.
+ * sign-out as failed (`SIGN_OUT_ERROR_CODES.providerSignOutFailed`): a person is waiting on it, and
+ * it stays inside the frontend's 8-second wait so the person is told the provider's sign-out failed.
+ * The InferLab gatekeeper refreshes the kept session first (up to 10 s) and then signs out (5 s), so
+ * a slow InferLab can outlast this bound: the person then sees the warning while the gatekeeper may
+ * still finish the sign-out everywhere. That errs on the safe side (a warning, never a silent miss).
  */
 export const SIGN_IN_END_TIMEOUT_MS = 6_000;
 

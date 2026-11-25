@@ -195,3 +195,5 @@ The clean line's gatekeepers and backend differ from the archived `main`, so the
 
 - No CI job deploys a stage, and two people deploying one stage at once are not prevented.
 - A passing dry run proves the plan, not a deployed instance.
+- Signing out of InferOS after already signing out in another InferLab app (within the Workshop's five-minute check) shows "InferLab couldn't sign you out everywhere", although the person is signed out everywhere: the kept session already ended, and the Workshop can't tell that apart from a session that died on its own (FAC-300).
+- A slow InferLab can outlast the Workshop's 6-second wait for the sign-out everywhere (refresh first, then sign-out). The person then sees the warning while the gatekeeper may still finish the sign-out (FAC-300).
