@@ -18,9 +18,12 @@ const REFRESH_TIMEOUT_MS = 10_000;
 /** How long a sign-out everywhere may take: a person is waiting on it. */
 const SIGN_OUT_TIMEOUT_MS = 5_000;
 /**
- * How long a kept sign-in's session is held after it was last confirmed live (FAC-300): the
- * Workshop's own session lifetime (`SESSION_LIFETIME_MS`), and InferLab's refresh sessions'. Then
- * its attempt object ends it. Here rather than in worker.ts, whose exports are entrypoints only.
+ * How long a kept sign-in's session is held after it was last confirmed live (FAC-300), matching the
+ * Workshop's own session lifetime (`SESSION_LIFETIME_MS`); then its attempt object ends it. InferLab
+ * ends the session sooner on its own: 30 days after sign-in however often it is refreshed
+ * (`refreshTtl`, absolute), and after 7 days without a refresh (`idleTimeout`). The hold only bounds
+ * how long a dead token lingers here. Here rather than in worker.ts, whose exports are entrypoints
+ * only.
  */
 export const KEPT_SIGN_IN_LIFETIME_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_TOKEN_RESPONSE_BYTES = 256 * 1024;

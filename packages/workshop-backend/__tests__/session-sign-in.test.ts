@@ -43,7 +43,10 @@ type Internals = {
       list(): Iterable<LoginSessionRecord>; get(id: string): LoginSessionRecord | undefined;
       put(record: LoginSessionRecord): void;
     };
-    signInBackings: { list(): Iterable<SignInBackingRecord>; delete(id: string): void };
+    signInBackings: {
+      list(): Iterable<SignInBackingRecord>; delete(id: string): void;
+      get(id: string): SignInBackingRecord | undefined;
+    };
     connectedAccounts: { list(): Iterable<unknown> };
   };
 };
@@ -325,6 +328,40 @@ describe("a session a sign-in backs", () => {
 
     expect(await authenticate(name, secret)).toBe("invalid session token");
     expect(await callsOf(key)).toEqual([]);
+  });
+});
+
+/**
+ * Makes every read of a sign-in backing in user DO `name` throw, as one whose stub no longer
+ * deserializes (its Worker unbound) does, for as long as the DO stays in memory.
+ */
+const breakBackingReads = (name: string) => inUser(name, ({ storage }) => {
+  storage.signInBackings.get = () => { throw new Error("the stub no longer deserializes"); };
+});
+
+describe("a backing that can't be read", () => {
+  it("ends its session at the next check, asking nothing", async () => {
+    const { name, secret, key } = await signIn(person());
+    await ageChecks(name, SIGN_IN_CHECK_INTERVAL_MS);
+    await breakBackingReads(name);
+
+    expect(await authenticate(name, secret)).toBe("invalid session token");
+    expect(await sessions(name)).toEqual([]);
+    expect(await callsOf(key)).toEqual([]);
+  });
+
+  it("still lets a sign-out end every session it backs", async () => {
+    const who = person();
+    const first = await signIn(who);
+    const second = await signIn(who);
+    await breakBackingReads(first.name);
+
+    await env.TEST_USER.getByName(first.name).signOut(first.secret);
+
+    expect(await sessions(first.name)).toEqual([]);
+    expect(await backings(first.name)).toEqual([]);
+    expect(await authenticate(second.name, second.secret)).toBe("invalid session token");
+    expect(await callsOf(first.key)).toEqual([]);
   });
 });
 

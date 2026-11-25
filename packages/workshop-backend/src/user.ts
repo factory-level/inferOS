@@ -9,7 +9,7 @@ import { skipRpcValidation, validateRpc } from "capnweb-validate";
 import type { Singleton } from "@gadgets/typed-storage";
 import {
   makeUserStorage, type BlueprintUserRecord, type CloudflareBilling, type ConnectedAccountRecord,
-  type GadgetRecord, type LoginSessionRecord, type PendingConnectFlow, type PendingDeviceHandoffRecord,
+  type GadgetRecord, type LoginSessionRecord, type SignInBackingRecord, type PendingConnectFlow, type PendingDeviceHandoffRecord,
   type PendingHandoffRecord, type UserAiModelRecord, type UserStorage, type WorkspaceOutputEntry,
   type ChatReadCursor,
 } from "./storage-schema/user-storage.js";
@@ -67,8 +67,9 @@ export const DEVICE_SESSION_LIFETIME_MS = 30 * 24 * 60 * 60_000;
 
 /**
  * How long a browser session lives (FAC-300): from its creation, or, for a session a provider
- * sign-in backs, from the last time that sign-in was confirmed live. InferLab's refresh sessions
- * live as long.
+ * sign-in backs, from the last time that sign-in was confirmed live. That renewal is the Workshop's
+ * own: InferLab ends its refresh session 30 days after sign-in however often it is refreshed, and
+ * after 7 days without a refresh, and the next check then finds it ended and ends this session too.
  */
 export const SESSION_LIFETIME_MS = 30 * 24 * 60 * 60_000;
 
@@ -524,7 +525,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   // Asks whether the provider sign-in behind backing `backingId` is still live: false when it has
   // ended or its record is gone, and null when the provider could not answer.
   async #checkSignIn(backingId: string): Promise<boolean | null> {
-    let record = this.storage.signInBackings.get(backingId);
+    let record = this.#backingRecord(backingId);
     if (!record) return false;
     const account = record.account;
     // A stub has every method; this narrows the optional one GatekeeperUser declares.
@@ -536,6 +537,18 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
         event: "session.sign_in.check.failed", vendorId: record.vendorId, error,
       });
       return null;
+    }
+  }
+
+  // The sign-in account record `backingId` names, or undefined when there is none or it can't be
+  // read (its stub no longer deserializes, say, because its Worker was unbound): either way nothing
+  // backs the session any more.
+  #backingRecord(backingId: string): SignInBackingRecord | undefined {
+    try {
+      return this.storage.signInBackings.get(backingId);
+    } catch (error) {
+      logger.warn("could not read the sign-in backing a session", { event: "session.sign_in.read.failed", error });
+      return undefined;
     }
   }
 
@@ -658,13 +671,19 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     let session = tokenId === null ? undefined : this.storage.sessions.get(tokenId);
     if (!session) return;
     let backing = session.backing;
-    // Read before the records go: the account is what ends the provider sign-in.
-    let record = backing ? this.storage.signInBackings.get(backing.id) : undefined;
-    this.#deleteSession(session.tokenId);
-    if (!backing) return;
-    for (let other of Array.from(this.storage.sessions.list())) {
-      if (other.backing?.vendorId === backing.vendorId) this.#deleteSession(other.tokenId);
+    if (!backing) {
+      this.#deleteSession(session.tokenId);
+      return;
     }
+    // The sessions go first, whatever the backing's record holds: a record that can't be read must
+    // not leave them standing.
+    let ended = [session, ...Array.from(this.storage.sessions.list())
+        .filter(other => other.tokenId !== session.tokenId && other.backing?.vendorId === backing.vendorId)];
+    for (let each of ended) this.storage.sessions.delete(each.tokenId);
+    // Then the account that ends the provider sign-in, read once its session is gone, and the
+    // records of every ended session's backing.
+    let record = this.#backingRecord(backing.id);
+    for (let each of ended) if (each.backing) this.storage.signInBackings.delete(each.backing.id);
     if (!record) return;
     const account = record.account;
     let failed = false;

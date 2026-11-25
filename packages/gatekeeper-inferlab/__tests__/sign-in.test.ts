@@ -597,25 +597,46 @@ describe("a sign-in the Workshop asks to keep (FAC-300)", () => {
   it("is ended everywhere with /auth/sign-out, not only this session with /auth/logout, idempotently", async () => {
     const { attemptId } = await keptSignIn();
     expect(await hooks().endSignIn(attemptId)).toBeNull();
-    expect(seen.map(s => s.path)).toEqual(["/auth/token", "/auth/sign-out"]);
-    expect(seen[1]!.body).toEqual({ refreshToken: "refresh-token-ended-at-once" });
+    // Refreshed first, since InferLab answers a sign-out 204 even for a token it no longer knows;
+    // the sign-out then carries the token just rotated.
+    expect(seen.map(s => s.path)).toEqual(["/auth/token", "/auth/refresh", "/auth/sign-out"]);
+    expect(seen[2]!.body).toEqual({ refreshToken: "rotated-1" });
     expect(await keptOf(attemptId)).toEqual({ kept: null, alarm: null });
     expect(await hooks().checkSignIn(attemptId)).toBe(false);
     expect(await hooks().endSignIn(attemptId)).toBeNull();
     expect(seen.filter(s => s.path === "/auth/sign-out")).toHaveLength(1);
   });
 
-  it("counts an already-ended session (401) as signed out", async () => {
+  it("counts a sign-out InferLab answers 401 for a live session as signed out", async () => {
     const { attemptId } = await keptSignIn();
     signOutAnswer = () => Response.json({ error: "unauthorized" }, { status: 401 });
     expect(await hooks().endSignIn(attemptId)).toBeNull();
   });
 
-  it("reports a sign-out InferLab refused, so it never reads as done, and keeps the session for the alarm", async () => {
+  it("reports a sign-out InferLab refused, then logs the kept session out alone and forgets it", async () => {
     const { attemptId } = await keptSignIn();
     signOutAnswer = () => new Response("down", { status: 503 });
     expect(await hooks().endSignIn(attemptId)).toContain("HTTP 503");
-    expect((await keptOf(attemptId)).kept).not.toBeNull();
+    expect(seen.map(s => s.path)).toEqual(["/auth/token", "/auth/refresh", "/auth/sign-out", "/auth/logout"]);
+    expect(seen[3]!.body).toEqual({ refreshToken: "rotated-1" });
+    expect(await keptOf(attemptId)).toEqual({ kept: null, alarm: null });
+  });
+
+  it("never reads a sign-out as done when the kept session had already ended at InferLab", async () => {
+    const { attemptId } = await keptSignIn();
+    // Ended elsewhere: InferLab would still answer /auth/sign-out with this token 204.
+    refreshAnswer = () => Response.json({ error: "unauthorized" }, { status: 401 });
+    expect(await hooks().endSignIn(attemptId)).toContain("already ended");
+    expect(seen.map(s => s.path)).toEqual(["/auth/token", "/auth/refresh"]);
+    expect(await keptOf(attemptId)).toEqual({ kept: null, alarm: null });
+  });
+
+  it("logs the kept session out alone and forgets it when InferLab can't be reached to check it", async () => {
+    const { attemptId } = await keptSignIn();
+    refreshAnswer = () => new Response("down", { status: 503 });
+    expect(await hooks().endSignIn(attemptId)).toContain("HTTP 503");
+    expect(seen.map(s => s.path)).toEqual(["/auth/token", "/auth/refresh", "/auth/logout"]);
+    expect(await keptOf(attemptId)).toEqual({ kept: null, alarm: null });
   });
 
   it("ends the kept session alone when the Workshop revokes a sign-in it did not use", async () => {

@@ -18,7 +18,8 @@
 //     `checkSignIn()` (a refresh, which rotates the token; a 401 is the session's end) and
 //     `endSignIn()` (`POST /auth/sign-out`, which ends every central-auth session of the person and
 //     every session under them, so every InferLab app is signed out). The Workshop's session is
-//     backed by it. The object ends the session itself 30 days after its last confirmation, and when
+//     backed by it. InferLab ends the session 30 days after sign-in (absolute) or after 7 idle days;
+//     the object ends it itself 30 days after its last confirmation at the latest, and when
 //     the Workshop revokes a sign-in it did not use.
 //   - Any other sign-in ends the session at once, so a Workshop that predates `keepSignIn` is never
 //     handed one it would not hold. Only the subject, the company and a vouched email are kept.
@@ -277,15 +278,30 @@ export class SignInAttempt extends DurableObject<Cloudflare.Env> {
 
   /**
    * Ends the person's InferLab sign-in everywhere with the kept session (`POST /auth/sign-out`),
-   * then forgets it. Nothing kept (already ended, or never) is done already. Throws, keeping the
-   * session for the alarm to end, when InferLab did not confirm the sign-out.
+   * then forgets it. Nothing kept (never kept, or already signed out here) is done already.
+   *
+   * InferLab answers the sign-out 204 for a token it no longer knows, so the session is refreshed
+   * first: a live one signs out with the token just rotated, and one InferLab has already ended
+   * (401) throws, since its token can no longer end the person's other sign-ins. When InferLab can't
+   * be reached or refuses, the kept session alone is logged out, best effort, and forgotten (the
+   * Workshop has already let go of it), and this throws, so the sign-out never reads as done.
    */
   async endEverywhere(): Promise<void> {
     await this.#settled();
-    const kept = this.ctx.storage.kv.get<Kept>(KEPT_KEY);
-    if (!kept) return;
-    await signOutEverywhere(inferLabTarget(configOrThrow(this.env)), kept.refreshToken);
-    await this.#forget();
+    if (!this.ctx.storage.kv.get<Kept>(KEPT_KEY)) return;
+    const target = inferLabTarget(configOrThrow(this.env));
+    try {
+      if (!await this.checkSession()) {
+        throw new Error("The InferLab session had already ended, so it can't sign the person out everywhere.");
+      }
+      const live = this.ctx.storage.kv.get<Kept>(KEPT_KEY);
+      if (!live) throw new Error("The InferLab session ended while signing out.");
+      await signOutEverywhere(target, live.refreshToken);
+      await this.#forget();
+    } catch (error) {
+      await this.#endKept();
+      throw error;
+    }
   }
 
   /** Ends the kept session alone (`POST /auth/logout`), for a sign-in the Workshop did not use. */
@@ -295,6 +311,7 @@ export class SignInAttempt extends DurableObject<Cloudflare.Env> {
   }
 
   async alarm(): Promise<void> {
+    await this.#settled();
     await this.#endKept();
   }
 
