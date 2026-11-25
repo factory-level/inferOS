@@ -1,13 +1,13 @@
 // FAC-214's auth acceptance suite, gatekeeper half: InferLab sign-in end to end against a fake
 // InferLab central-auth (faked at `fetch`, in mock mode: no network, no real provider). The kernel
 // half (account keyed on the subject) is packages/workshop-backend/__tests__/subject-login.test.ts.
-import { env } from "cloudflare:test";
+import { env, runInDurableObject } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import worker from "../src/worker.js";
+import worker, { type SignInAttempt, type SignInPurpose } from "../src/worker.js";
 import {
   ISSUER_MAX_LENGTH, ISSUER_PATTERN, NOT_CONFIGURED, SIGN_IN_CALLBACK_PATH, inferLabTarget, parseOrigin, readConfig,
 } from "../src/config.js";
-import { endSession, exchangeCode } from "../src/token.js";
+import { KEPT_SIGN_IN_LIFETIME_MS, endSession, exchangeCode } from "../src/token.js";
 // The InferLab contract, pinned from inferops (scripts/inferlab-contracts).
 import subjectSchema from "../../../scripts/inferlab-contracts/schemas/inferlab.stable-subject.v1.schema.json";
 
@@ -29,6 +29,10 @@ type Seen = { path: string; body: Record<string, unknown> };
 let seen: Seen[] = [];
 /** What the fake answers `/auth/token` with; a test overrides it. */
 let tokenAnswer: () => Response;
+/** What the fake answers `/auth/refresh` and `/auth/sign-out` with (FAC-300); a test overrides them. */
+let refreshAnswer: () => Response;
+let signOutAnswer: () => Response;
+let refreshes = 0;
 
 const tokenOk = (user: Record<string, unknown> = {}) => () => Response.json({
   token: "access-token-never-kept",
@@ -39,6 +43,9 @@ const tokenOk = (user: Record<string, unknown> = {}) => () => Response.json({
 beforeEach(() => {
   seen = [];
   tokenAnswer = tokenOk();
+  refreshes = 0;
+  refreshAnswer = () => Response.json({ token: "access-never-kept", refreshToken: `rotated-${++refreshes}` });
+  signOutAnswer = () => new Response(null, { status: 204 });
   vi.stubGlobal("fetch", async (input: RequestInfo, init?: RequestInit) => {
     const url = new URL(typeof input === "string" ? input : input.url);
     if (url.origin !== ISSUER) throw new Error(`unexpected fetch to ${url.origin}`);
@@ -46,6 +53,8 @@ beforeEach(() => {
     seen.push({ path: url.pathname, body });
     if (url.pathname === "/auth/token") return tokenAnswer();
     if (url.pathname === "/auth/logout") return new Response(null, { status: 204 });
+    if (url.pathname === "/auth/refresh") return refreshAnswer();
+    if (url.pathname === "/auth/sign-out") return signOutAnswer();
     throw new Error(`unexpected fetch to ${url.pathname}`);
   });
 });
@@ -62,11 +71,11 @@ const hooks = () => env.TEST_HOOKS.getByName("hooks");
 
 let counter = 0;
 /** A started attempt, as connectAccount leaves it: its id, its initiation nonce, and a label. */
-async function started() {
+async function started(purpose?: SignInPurpose, options?: { revokeOnComplete?: boolean }) {
   const attemptId = env.SIGN_IN_ATTEMPT.newUniqueId().toString();
   const nonce = (++counter).toString(16).padStart(64, "a");
   const label = `attempt-${counter}`;
-  await hooks().startAttempt(attemptId, nonce, label);
+  await hooks().startAttempt(attemptId, nonce, label, purpose, options);
   return { attemptId, nonce, label };
 }
 
@@ -151,6 +160,10 @@ describe("login exposes no business tools", () => {
   it("the vendor offers sign-in by subject, lists nothing, and refuses any connection but sign-in", async () => {
     const auth = await hooks().vendor("auth");
     expect(auth.description).toMatchObject({ providesAuth: true, providesSubject: true });
+    // One Google sign-in (FAC-300): it can back the Workshop session, and no button names a product.
+    expect(auth.description).toMatchObject({
+      keepsSignIn: true, signInLabel: "Sign in with Google", chooseAccountLabel: "Use a different Google account",
+    });
     expect(auth.resources).toBe(0);
     expect(auth.connect).toBe("allowed");
     expect((await hooks().vendor("full")).connect).toBe("InferLab connects only to sign you in.");
@@ -435,5 +448,233 @@ describe("the InferLab edge (FAC-296)", () => {
       .filter(([, text]) => /(?<![.\w]|async )fetch\s*\(|globalThis\.fetch|=\s*fetch\b/m.test(text))
       .map(([path]) => path);
     expect(offenders).toEqual([]);
+  });
+});
+
+// FAC-300: one Google sign-in through InferLab central auth. A sign-in the Workshop asks to keep
+// holds its InferLab session in its attempt object, backing the Workshop session: first it asks
+// InferLab to reuse a live sign-in (`prompt=none`), going on to an interactive leg when there is
+// none, and the account it hands over checks the session (a refresh) and ends the person's sign-in
+// everywhere (`/auth/sign-out`).
+const KEEP: SignInPurpose = { keep: true, silent: true };
+const KEEP_CHOOSER: SignInPurpose = { keep: true, silent: false };
+
+/** What an attempt object still holds of a kept sign-in, read inside it. */
+const keptOf = (attemptId: string) => runInDurableObject(
+  env.SIGN_IN_ATTEMPT.get(env.SIGN_IN_ATTEMPT.idFromString(attemptId)),
+  async (_: SignInAttempt, state) => ({
+    kept: state.storage.kv.get<{ refreshToken: string }>("kept") ?? null,
+    alarm: await state.storage.getAlarm(),
+  }));
+
+/** A kept sign-in, through a silent leg InferLab answers with a code. */
+async function keptSignIn(purpose: SignInPurpose = KEEP) {
+  const attempt = await started(purpose);
+  const auth = await authorize(attempt.attemptId, attempt.nonce);
+  const callback = await get(`${REDIRECT_URI}?code=the-code&state=${auth.searchParams.get("state")}`);
+  expect(callback.status).toBe(200);
+  return { ...attempt, auth };
+}
+
+describe("a sign-in the Workshop asks to keep (FAC-300)", () => {
+  it("asks InferLab to reuse a live sign-in first, and the chooser when the Workshop asks for it", async () => {
+    const silent = await started(KEEP);
+    expect((await authorize(silent.attemptId, silent.nonce)).searchParams.get("prompt")).toBe("none");
+    const chooser = await started(KEEP_CHOOSER);
+    expect((await authorize(chooser.attemptId, chooser.nonce)).searchParams.get("prompt")).toBe("select_account");
+    // A sign-in that keeps nothing always shows the chooser, even if it asked to be silent.
+    const transient = await started({ keep: false, silent: true });
+    expect((await authorize(transient.attemptId, transient.nonce)).searchParams.get("prompt")).toBe("select_account");
+  });
+
+  it("starts as the Workshop asked through connectAccount", async () => {
+    for (const [options, prompt] of [
+      [{ keepSignIn: true, chooseAccount: false }, "none"],
+      [{ keepSignIn: true, chooseAccount: true }, "select_account"],
+      [{ keepSignIn: true }, "select_account"],
+      [{ chooseAccount: false }, "select_account"],
+      [{}, "select_account"],
+    ] as const) {
+      const url = await hooks().vendorConnect({ scopes: "auth", ...options });
+      const response = await get(url);
+      expect(new URL(response.headers.get("location")!).searchParams.get("prompt"), JSON.stringify(options))
+        .toBe(prompt);
+    }
+  });
+
+  it("goes on, once, to an interactive leg with no prompt for every answer that means InferLab needs a page", async () => {
+    for (const error of ["login_required", "interaction_required", "consent_required", "account_selection_required"]) {
+      const attempt = await started(KEEP);
+      const silent = await authorize(attempt.attemptId, attempt.nonce);
+      const resumed = await get(`${REDIRECT_URI}?error=${error}&state=${silent.searchParams.get("state")}`);
+      expect(resumed.status, error).toBe(302);
+      const leg = new URL(resumed.headers.get("location")!);
+      expect(`${leg.origin}${leg.pathname}`).toBe(`${ISSUER}/authorize`);
+      expect(leg.searchParams.has("prompt"), error).toBe(false);
+      expect(leg.searchParams.get("state")).not.toBe(silent.searchParams.get("state"));
+      expect(leg.searchParams.get("state")!.split(".")[0]).toBe(attempt.attemptId);
+      expect(leg.searchParams.get("code_challenge")).not.toBe(silent.searchParams.get("code_challenge"));
+      // The silent leg's state is spent: neither a replay of the error nor a code under it does anything.
+      expect((await get(`${REDIRECT_URI}?error=${error}&state=${silent.searchParams.get("state")}`)).status).toBe(400);
+      expect((await get(`${REDIRECT_URI}?code=c&state=${silent.searchParams.get("state")}`)).status).toBe(400);
+      // There is no third leg: the interactive leg InferLab cannot complete ends the attempt.
+      const ended = await get(`${REDIRECT_URI}?error=${error}&state=${leg.searchParams.get("state")}`);
+      expect(ended.status).toBe(400);
+      expect(await ended.text()).toContain("not completed");
+    }
+    expect(seen).toEqual([]);
+  });
+
+  it("completes on the interactive leg with that leg's own verifier", async () => {
+    const attempt = await started(KEEP);
+    const silent = await authorize(attempt.attemptId, attempt.nonce);
+    const leg = new URL((await get(
+      `${REDIRECT_URI}?error=login_required&state=${silent.searchParams.get("state")}`)).headers.get("location")!);
+    const done = await get(`${REDIRECT_URI}?code=the-code&state=${leg.searchParams.get("state")}`);
+    expect(done.status).toBe(200);
+    const exchange = seen.find(s => s.path === "/auth/token")!.body;
+    expect(await sha256base64url(String(exchange.codeVerifier))).toBe(leg.searchParams.get("code_challenge"));
+    expect(await hooks().received(attempt.label)).toMatchObject({ subject: { issuer: ISSUER, subject: PRINCIPAL } });
+  });
+
+  it("ends the attempt on any other error, and on a needs-a-page error to a leg that asked for the chooser", async () => {
+    const denied = await started(KEEP);
+    const silent = await authorize(denied.attemptId, denied.nonce);
+    expect((await get(`${REDIRECT_URI}?error=access_denied&state=${silent.searchParams.get("state")}`)).status).toBe(400);
+    expect((await get(`${REDIRECT_URI}?code=c&state=${silent.searchParams.get("state")}`)).status).toBe(400);
+    const chooser = await started(KEEP_CHOOSER);
+    const shown = await authorize(chooser.attemptId, chooser.nonce);
+    expect((await get(`${REDIRECT_URI}?error=login_required&state=${shown.searchParams.get("state")}`)).status).toBe(400);
+    expect((await get(`${REDIRECT_URI}?code=c&state=${shown.searchParams.get("state")}`)).status).toBe(400);
+  });
+
+  it("keeps the session, only in its attempt object, held for thirty days", async () => {
+    const before = Date.now();
+    const { attemptId, label } = await keptSignIn();
+    expect(seen.map(s => s.path)).toEqual(["/auth/token"]);
+    const { kept, alarm } = await keptOf(attemptId);
+    expect(kept).toEqual({ refreshToken: "refresh-token-ended-at-once" });
+    expect(alarm).toBeGreaterThanOrEqual(before + KEPT_SIGN_IN_LIFETIME_MS);
+    // The Workshop is handed the person, never a token.
+    const got = JSON.stringify(await hooks().received(label));
+    expect(got).not.toContain("refresh-token");
+    expect(got).not.toContain("access-token");
+  });
+
+  it("is live while InferLab refreshes the session, which rotates it, and renews the hold", async () => {
+    const { attemptId } = await keptSignIn();
+    expect(await hooks().checkSignIn(attemptId)).toBe(true);
+    expect(await hooks().checkSignIn(attemptId)).toBe(true);
+    expect(seen.filter(s => s.path === "/auth/refresh").map(s => s.body.refreshToken))
+      .toEqual(["refresh-token-ended-at-once", "rotated-1"]);
+    expect((await keptOf(attemptId)).kept).toEqual({ refreshToken: "rotated-2" });
+  });
+
+  it("shares one refresh between concurrent checks, so no refresh token is presented twice", async () => {
+    const { attemptId } = await keptSignIn();
+    const answers = await Promise.all([hooks().checkSignIn(attemptId), hooks().checkSignIn(attemptId), hooks().checkSignIn(attemptId)]);
+    expect(answers).toEqual([true, true, true]);
+    const presented = seen.filter(s => s.path === "/auth/refresh").map(s => s.body.refreshToken);
+    expect(new Set(presented).size).toBe(presented.length);
+  });
+
+  it("has ended once InferLab refuses the refresh, and then holds nothing and asks nothing", async () => {
+    const { attemptId } = await keptSignIn();
+    refreshAnswer = () => Response.json({ error: "unauthorized" }, { status: 401 });
+    expect(await hooks().checkSignIn(attemptId)).toBe(false);
+    expect(await keptOf(attemptId)).toEqual({ kept: null, alarm: null });
+    expect(await hooks().checkSignIn(attemptId)).toBe(false);
+    expect(seen.filter(s => s.path === "/auth/refresh")).toHaveLength(1);
+  });
+
+  it("says nothing either way when InferLab cannot answer", async () => {
+    const { attemptId } = await keptSignIn();
+    refreshAnswer = () => new Response("down", { status: 503 });
+    expect(await hooks().checkSignIn(attemptId)).toMatch(/HTTP 503/);
+    expect((await keptOf(attemptId)).kept).not.toBeNull();
+  });
+
+  it("is ended everywhere with /auth/sign-out, not only this session with /auth/logout, idempotently", async () => {
+    const { attemptId } = await keptSignIn();
+    expect(await hooks().endSignIn(attemptId)).toBeNull();
+    // Refreshed first, since InferLab answers a sign-out 204 even for a token it no longer knows;
+    // the sign-out then carries the token just rotated.
+    expect(seen.map(s => s.path)).toEqual(["/auth/token", "/auth/refresh", "/auth/sign-out"]);
+    expect(seen[2]!.body).toEqual({ refreshToken: "rotated-1" });
+    expect(await keptOf(attemptId)).toEqual({ kept: null, alarm: null });
+    expect(await hooks().checkSignIn(attemptId)).toBe(false);
+    expect(await hooks().endSignIn(attemptId)).toBeNull();
+    expect(seen.filter(s => s.path === "/auth/sign-out")).toHaveLength(1);
+  });
+
+  it("counts a sign-out InferLab answers 401 for a live session as signed out", async () => {
+    const { attemptId } = await keptSignIn();
+    signOutAnswer = () => Response.json({ error: "unauthorized" }, { status: 401 });
+    expect(await hooks().endSignIn(attemptId)).toBeNull();
+  });
+
+  it("reports a sign-out InferLab refused, then logs the kept session out alone and forgets it", async () => {
+    const { attemptId } = await keptSignIn();
+    signOutAnswer = () => new Response("down", { status: 503 });
+    expect(await hooks().endSignIn(attemptId)).toContain("HTTP 503");
+    expect(seen.map(s => s.path)).toEqual(["/auth/token", "/auth/refresh", "/auth/sign-out", "/auth/logout"]);
+    expect(seen[3]!.body).toEqual({ refreshToken: "rotated-1" });
+    expect(await keptOf(attemptId)).toEqual({ kept: null, alarm: null });
+  });
+
+  it("never reads a sign-out as done when the kept session had already ended at InferLab", async () => {
+    const { attemptId } = await keptSignIn();
+    // Ended elsewhere: InferLab would still answer /auth/sign-out with this token 204.
+    refreshAnswer = () => Response.json({ error: "unauthorized" }, { status: 401 });
+    expect(await hooks().endSignIn(attemptId)).toContain("already ended");
+    expect(seen.map(s => s.path)).toEqual(["/auth/token", "/auth/refresh"]);
+    expect(await keptOf(attemptId)).toEqual({ kept: null, alarm: null });
+  });
+
+  it("logs the kept session out alone and forgets it when InferLab can't be reached to check it", async () => {
+    const { attemptId } = await keptSignIn();
+    refreshAnswer = () => new Response("down", { status: 503 });
+    expect(await hooks().endSignIn(attemptId)).toContain("HTTP 503");
+    expect(seen.map(s => s.path)).toEqual(["/auth/token", "/auth/refresh", "/auth/logout"]);
+    expect(await keptOf(attemptId)).toEqual({ kept: null, alarm: null });
+  });
+
+  it("ends the kept session alone when the Workshop revokes a sign-in it did not use", async () => {
+    const { attemptId } = await keptSignIn();
+    await hooks().revoke(attemptId);
+    expect(seen.map(s => s.path)).toEqual(["/auth/token", "/auth/logout"]);
+    expect(await keptOf(attemptId)).toEqual({ kept: null, alarm: null });
+  });
+
+  it("ends the kept session when the Workshop refuses the sign-in inside complete()", async () => {
+    const attempt = await started(KEEP, { revokeOnComplete: true });
+    const auth = await authorize(attempt.attemptId, attempt.nonce);
+    expect((await get(`${REDIRECT_URI}?code=c&state=${auth.searchParams.get("state")}`)).status).toBe(200);
+    expect(seen.map(s => s.path)).toEqual(["/auth/token", "/auth/logout"]);
+    expect(await keptOf(attempt.attemptId)).toEqual({ kept: null, alarm: null });
+  });
+
+  it("keeps no session from another company", async () => {
+    tokenAnswer = tokenOk({ tenantId: OTHER });
+    const attempt = await started(KEEP);
+    const auth = await authorize(attempt.attemptId, attempt.nonce);
+    expect((await get(`${REDIRECT_URI}?code=c&state=${auth.searchParams.get("state")}`)).status).toBe(502);
+    expect(seen.map(s => s.path)).toEqual(["/auth/token", "/auth/logout"]);
+    expect((await keptOf(attempt.attemptId)).kept).toBeNull();
+  });
+
+  it("ends the kept session once its hold runs out", async () => {
+    const { attemptId } = await keptSignIn();
+    await runInDurableObject(env.SIGN_IN_ATTEMPT.get(env.SIGN_IN_ATTEMPT.idFromString(attemptId)),
+      (instance: SignInAttempt) => instance.alarm());
+    expect(seen.map(s => s.path)).toEqual(["/auth/token", "/auth/logout"]);
+    expect(await keptOf(attemptId)).toEqual({ kept: null, alarm: null });
+  });
+
+  it("a sign-in that keeps nothing hands over an account with no sign-in to check or end", async () => {
+    await signIn();
+    expect(await hooks().checkSignIn(null)).toBe(false);
+    expect(await hooks().endSignIn(null)).toBeNull();
+    expect(seen.map(s => s.path)).toEqual(["/auth/token", "/auth/logout"]);
   });
 });

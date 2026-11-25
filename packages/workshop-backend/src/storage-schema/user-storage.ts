@@ -78,10 +78,31 @@ export type UserAiModelRecord = {
 export type LoginSessionRecord = {
   tokenId: string,  // sha256 hash of token, hex-formatted
   created: Date,
-  /** Device sessions expire server-side; legacy browser sessions have no expiry. */
+  /**
+   * When the session ends. Every session minted since FAC-300 has one (`SESSION_LIFETIME_MS` in
+   * user.ts, renewed while a backing sign-in is confirmed live); a session minted before has none,
+   * and ends `SESSION_LIFETIME_MS` after `created`.
+   */
   expiresAt?: Date,
   /** A staged device session cannot authenticate until its handoff is consumed. */
   pendingUntil?: Date,
+  /**
+   * The provider sign-in that backs this session (FAC-300, `VendorDescription.keepsSignIn`): the
+   * `signInBackings` record holding its account, the vendor, when it was last confirmed live, and
+   * when asking it last failed. Each confirmation renews `expiresAt`; a sign-in confirmed ended,
+   * a record gone, or a day without a confirmation ends the session.
+   */
+  backing?: { id: string, vendorId: string, checkedAt: Date, failedAt?: Date },
+}
+
+/**
+ * The sign-in account behind one backed session (LoginSessionRecord.backing), apart from the
+ * session so that listing sessions never has to revive a stub whose Worker may be unbound.
+ */
+export type SignInBackingRecord = {
+  id: string,
+  vendorId: string,
+  account: Fetcher<GatekeeperUser>,
 }
 
 /**
@@ -269,6 +290,10 @@ export function makeUserStorage(storage: DurableObjectStorage) {
       }),
       sessions: collection<LoginSessionRecord>()({
         primaryKey: "tokenId",
+      }),
+      // The sign-in accounts that back sessions (FAC-300). A new collection, so no migration.
+      signInBackings: collection<SignInBackingRecord>()({
+        primaryKey: "id",
       }),
       pendingHandoffs: collection<PendingHandoffRecord>()({
         primaryKey: "ticketHash",

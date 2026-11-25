@@ -1,7 +1,7 @@
 import { RpcStub, RpcTarget, newHttpBatchRpcResponse, newWebSocketRpcSession, RpcSessionOptions } from "capnweb";
 import { validateRpc } from "capnweb-validate";
 import type { JWTPayload } from "jose";
-import { PublicApi, ROUTER_TAG_PROBE_PATH, VERSION_PATH, AuthenticatedApi, Overseer, WorkspaceMetadataWithTimestamps, AiChatAuthorInfo, RedactedAiModelConfig, AiGatewayInfo, ModelKind, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, ObserverConfigCallback, BlueprintLibrarySummary, BlueprintPublicInfo, BlueprintUserSummary, BlueprintBindingAssignment, AgentSpawnerConfig, WorkpieceId, BLUEPRINT_SCREENSHOT_PATH_PREFIX, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ServerConfig, CloudflareUsageInfo, CloudflareAccountOption, LoginAttempt, GatekeeperAppInfo, AdminApi, GatekeeperVendorInfo, OutputFormatOffer, ListOutputsResult, UserDirectoryRecord, createOpenWorkspaceError, getOpenWorkspaceErrorCode, OPEN_WORKSPACE_ERROR_CODES, AUTH_ERROR_CODES, createAuthError, ConnectFlowStart, NotificationSubscriber, NotificationMute, WebPushSubscription, type UnreadStateSubscriber, AdminVia } from '@gadgets/workshop-shared/api';
+import { PublicApi, ROUTER_TAG_PROBE_PATH, VERSION_PATH, AuthenticatedApi, Overseer, WorkspaceMetadataWithTimestamps, AiChatAuthorInfo, RedactedAiModelConfig, AiGatewayInfo, ModelKind, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, ObserverConfigCallback, BlueprintLibrarySummary, BlueprintPublicInfo, BlueprintUserSummary, BlueprintBindingAssignment, AgentSpawnerConfig, WorkpieceId, BLUEPRINT_SCREENSHOT_PATH_PREFIX, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ServerConfig, CloudflareUsageInfo, CloudflareAccountOption, LoginAttempt, GatekeeperAppInfo, AdminApi, GatekeeperVendorInfo, OutputFormatOffer, ListOutputsResult, UserDirectoryRecord, createOpenWorkspaceError, getOpenWorkspaceErrorCode, OPEN_WORKSPACE_ERROR_CODES, AUTH_ERROR_CODES, createAuthError, SIGN_OUT_ERROR_CODES, SIGN_OUT_ERROR_MESSAGES, createSignOutError, ConnectFlowStart, NotificationSubscriber, NotificationMute, WebPushSubscription, type UnreadStateSubscriber, AdminVia } from '@gadgets/workshop-shared/api';
 import type { UiFeatureFlags } from "@gadgets/workshop-shared/feature-flags";
 import type { AttentionItem, AttentionPersonalState, UnreadStateScope } from "@gadgets/workshop-shared/api";
 import { backendVersion, getServerConfig } from "./deployment-config.js";
@@ -103,25 +103,92 @@ const CLI_ADMINS_ONLY =
 
 // =======================================================================================
 
+/**
+ * One WebSocket API connection, shared by every API authenticated on it: `close` closes it, and
+ * `signingOut` is true once a `signOut()` on it has begun. From then on no session watch closes it
+ * (another API on the connection has one too, which the sign-out ends), so the sign-out is answered;
+ * the sign-out closes it itself once it has been.
+ */
+type ApiConnection = { close(reason: Error): void; signingOut: boolean };
+
+// How long after a sign-out has been answered its connection is closed, so the answer reaches the
+// client first.
+const SIGN_OUT_CLOSE_DELAY_MS = 100;
+
+// When a sign-out's connection is closed whether or not it has been answered, so a user DO that
+// never answers cannot leave a dead session's APIs working on it. The user DO bounds the provider's
+// sign-out at SIGN_IN_END_TIMEOUT_MS, well inside this.
+const SIGN_OUT_CLOSE_DEADLINE_MS = 15_000;
+
 @validateRpc()
 class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
+  // `connection` is absent for a one-shot HTTP batch, which has none to close. `sessionSecret` is
+  // the secret half of the session token this API was authenticated with, which `signOut()` ends;
+  // absent for a Cloudflare Access session, which has no token. With both, the connection is closed
+  // once the session ends anywhere (#watchSession).
   constructor(private ctx: ExecutionContext, private env: Env,
       userId: DurableObjectId,
-      private abortSession: (reason: Error) => void,
+      private connection: ApiConnection | undefined,
       private via: AdminVia,
-      private accessSession?: { jwt: string; expiresAt: number }) {
+      private accessSession?: { jwt: string; expiresAt: number },
+      sessionSecret?: string) {
     super();
 
     this.#userId = userId;
+    this.#sessionSecret = sessionSecret;
     this.overseers = this.ctx.exports.OverseerDurableObject;
     this.users = this.ctx.exports.UserDurableObject;
+    if (sessionSecret !== undefined && connection) this.#watchSession(sessionSecret, connection);
   }
 
   private overseers: DurableObjectNamespace<OverseerDurableObject>;
   private users: DurableObjectNamespace<UserDurableObject>;
 
   #userId: DurableObjectId;
+  #sessionSecret?: string;
+  #sessionWatch?: Disposable;
+  #unwatched = false;
   #userSearchPolicyCache?: { expiresAt: number; promise: Promise<boolean> };
+
+  // Closes the connection once the session ends anywhere (UserDurableObject.watchSession): signed
+  // out from another connection, or ended by another connection's check of the sign-in behind it.
+  // A watch the user DO lost (it reset) is set up again, which finds a session that ended meanwhile.
+  // One that cannot be set up closes the connection, which its client treats as a reconnect.
+  #watchSession(secret: string, connection: ApiConnection): void {
+    let established = false;
+    let ended = Object.assign(() => {
+      if (this.#unwatched) return;
+      // Ended either way: a sign-out under way on the connection closes it once answered, and
+      // watching again would find no session and end at once, over and over.
+      this.#unwatched = true;
+      if (connection.signingOut) return;
+      connection.close(createAuthError(AUTH_ERROR_CODES.invalidSessionToken));
+    }, {
+      [Symbol.dispose]: () => {
+        if (established && !this.#unwatched && !connection.signingOut) this.#watchSession(secret, connection);
+      },
+    });
+    retryOnDoReset(() => this.#user.watchSession(secret, ended)).then(watch => {
+      established = true;
+      if (this.#unwatched) watch[Symbol.dispose]();
+      else this.#sessionWatch = watch;
+    }, (error: unknown) => {
+      if (this.#unwatched) return;
+      this.#unwatched = true;
+      logger.warn("could not watch the session; closing the connection", { event: "session.watch.failed", error });
+      connection.close(new Error("could not watch the session"));
+    });
+  }
+
+  #unwatch(): void {
+    this.#unwatched = true;
+    this.#sessionWatch?.[Symbol.dispose]();
+    this.#sessionWatch = undefined;
+  }
+
+  [Symbol.dispose](): void {
+    this.#unwatch();
+  }
 
   #userSearchEnabled(): Promise<boolean> {
     let cached = this.#userSearchPolicyCache;
@@ -170,6 +237,33 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     if (!(await this.#userSearchEnabled())) return [];
     return retryOnDoReset(() => this.ctx.exports.UserDirectoryDurableObject.getByName("")
         .searchUsers(query, [this.#userId.name!, ...excludeIds]));
+  }
+  async signOut(): Promise<void> {
+    let secret = this.#sessionSecret;
+    if (secret === undefined) return;
+    // This connection ends its own session, so no watch on it (this API's, or another API's on the
+    // same connection) may close it under this call. Once it has been answered the connection is
+    // closed, so nothing authenticated with the session goes on working on it; its client
+    // reconnects signed out.
+    let connection = this.connection;
+    this.#unwatch();
+    let close = () => connection?.close(createAuthError(AUTH_ERROR_CODES.invalidSessionToken));
+    if (connection) {
+      connection.signingOut = true;
+      setTimeout(close, SIGN_OUT_CLOSE_DEADLINE_MS);
+    }
+    try {
+      await this.#user.signOut(secret);
+    } catch (error) {
+      // Native RPC from the user DO keeps the message but not the code; the client reads the code.
+      if (error instanceof Error &&
+          error.message === SIGN_OUT_ERROR_MESSAGES[SIGN_OUT_ERROR_CODES.providerSignOutFailed]) {
+        throw createSignOutError(SIGN_OUT_ERROR_CODES.providerSignOutFailed);
+      }
+      throw error;
+    } finally {
+      if (connection) setTimeout(close, SIGN_OUT_CLOSE_DELAY_MS);
+    }
   }
   changePassword(oldHash: Uint8Array, newHash: Uint8Array): Promise<void> {
     return this.#user.changePassword(oldHash, newHash);
@@ -365,7 +459,7 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
       if (started && !closed) {
         // this.ctx.abort() would be nicer here, but it is still marked experimental in the
         // workers runtime.
-        this.abortSession(new Error(`lost connection to workspace DO (gadget ${id})`));
+        this.connection?.close(new Error(`lost connection to workspace DO (gadget ${id})`));
       }
     }
 
@@ -769,14 +863,18 @@ class LoginAttemptImpl extends RpcTarget implements LoginAttempt {
 class PublicApiImpl extends RpcTarget implements PublicApi {
   users: DurableObjectNamespace<UserDurableObject>;
 
+  // `abortSession` closes the connection; absent for a one-shot HTTP batch, which has none.
   constructor(private ctx: ExecutionContext, private env: Env,
-      private abortSession: (reason: Error) => void,
+      abortSession: ((reason: Error) => void) | undefined,
       private accessSession: { payload: JWTPayload; jwt: string } | undefined,
       private cliAdminsOnly: boolean,
       private via: AdminVia) {
     super();
     this.users = this.ctx.exports.UserDurableObject;
+    this.#connection = abortSession ? { close: abortSession, signingOut: false } : undefined;
   }
+
+  #connection: ApiConnection | undefined;
 
   // With `cliAdminsOnly` (`cf-os api` on a deployment, see the /api route), refuses the call unless
   // it signs in as a deployment admin, `user`. Every method calls it, the sign-ins once they know who
@@ -797,7 +895,7 @@ class PublicApiImpl extends RpcTarget implements PublicApi {
     return getServerConfig(this.env);
   }
 
-  async startGatekeeperLogin(vendorId: string)
+  async startGatekeeperLogin(vendorId: string, options?: { chooseAccount?: boolean })
       : Promise<{ url: string; nonce: string; attempt: RpcStub<LoginAttempt> }> {
     if (!getAuthGatekeeperAllowlist(this.env).includes(vendorId)) {
       throw new Error(`Sign-in via "${vendorId}" is not enabled on this deployment.`);
@@ -823,16 +921,25 @@ class PublicApiImpl extends RpcTarget implements PublicApi {
     // Mark the attempt as started before the gatekeeper can deliver to it, so receive() answers null
     // while it is still running instead of reporting it expired.
     await pending.begin();
-    const callback = this.ctx.exports.LoginConnectCallbackImpl(
-        { props: { pendingId: pendingId.toString(), vendorId, subject: desc.providesSubject === true } });
+    // A subject vendor that can keep its provider sign-in (FAC-300) is asked to, explicitly: its
+    // sign-in account then backs the session. A vendor that cannot is never asked, and one that is
+    // not asked keeps nothing, so neither side of a deploy skew leaves a provider session no
+    // Workshop session holds.
+    const keeps = desc.providesSubject === true && desc.keepsSignIn === true;
+    const callback = this.ctx.exports.LoginConnectCallbackImpl({ props: {
+      pendingId: pendingId.toString(), vendorId, subject: desc.providesSubject === true,
+      ...(keeps ? { keeps: true } : {}),
+    } });
     // For most providers, sign-in needs only minimal scopes to verify the user's email (the grant is
     // transient); capability scopes are requested later via an explicit connectAccount. Cloudflare is
     // the exception: signing in with Cloudflare also links AI Gateway billing, so it requests and
     // persists the billing-only scope set up front.
-    const options = vendorId === CLOUDFLARE_VENDOR_ID
+    const chooseAccount = desc.chooseAccountLabel && typeof options?.chooseAccount === "boolean"
+      ? { chooseAccount: options.chooseAccount } : {};
+    const connectOptions = vendorId === CLOUDFLARE_VENDOR_ID
       ? { scopes: "full" as const, resourceUrlPatterns: [] }
-      : { scopes: "auth" as const };
-    const { url } = await vendor.connectAccount(callback, options);
+      : { scopes: "auth" as const, ...(keeps ? { keepSignIn: true } : {}), ...chooseAccount };
+    const { url } = await vendor.connectAccount(callback, connectOptions);
     // @ts-expect-error Cap'n Web RPC stubs and native RPC targets are compatible but the type
     //     system doesn't know this.
     return { url, nonce: secret.toHex(), attempt: new LoginAttemptImpl(pending) };
@@ -861,7 +968,8 @@ class PublicApiImpl extends RpcTarget implements PublicApi {
       user_id: userId.toString(),
       source: "session_token",
     });
-    return new AuthenticatedApiImpl(this.ctx, this.env, userId, this.abortSession, this.via);
+    return new AuthenticatedApiImpl(this.ctx, this.env, userId, this.#connection, this.via,
+        undefined, split[1]);
   }
 
   async authenticateFromCfAccess(): Promise<AuthenticatedApi> {
@@ -887,7 +995,7 @@ class PublicApiImpl extends RpcTarget implements PublicApi {
       user_id: userId.toString(),
       source: "cf_access",
     });
-    return new AuthenticatedApiImpl(this.ctx, this.env, userId, this.abortSession, this.via,
+    return new AuthenticatedApiImpl(this.ctx, this.env, userId, this.#connection, this.via,
         { jwt: this.accessSession.jwt, expiresAt: (this.accessSession.payload.exp ?? 0) * 1000 });
   }
 
@@ -1105,8 +1213,10 @@ export default {
       let local = env.WORKSHOP_ENVIRONMENT === "development" || env.WORKSHOP_ENVIRONMENT === "test";
       let cli = CF_OS_CLI_USER_AGENT.test(req.headers.get("User-Agent") ?? "");
 
+      // Only a WebSocket session has a connection to close (an HTTP batch ends with its response).
+      let connected = req.headers.get("Upgrade")?.toLowerCase() === "websocket";
       return await newWorkersRpcResponse(req,
-          new PublicApiImpl(ctx, env, abortSession, accessSession,
+          new PublicApiImpl(ctx, env, connected ? abortSession : undefined, accessSession,
               !local && cli, cli ? "cli" : "api"),
           { abortSignal: abortController.signal });
     }

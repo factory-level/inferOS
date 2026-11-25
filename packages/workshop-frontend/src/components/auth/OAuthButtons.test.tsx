@@ -404,3 +404,94 @@ describe('OAuthButtons', () => {
     expect(receive).toHaveBeenCalledTimes(2)
   })
 })
+
+// FAC-300: one Google sign-in through InferLab. The button names no product, and a vendor with an
+// account chooser asks for it only when the person picks another account or has just signed out.
+describe('OAuthButtons with an account chooser', () => {
+  let root: Root | undefined
+  let container: HTMLDivElement | undefined
+  const INFERLAB: AuthVendorInfo = {
+    vendorId: 'inferlab', displayName: 'InferLab', logo: { url: 'data:image/svg+xml,il' },
+    signInLabel: 'Sign in with Google', chooseAccountLabel: 'Use a different Google account',
+  }
+  const receive = vi.fn<() => Promise<string | null>>()
+  const attempt = { receive, [Symbol.dispose]() {} } as unknown as RpcStub<LoginAttempt>
+  const startGatekeeperLogin = vi.fn<(vendorId: string, options?: { chooseAccount?: boolean }) =>
+    Promise<{ url: string; nonce: string; attempt: RpcStub<LoginAttempt> }>>(
+    async () => ({ url: URL, nonce: NONCE, attempt }))
+  const rpcStub = { startGatekeeperLogin, confirmLogin: async () => {} } as unknown as RpcStub<PublicApi>
+
+  function mount(vendors: AuthVendorInfo[] = [INFERLAB]) {
+    container = document.createElement('div')
+    document.body.appendChild(container)
+    root = createRoot(container)
+    act(() => root!.render(<OAuthButtons rpcStub={rpcStub} vendors={vendors} onSuccess={() => {}} />))
+  }
+
+  const buttons = () => [...container!.querySelectorAll('button')]
+  const click = (label: string) => act(async () => {
+    buttons().find(b => b.textContent === label)!.click()
+  })
+
+  beforeEach(() => {
+    vi.useFakeTimers()
+    vi.stubGlobal('location', { origin: 'https://workshop.example' })
+    vi.spyOn(window, 'open').mockReturnValue(fakePopup() as unknown as Window)
+  })
+
+  afterEach(() => {
+    act(() => root?.unmount())
+    container?.remove()
+    vi.restoreAllMocks()
+    vi.unstubAllGlobals()
+    vi.useRealTimers()
+    receive.mockReset()
+    startGatekeeperLogin.mockClear()
+    localStorage.clear()
+  })
+
+  it('reads "Sign in with Google" and offers a different Google account, naming no product', () => {
+    mount()
+    expect(buttons().map(b => b.textContent)).toEqual(['Sign in with Google', 'Use a different Google account'])
+    expect(container!.textContent).not.toContain('InferLab')
+    // The vendor's own mark is a product's: a vendor that names its button shows none.
+    expect(container!.querySelector('img')).toBeNull()
+  })
+
+  it('asks to reuse a live sign-in by default', async () => {
+    receive.mockResolvedValue(null)
+    mount()
+    await click('Sign in with Google')
+    await settle()
+    expect(startGatekeeperLogin).toHaveBeenCalledExactlyOnceWith('inferlab', { chooseAccount: false })
+  })
+
+  it('asks for the chooser for a different account', async () => {
+    receive.mockResolvedValue(null)
+    mount()
+    await click('Use a different Google account')
+    await settle()
+    expect(startGatekeeperLogin).toHaveBeenCalledExactlyOnceWith('inferlab', { chooseAccount: true })
+  })
+
+  it('asks for the chooser after a sign-out, and stops asking once a sign-in succeeds', async () => {
+    localStorage.setItem('auth.chooseAccountNext', '1')
+    receive.mockResolvedValueOnce(TOKEN)
+    mount()
+    await click('Sign in with Google')
+    await settle()
+    await tick()
+    expect(startGatekeeperLogin).toHaveBeenCalledExactlyOnceWith('inferlab', { chooseAccount: true })
+    expect(localStorage.getItem('authToken')).toBe(TOKEN)
+    expect(localStorage.getItem('auth.chooseAccountNext')).toBeNull()
+  })
+
+  it('keeps "Continue with" and passes no chooser option for a vendor without one', async () => {
+    receive.mockResolvedValue(null)
+    mount([{ vendorId: 'github', displayName: 'GitHub' }])
+    expect(buttons().map(b => b.textContent)).toEqual(['Continue with GitHub'])
+    await click('Continue with GitHub')
+    await settle()
+    expect(startGatekeeperLogin).toHaveBeenCalledExactlyOnceWith('github', undefined)
+  })
+})

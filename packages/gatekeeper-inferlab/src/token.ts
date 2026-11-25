@@ -1,6 +1,9 @@
-// The code exchange with InferLab central-auth (`POST /auth/token`) and the logout that follows it.
-// Ported from the archived fork's `custom-gatekeepers/gatekeeper-inferops/src/inferlab-login.ts`
-// (24f5d885), sign-in only: no workspace list, no stored session, no InferOps API call.
+// The code exchange with InferLab central-auth (`POST /auth/token`), and what happens to the session
+// it opens: ended at once for a transient sign-in (`POST /auth/logout`), or kept for a sign-in the
+// Workshop asked to keep (FAC-300), which is refreshed to check it (`POST /auth/refresh`) and ended
+// everywhere on sign-out (`POST /auth/sign-out`). Ported from the archived fork's
+// `custom-gatekeepers/gatekeeper-inferops/src/inferlab-login.ts` (24f5d885), sign-in only: no
+// workspace list, no InferOps API call, and no access token kept.
 
 import { type InferLabOriginLike, inferLabFetch, originOf } from "@gadgets/gatekeeper-kit/inferlab-edge";
 import { readTextCapped } from "@gadgets/gatekeeper-kit/response-body";
@@ -11,6 +14,18 @@ export const INFERLAB_CLIENT_ID = "inferos";
 
 const EXCHANGE_TIMEOUT_MS = 30_000;
 const LOGOUT_TIMEOUT_MS = 10_000;
+const REFRESH_TIMEOUT_MS = 10_000;
+/** How long a sign-out everywhere may take: a person is waiting on it. */
+const SIGN_OUT_TIMEOUT_MS = 5_000;
+/**
+ * How long a kept sign-in's session is held after it was last confirmed live (FAC-300), matching the
+ * Workshop's own session lifetime (`SESSION_LIFETIME_MS`); then its attempt object ends it. InferLab
+ * ends the session sooner on its own: 30 days after sign-in however often it is refreshed
+ * (`refreshTtl`, absolute), and after 7 days without a refresh (`idleTimeout`). The hold only bounds
+ * how long a dead token lingers here. Here rather than in worker.ts, whose exports are entrypoints
+ * only.
+ */
+export const KEPT_SIGN_IN_LIFETIME_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_TOKEN_RESPONSE_BYTES = 256 * 1024;
 /** OpenID Connect's rule for `sub`, which the InferLab contract adopts. */
 const SUBJECT = /^[\x21-\x7e]{1,255}$/;
@@ -21,7 +36,10 @@ export type SignedIn = {
   tenantId: string;
   /** Present only when InferLab vouches for it (`emailVerified: true`). Display data. */
   email?: string;
-  /** Only to end the session at once; never stored. */
+  /**
+   * Ended at once for a transient sign-in; for a kept one, stored in its attempt's Durable Object
+   * and nowhere else, and never handed to the Workshop.
+   */
   refreshToken: string;
 };
 
@@ -115,5 +133,58 @@ function errorCode(body: string): string | null {
     return typeof error === "string" ? error : null;
   } catch {
     return null;
+  }
+}
+
+/** The outcome of a refresh: the rotated refresh token, or the session's end (401). */
+export type Refreshed = { refreshToken: string } | { ended: true };
+
+/**
+ * Refreshes a kept session (`POST /auth/refresh`, which rotates the refresh token). A 401 is the
+ * session's end: signed out anywhere, revoked or expired. Anything else that isn't a rotation
+ * throws, and says nothing about the session. The access token InferLab returns is not kept.
+ */
+export async function refreshSession(target: InferLabOriginLike, refreshToken: string): Promise<Refreshed> {
+  const response = await inferLabFetch(target)(`${originOf(target)}/auth/refresh`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify({ refreshToken }),
+    redirect: "manual",
+    signal: AbortSignal.timeout(REFRESH_TIMEOUT_MS),
+  });
+  const body = await readTextCapped(response, MAX_TOKEN_RESPONSE_BYTES);
+  if (response.status === 401) return { ended: true };
+  if (!response.ok) throw new Error(`InferLab refresh failed (HTTP ${response.status}).`);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    throw new Error("InferLab returned an unreadable refresh.");
+  }
+  const rotated = (parsed ?? {}) as { refreshToken?: unknown };
+  if (typeof rotated.refreshToken !== "string" || !rotated.refreshToken) {
+    throw new Error("InferLab returned an incomplete refresh.");
+  }
+  return { refreshToken: rotated.refreshToken };
+}
+
+/**
+ * Ends the person's InferLab sign-in everywhere: every central-auth session of theirs, across every
+ * company, and every session under them, the one `refreshToken` names included (`POST
+ * /auth/sign-out`, idempotent, 204). A 401 (that session had already ended) counts as done. Throws
+ * when InferLab could not be reached within SIGN_OUT_TIMEOUT_MS or refused for any other reason,
+ * since a sign-out that did not happen must not read as done.
+ */
+export async function signOutEverywhere(target: InferLabOriginLike, refreshToken: string): Promise<void> {
+  const response = await inferLabFetch(target)(`${originOf(target)}/auth/sign-out`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ refreshToken }),
+    redirect: "manual",
+    signal: AbortSignal.timeout(SIGN_OUT_TIMEOUT_MS),
+  });
+  await response.body?.cancel();
+  if (!response.ok && response.status !== 401) {
+    throw new Error(`InferLab refused to sign out (HTTP ${response.status}).`);
   }
 }
