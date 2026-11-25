@@ -45,6 +45,8 @@ const logger = createLogger<LogFields>({
 });
 
 const SESSION_TIMEOUT_MS = 30_000;
+/** How long a sign-out everywhere (`POST /auth/sign-out`) may take: a person is waiting on it. */
+const SIGN_OUT_TIMEOUT_MS = 5_000;
 const MAX_RESPONSE_BYTES = 256 * 1024;
 const CALLBACK_KEY = "callback";
 const IDENTITY_KEY = "identity";
@@ -127,13 +129,13 @@ export function grantFromRefreshResponse(body: string): InferOpsGrant {
 }
 
 async function postSession(origin: string, path: string, refreshToken: string,
-                           fetcher: typeof fetch): Promise<Response> {
+                           fetcher: typeof fetch, timeoutMs = SESSION_TIMEOUT_MS): Promise<Response> {
   return fetcher(`${origin}${path}`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "application/json" },
     body: JSON.stringify({ refreshToken }),
     redirect: "manual",
-    signal: AbortSignal.timeout(SESSION_TIMEOUT_MS),
+    signal: AbortSignal.timeout(timeoutMs),
   });
 }
 
@@ -176,12 +178,12 @@ export async function logoutInferLabSession(origin: string, refreshToken: string
 /**
  * Ends the person's InferLab sign-in everywhere: every central-auth session of theirs and every
  * session under them, the one `refreshToken` names included (`POST /auth/sign-out`, idempotent).
- * Throws when InferLab could not be reached or refused for any reason but an already-dead session
- * (401), since a sign-out that did not happen must not read as done.
+ * Throws when InferLab could not be reached in SIGN_OUT_TIMEOUT_MS or refused for any reason but an
+ * already-dead session (401), since a sign-out that did not happen must not read as done.
  */
 export async function signOutInferLabEverywhere(origin: string, refreshToken: string,
                                                 fetcher: typeof fetch): Promise<void> {
-  const response = await postSession(origin, "/auth/sign-out", refreshToken, fetcher);
+  const response = await postSession(origin, "/auth/sign-out", refreshToken, fetcher, SIGN_OUT_TIMEOUT_MS);
   await response.body?.cancel();
   if (!response.ok && response.status !== 401) {
     logger.warn("InferLab sign-out failed", { event: "session.sign_out.failed", status: response.status });

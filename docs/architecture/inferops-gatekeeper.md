@@ -1099,7 +1099,9 @@ included, and any sign-out ends it everywhere.
   closed with `invalidSessionToken`, so its client reconnects and is refused. Once a sign-out has
   begun on a connection, no watch closes it (another API on it, such as the blueprint page's, holds
   one too), so the sign-out is answered; 100 ms after the answer (or the failure), the sign-out
-  closes the connection itself, so the API it was called on stops working there too. A watch the
+  closes the connection itself, so the API it was called on stops working there too, and 15 seconds
+  after it began it closes it in any case, so a user DO that never answers cannot leave the dead
+  session's APIs working. A watch that fires during the sign-out ends without being set up again. A watch the
   user DO lost to a reset is set up again, which finds a session that ended meanwhile; one that
   cannot be set up closes the connection, which its client treats as a reconnect. An HTTP batch and the operate AG-UI endpoint
   have no connection to close and watch nothing. While at least one session is watched, a timer in
@@ -1113,12 +1115,14 @@ included, and any sign-out ends it everywhere.
 - **Sign-out.** `AuthenticatedApi.signOut()` (a Cloudflare Access session has nothing to end)
   calls `UserDurableObject.signOut(secret)`: it deletes the session, then every other session the
   same account backs, then calls the account's `endSignIn()` and marks its credentials expired
-  (only the account as it was before the call). When `endSignIn()` fails it throws after all that,
+  (only the account as it was before the call). `endSignIn()` is given 6 seconds
+  (`SIGN_IN_END_TIMEOUT_MS`; the gatekeeper's own `POST /auth/sign-out` has 5). When it fails or
+  does not answer in time it throws after all that,
   with `SIGN_OUT_ERROR_CODES.providerSignOutFailed` (the provider's own error is only logged), so a
   sign-out that did not reach InferLab never reads as done. The person's sign-in ends even when
   they have connected other InferOps accounts, since the sign-in identity is one person.
   `useAuth.logout` clears the token and the stub at once, sets `auth.chooseAccountNext`, and waits
-  up to 5 seconds for the answer. A failure or no answer shows a warning on the sign-in page
+  up to 8 seconds for the answer. A failure or no answer shows a warning on the sign-in page
   (`SignOutWarning`). With `providerSignOutFailed` it says the person is signed out of InferOS but
   InferLab couldn't sign them out everywhere; there is no retry, since the session that could reach
   the account is gone, so it says to sign out from another InferLab app instead. Any other failure,
@@ -1142,9 +1146,16 @@ included, and any sign-out ends it everywhere.
   the login callback links the account and mints the Workshop session as soon as InferLab answers,
   before the popup's `confirmLogin` redeems it; an unconfirmed sign-in leaves that account linked
   and that session in storage until it expires or a sign-out ends it, though no browser holds the
-  token. This is accepted: the session is unreachable without the ticket the popup holds, and moving
+  token. It also replaces the grant of an account already linked for the person (revoking the old
+  one), and creates the Workshop account when there is none and signups are open. This is accepted: the session is unreachable without the ticket the popup holds, and moving
   the link and the mint behind `confirmLogin` would rework the login callback and `PendingLogin`
   for every vendor.
+- **Rotation and call volume.** Each check of a backing sign-in (`checkSignIn`, at most every 5
+  minutes per session while it is used or watched) refreshes the InferLab session, which rotates its
+  refresh token; an open connection is re-checked by the user DO each minute, so a person with
+  InferOS open rotates their InferOps account's token about every 5 minutes. `authenticate` calls on
+  one connection are bounded only by the connection's lifetime: each starts a watch of its own,
+  which ends with its API stub or the connection.
 - **Sessions from before this change.** A session record without `backing` (a password sign-in,
   a sign-in through any other vendor, or an InferOps sign-in from before FAC-300) is never
   re-checked, and lives until 30 days after its `created`. Since every session now expires, a

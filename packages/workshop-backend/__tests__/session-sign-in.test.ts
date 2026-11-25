@@ -37,7 +37,7 @@ type SessionRecord = {
 type AccountRecord = { id: number; vendorId: string; credentialsExpired?: boolean };
 // What a test reaches into a user DO for.
 type Internals = {
-  sessionWatches: { counts: Map<string, number>; timer: unknown; intervalMs: number };
+  sessionWatches: { counts: Map<string, number>; timer: unknown; intervalMs: number; requested: number };
   ctx: DurableObjectState & { exports: Exports };
   storage: {
     sessions: { list(): Iterable<SessionRecord>; get(id: string): SessionRecord | undefined; put(r: SessionRecord): void };
@@ -373,6 +373,21 @@ describe("signing out", () => {
     expect((await accounts(first.name))[0]!.credentialsExpired).toBe(true);
   });
 
+  it("treats a provider sign-out that does not answer in time as failed", { timeout: 30_000 }, async () => {
+    const { name, secret, key } = await signIn(person());
+    await hold(key);
+    try {
+      const failure = await env.TEST_USER.getByName(name).signOut(secret)
+        .then(() => null, (error: Error) => error.message);
+
+      expect(failure).toBe(SIGN_OUT_ERROR_MESSAGES[SIGN_OUT_ERROR_CODES.providerSignOutFailed]);
+      expect(await authenticate(name, secret)).toBe("invalid session token");
+      expect((await accounts(name))[0]!.credentialsExpired).toBe(true);
+    } finally {
+      await release(key);
+    }
+  });
+
   it("ends a session no sign-in backs without asking any account", async () => {
     const { name, key } = await signIn(person());
     const secret = await plantSession(name, { created: new Date(), expiresAt: new Date(Date.now() + DAY) });
@@ -466,6 +481,11 @@ describe("signing out on a connection (FAC-300)", () => {
     await expect.poll(() => callsOf(key)).toEqual(["endSignIn"]);
     // The session is gone and the other API's watch has fired while InferLab is still being asked.
     await expect.poll(() => sessions(name)).toEqual([]);
+    // That watch ended rather than being set up again, which would find no session and end at once,
+    // over and over, for as long as InferLab is asked.
+    const requested = await inUser(name, ({ sessionWatches }) => sessionWatches.requested);
+    await new Promise(resolve => setTimeout(resolve, 300));
+    expect(await inUser(name, ({ sessionWatches }) => sessionWatches.requested)).toBe(requested);
     await release(key);
 
     expect(await outcome).toBe("done");

@@ -467,7 +467,11 @@ export const SIGN_OUT_ERROR_CODES = {
 /** An expected sign-out failure code. */
 export type SignOutErrorCode = typeof SIGN_OUT_ERROR_CODES[keyof typeof SIGN_OUT_ERROR_CODES];
 
-/** Messages for sign-out failures, as the codes are created with. */
+/**
+ * Messages for sign-out failures, as the codes are created with. The text is load-bearing: native
+ * RPC from a Durable Object keeps an error's message but not its code, so the Workshop matches the
+ * message to restore the code before the client sees it. Change it only with that match.
+ */
 export const SIGN_OUT_ERROR_MESSAGES: Record<SignOutErrorCode, string> = {
   [SIGN_OUT_ERROR_CODES.providerSignOutFailed]: "The sign-in provider could not end the sign-in everywhere.",
 };

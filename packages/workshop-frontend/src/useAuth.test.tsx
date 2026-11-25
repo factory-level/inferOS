@@ -341,7 +341,7 @@ describe('useAuth sign-out', () => {
     expect(events).toEqual(['signOut'])
 
 
-    await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
+    await act(async () => { await vi.advanceTimersByTimeAsync(8000) })
     expect(events).toEqual(['signOut', 'dispose'])
     // Unanswered is not done: the sign-in page says so, naming no provider it knows nothing of.
     expect(document.body.textContent).toContain(UNCONFIRMED)

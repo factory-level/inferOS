@@ -11,7 +11,7 @@ const CF_ACCESS_MODE = import.meta.env.VITE_CF_ACCESS_MODE === 'true'
 
 // How long logout waits for the server to end the session before disposing the stub anyway, and
 // reporting that the sign-out may not have reached InferLab.
-const SIGN_OUT_TIMEOUT_MS = 5000
+const SIGN_OUT_TIMEOUT_MS = 8000
 
 interface AuthState {
   token: string | null

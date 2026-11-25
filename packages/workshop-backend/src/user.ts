@@ -369,6 +369,14 @@ export const SIGN_IN_CHECK_INTERVAL_MS = 5 * 60 * 1000;
 /** How long after a backing sign-in could not answer `authenticate` waits before asking again. */
 export const SIGN_IN_RETRY_INTERVAL_MS = 60 * 1000;
 
+/**
+ * How long `signOut` waits for a backing account's `endSignIn()` before treating the provider's
+ * sign-out as failed (`SIGN_OUT_ERROR_CODES.providerSignOutFailed`): a person is waiting on it. A
+ * little over the InferOps gatekeeper's own 5-second bound, so its answer wins when it has one, and
+ * inside the frontend's 8-second wait, so the person is told the provider's sign-out failed.
+ */
+export const SIGN_IN_END_TIMEOUT_MS = 6_000;
+
 /** How long a session a sign-in backs stands without that sign-in confirmed live (fail closed). */
 export const SIGN_IN_UNCONFIRMED_LIMIT_MS = 24 * 60 * 60 * 1000;
 
@@ -867,6 +875,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     let sessions = this.storage.sessions;
     let callback = ended.dup();  // keep the stub after return
     let done = false;
+    this.sessionWatches.requested++;
     let watches = this.sessionWatches.counts;
     let subscriber = {
       add() {},
@@ -905,7 +914,8 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   // The token ids of the sessions open connections watch, each with its number of watches, the
-  // timer that re-checks them, armed only while there is at least one, and its interval. A watch
+  // timer that re-checks them, armed only while there is at least one, its interval, and how many
+  // watches have been asked for in all (`requested`, which tests read). A watch
   // exists only while a connection holds it, so an idle user costs nothing; a reset drops all of
   // it, and the connections watch again (AuthenticatedApiImpl), which arms the timer again. Not
   // `#`-private, so a test can read it and shorten `intervalMs` (session-sign-in.test.ts); RPC
@@ -914,7 +924,8 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     counts: Map<string, number>;
     timer: ReturnType<typeof setTimeout> | undefined;
     intervalMs: number;
-  } = { counts: new Map(), timer: undefined, intervalMs: SESSION_RECHECK_INTERVAL_MS };
+    requested: number;
+  } = { counts: new Map(), timer: undefined, intervalMs: SESSION_RECHECK_INTERVAL_MS, requested: 0 };
 
   #startRechecks(): void {
     let watches = this.sessionWatches;
@@ -950,8 +961,9 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
    * Ends the session `token` names (see AuthenticatedApi.signOut). When a provider sign-in backs it,
    * that sign-in is ended everywhere through its account, which also ends every other session of
    * this account it backs. The sessions are gone, and the account is marked expired, whether or not
-   * the provider could end its sign-in; when it could not, this throws, so a sign-out that did not
-   * reach the provider never reads as done.
+   * the provider could end its sign-in; when it could not, or did not answer within
+   * SIGN_IN_END_TIMEOUT_MS, this throws, so a sign-out that did not reach the provider never reads as
+   * done.
    */
   async signOut(token: string): Promise<void> {
     let tokenId = await sessionTokenId(token);
@@ -968,7 +980,17 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     let failed = false;
     try {
       // A stub has every method; this narrows the optional one GatekeeperUser declares.
-      if (typeof account.endSignIn === "function") await account.endSignIn();
+      if (typeof account.endSignIn === "function") {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        let timedOut = new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error("the provider's sign-out did not answer in time")), SIGN_IN_END_TIMEOUT_MS);
+        });
+        try {
+          await Promise.race([account.endSignIn(), timedOut]);
+        } finally {
+          clearTimeout(timer);
+        }
+      }
     } catch (error) {
       logger.error("could not end the sign-in backing a session", {
         event: "session.sign_in.end.failed", accountId, error,

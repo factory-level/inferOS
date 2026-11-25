@@ -125,6 +125,11 @@ type ApiConnection = { close(reason: Error): void; signingOut: boolean };
 // client first (as OverseerImpl.scheduleAccessRestart delays its abort).
 const SIGN_OUT_CLOSE_DELAY_MS = 100;
 
+// When a sign-out's connection is closed whether or not it has been answered, so a user DO that
+// never answers cannot leave a dead session's APIs working on it. The user DO bounds the provider's
+// sign-out at SIGN_IN_END_TIMEOUT_MS, well inside this.
+const SIGN_OUT_CLOSE_DEADLINE_MS = 15_000;
+
 @validateRpc()
 class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   // `sessionSecret` is the secret half of the session token this API was authenticated with, which
@@ -162,12 +167,15 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   #watchSession(secret: string, connection: ApiConnection): void {
     let established = false;
     let ended = Object.assign(() => {
-      if (this.#unwatched || connection.signingOut) return;
+      if (this.#unwatched) return;
+      // Ended either way: the sign-out under way on the connection closes it once answered, and
+      // watching again would find no session and end at once, over and over.
       this.#unwatched = true;
+      if (connection.signingOut) return;
       connection.close(createAuthError(AUTH_ERROR_CODES.invalidSessionToken));
     }, {
       [Symbol.dispose]: () => {
-        if (established && !this.#unwatched) this.#watchSession(secret, connection);
+        if (established && !this.#unwatched && !connection.signingOut) this.#watchSession(secret, connection);
       },
     });
     retryOnDoReset(() => this.#user.watchSession(secret, ended)).then(watch => {
@@ -254,7 +262,11 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     // reconnects signed out.
     let connection = this.connection;
     this.#unwatch();
-    if (connection) connection.signingOut = true;
+    let close = () => connection?.close(createAuthError(AUTH_ERROR_CODES.invalidSessionToken));
+    if (connection) {
+      connection.signingOut = true;
+      setTimeout(close, SIGN_OUT_CLOSE_DEADLINE_MS);
+    }
     try {
       await this.#user.signOut(secret);
     } catch (error) {
@@ -264,9 +276,7 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
       }
       throw error;
     } finally {
-      if (connection) {
-        setTimeout(() => connection.close(createAuthError(AUTH_ERROR_CODES.invalidSessionToken)), SIGN_OUT_CLOSE_DELAY_MS);
-      }
+      if (connection) setTimeout(close, SIGN_OUT_CLOSE_DELAY_MS);
     }
   }
   changePassword(oldHash: Uint8Array, newHash: Uint8Array): Promise<void> {
