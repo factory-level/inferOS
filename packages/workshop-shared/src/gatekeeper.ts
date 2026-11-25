@@ -84,11 +84,11 @@ export type VendorDescription = {
 
   /**
    * True if this vendor's sign-in also connects the account it signs in with, and the provider
-   * sign-in behind that account backs the Workshop session (FAC-300): the Workshop requests full
-   * scopes for the sign-in, persists the account as a connect would, checks that sign-in through
-   * `GatekeeperUser.checkSignIn()` and ends it through `GatekeeperUser.endSignIn()`, which such a
-   * vendor's accounts must implement. Only meaningful with `providesSubject`. Defaults to false: a
-   * sign-in grant is transient.
+   * sign-in behind that account backs the Workshop session (FAC-300): the Workshop asks for it with
+   * `GatekeeperConnectOptions.connect`, persists the account as a connect would, checks that sign-in
+   * through `GatekeeperUser.checkSignIn()` and ends it through `GatekeeperUser.endSignIn()`, which
+   * such a vendor's accounts must implement. A sign-in without `connect` stays transient, as for any
+   * other vendor. Only meaningful with `providesSubject`. Defaults to false.
    */
   signInConnects?: boolean;
 
@@ -627,6 +627,13 @@ export type GatekeeperConnectOptions = {
    * falling back to its normal sign-in when there is none. Unset leaves the vendor's default.
    */
   chooseAccount?: boolean;
+  /**
+   * Only for a vendor that declares `VendorDescription.signInConnects`: the sign-in connects the
+   * account it signs in with, as a connect does, and its provider sign-in is kept. Without it a
+   * sign-in (`scopes: "auth"`) is transient and keeps nothing, so a Workshop that predates
+   * `signInConnects` is never handed an account it would not hold.
+   */
+  connect?: boolean;
 };
 
 /**

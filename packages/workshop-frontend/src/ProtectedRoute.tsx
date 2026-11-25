@@ -12,7 +12,7 @@ interface ProtectedRouteProps {
 }
 
 export default function ProtectedRoute({ children, rpcStub }: ProtectedRouteProps) {
-  const { isAuthenticated, authenticatedApi, accountKey, isLoading, error, logout, login } = useAuth(rpcStub)
+  const { isAuthenticated, authenticatedApi, accountKey, isLoading, error, logout, login, signOutFailed, dismissSignOutWarning } = useAuth(rpcStub)
 
   const handleLoginSuccess = () => {
     // Trigger re-authentication by calling login with stored token
@@ -90,7 +90,8 @@ export default function ProtectedRoute({ children, rpcStub }: ProtectedRouteProp
         </div>
       )
     }
-    return <LoginPage rpcStub={rpcStub} onLoginSuccess={handleLoginSuccess} />
+    return <LoginPage rpcStub={rpcStub} onLoginSuccess={handleLoginSuccess}
+      signOutFailed={signOutFailed} onDismissSignOutWarning={dismissSignOutWarning} />
   }
 
   return (

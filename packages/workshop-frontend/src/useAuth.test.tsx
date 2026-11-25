@@ -9,6 +9,7 @@ import { AUTH_ERROR_CODES, createAuthError, type PublicApi, type AiChatAuthorInf
 import { setReportedUserId } from './errorReporting'
 import { useAuth } from './useAuth'
 import { getDevLoginToken } from './features/auth/devLogin'
+import SignOutWarning, { SIGN_OUT_INCOMPLETE_TITLE } from './features/auth/SignOutWarning'
 
 vi.mock('./features/auth/devLogin', () => ({ getDevLoginToken: vi.fn<typeof getDevLoginToken>(async () => null) }))
 
@@ -65,7 +66,7 @@ function deferredPublicApi(): {
   }
 }
 
-type Controls = { login: (token: string) => void; logout: () => void }
+type Controls = { login: (token: string) => void; logout: () => Promise<void> }
 
 describe('useAuth error reporting identity', () => {
   const roots: Root[] = []
@@ -152,7 +153,7 @@ describe('useAuth error reporting identity', () => {
     localStorage.setItem('authToken', 'stored-token')
     const { controls } = await mount(stubPublicApi(person))
 
-    act(() => controls.logout())
+    act(() => { void controls.logout() })
 
     expect(setReportedUserId).toHaveBeenLastCalledWith(undefined)
   })
@@ -162,7 +163,7 @@ describe('useAuth error reporting identity', () => {
     const { api, release } = deferredPublicApi()
     const { controls } = await mount(api)
 
-    act(() => controls.logout())
+    act(() => { void controls.logout() })
     expect(setReportedUserId).toHaveBeenLastCalledWith(undefined)
 
     // Disposing the stub is not a defence: capnweb does not guarantee that disposal rejects a call
@@ -260,7 +261,7 @@ describe('useAuth error reporting identity', () => {
     vi.mocked(getDevLoginToken).mockReturnValue(new Promise<string>(done => { resolve = done }))
     localStorage.removeItem('authToken')
     const { controls: second } = await mount(stubPublicApi(person))
-    act(() => second.logout())
+    act(() => { void second.logout() })
     await act(async () => resolve('late-token'))
     expect(localStorage.getItem('authToken')).toBeNull()
     expect(containers[1].textContent).toBe('Signed out')
@@ -292,12 +293,16 @@ describe('useAuth sign-out', () => {
     return { api, events }
   }
 
+  /** Renders the warning as the sign-in page does, after the signed-in state. */
   async function mountWith(api: RpcStub<PublicApi>): Promise<Controls> {
     const captured: { controls?: Controls } = {}
     function Consumer() {
-      const { login, logout, isAuthenticated } = useAuth(api)
+      const { login, logout, isAuthenticated, signOutFailed, dismissSignOutWarning } = useAuth(api)
       useEffect(() => { captured.controls = { login, logout } })
-      return <p>{isAuthenticated ? 'Signed in' : 'Signed out'}</p>
+      return <>
+        <p>{isAuthenticated ? 'Signed in' : 'Signed out'}</p>
+        {signOutFailed && <SignOutWarning onDismiss={dismissSignOutWarning} />}
+      </>
     }
     const container = document.createElement('div')
     document.body.append(container)
@@ -318,6 +323,7 @@ describe('useAuth sign-out', () => {
     expect(localStorage.getItem('authToken')).toBeNull()
     expect(localStorage.getItem('auth.chooseAccountNext')).toBe('1')
     expect(document.body.textContent).toBe('Signed out')
+    expect(document.body.textContent).not.toContain(SIGN_OUT_INCOMPLETE_TITLE)
   })
 
   it('signs out in the browser at once even when the server never answers, and disposes after a timeout', async () => {
@@ -326,24 +332,55 @@ describe('useAuth sign-out', () => {
     const { api, events } = signOutApi(() => new Promise<void>(() => {}))
     const controls = await mountWith(api)
 
-    await act(async () => controls.logout())
+    await act(async () => { void controls.logout() })
     expect(document.body.textContent).toBe('Signed out')
     expect(localStorage.getItem('authToken')).toBeNull()
     expect(events).toEqual(['signOut'])
 
+    expect(document.body.textContent).not.toContain(SIGN_OUT_INCOMPLETE_TITLE)
+
     await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
     expect(events).toEqual(['signOut', 'dispose'])
+    // Unanswered is not done: the sign-in page says so.
+    expect(document.body.textContent).toContain(SIGN_OUT_INCOMPLETE_TITLE)
   })
 
-  it('signs out in the browser when the server refuses', async () => {
+  it('signs out in the browser when the server refuses, and warns that InferLab may still be signed in', async () => {
     localStorage.setItem('authToken', 'stored-token')
-    const { api, events } = signOutApi(async () => { throw new Error('Peer closed WebSocket') })
+    const { api, events } = signOutApi(async () => { throw new Error('InferLab refused to sign out (HTTP 500).') })
     const controls = await mountWith(api)
 
     await act(async () => controls.logout())
 
     expect(events).toEqual(['signOut', 'dispose'])
     expect(localStorage.getItem('authToken')).toBeNull()
-    expect(document.body.textContent).toBe('Signed out')
+    expect(document.body.textContent).toContain('Signed out')
+    const warning = document.querySelector('[role="status"]')
+    expect(warning?.textContent).toContain(SIGN_OUT_INCOMPLETE_TITLE)
+    expect(warning?.textContent).toContain('sign out from another InferLab app')
+
+    // Non-blocking: it can be dismissed, and a new sign-in clears it too.
+    const dismiss = [...warning!.querySelectorAll('button')].find(b => b.textContent === 'Dismiss')!
+    await act(async () => dismiss.click())
+    expect(document.body.textContent).not.toContain(SIGN_OUT_INCOMPLETE_TITLE)
+
+    await act(async () => controls.login('stored-token'))
+    await act(async () => controls.logout())
+    expect(document.body.textContent).toContain(SIGN_OUT_INCOMPLETE_TITLE)
+    await act(async () => controls.login('fresh-token'))
+    expect(document.body.textContent).not.toContain(SIGN_OUT_INCOMPLETE_TITLE)
+  })
+
+  it('does not warn about a sign-out a newer sign-in has superseded', async () => {
+    let refuse!: (error: Error) => void
+    localStorage.setItem('authToken', 'stored-token')
+    const { api } = signOutApi(() => new Promise<void>((_, reject) => { refuse = reject }))
+    const controls = await mountWith(api)
+
+    await act(async () => { void controls.logout() })
+    await act(async () => controls.login('fresh-token'))
+    await act(async () => refuse(new Error('InferLab refused to sign out (HTTP 500).')))
+
+    expect(document.body.textContent).not.toContain(SIGN_OUT_INCOMPLETE_TITLE)
   })
 })

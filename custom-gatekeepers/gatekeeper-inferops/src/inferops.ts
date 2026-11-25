@@ -87,8 +87,9 @@ import { GovernedRequestError, listGoverned, parseGovernedListRequest } from "@g
 //   InferOps account can open that project.
 //
 // - Identity: when INFERLAB_AUTH_ORIGIN is set the vendor provides authentication ("Sign in with
-//   Google", FAC-300), and its sign-in also connects the account: the same InferLab PKCE flow as a
-//   connect from the Gatekeepers page (inferlab-login.ts). A connected account is backed by the
+//   Google", FAC-300), and its sign-in also connects the account when the Workshop asks for that
+//   (`connect`): the same InferLab PKCE flow as a connect from the Gatekeepers page
+//   (inferlab-login.ts). A connected account is backed by the
 //   person's own InferLab session, held in its `InferOpsCredentials` object (inferops-credentials.ts), and
 //   every request it makes carries that person's token and one of their workspaces. Auto-provisioned
 //   accounts exist only while no auth origin is configured: they carry no identity and serve demo
@@ -172,6 +173,7 @@ import {
 } from "./workflow-policy";
 import {
   InferLabLogin, handleInferLabLogin, inferLabAuthOrigin, inferOpsApiEndpoint, startInferLabLogin,
+  type LoginPurpose,
 } from "./inferlab-login";
 import {
   CHATBOT_DOT_RESOURCE, DEMO_HOST, INFEROPS_ACCOUNT_RESOURCE, KNOWLEDGE_WIKI_RESOURCE, OBJECT_TABLE_RESOURCE,
@@ -829,8 +831,10 @@ export class GatekeeperVendor extends WorkerEntrypoint<Cloudflare.Env> {
   }
 
   /**
-   * Every flow is an InferLab sign-in that connects an account backed by the person's own session:
-   * the vendor declares `signInConnects`, so `scopes` changes nothing (FAC-300). `chooseAccount:
+   * Every flow is an InferLab sign-in. A connect, or a sign-in the Workshop asks to connect
+   * (`connect`; the vendor declares `signInConnects`, FAC-300), connects an account backed by the
+   * person's own session; `scopes: "auth"` alone, from a Workshop that predates that, is a transient
+   * sign-in that hands back only the principal and verified email. For a connect, `chooseAccount:
    * false` asks InferLab to reuse a sign-in the browser holds (`prompt=none`), falling back to the
    * normal sign-in; anything else asks for the account chooser (inferlab-login.ts). Without an
    * InferLab origin the demo account is provided automatically and there is no flow at all.
@@ -838,7 +842,9 @@ export class GatekeeperVendor extends WorkerEntrypoint<Cloudflare.Env> {
   async connectAccount(callback: Fetcher<GatekeeperConnectCallback>,
                        options?: GatekeeperConnectOptions): Promise<{ url: string }> {
     if (inferLabAuthOrigin(this.env) === null) throw new Error(NO_CONNECT_FLOW);
-    const purpose = { kind: "connect" as const, silent: options?.chooseAccount === false };
+    const purpose: LoginPurpose = options?.scopes === "auth" && options.connect !== true
+      ? { kind: "signin" }
+      : { kind: "connect", silent: options?.chooseAccount === false };
     return startInferLabLogin(this.ctx.exports.InferLabLogin, this.env, purpose, callback);
   }
 

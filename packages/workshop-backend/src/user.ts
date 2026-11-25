@@ -28,7 +28,7 @@ import { subjectAccountName, type SubjectBinding } from "./account-subject";
 export const SIGNS_IN_THROUGH_SUBJECT = "This account signs in with InferOps. Use InferOps sign-in.";
 /** A subject's sign-in reached an account bound to another (never expected; the directory decides). */
 const SUBJECT_MISMATCH = "This account belongs to another sign-in.";
-import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
+import { DurableObject, WorkerEntrypoint, RpcStub as NativeRpcStub, RpcTarget as NativeRpcTarget } from "cloudflare:workers";
 import { createTypedStorage, collection } from "@gadgets/typed-storage";
 import { recordAnalytics } from "./analytics";
 import { createWorkshopLogger } from "./observability";
@@ -351,9 +351,10 @@ type LoginSessionRecord = {
   // SESSION_LIFETIME_MS after `created`, like a new one that is never renewed.
   expiresAt?: Date,
   // The connected account whose provider sign-in backs this session (VendorDescription
-  // .signInConnects), and when that sign-in was last confirmed live: each confirmation renews
-  // `expiresAt`, and a sign-in confirmed ended, or an account gone, ends the session.
-  backing?: { accountId: number, checkedAt: Date },
+  // .signInConnects), when that sign-in was last confirmed live, and when asking it last failed:
+  // each confirmation renews `expiresAt`, and a sign-in confirmed ended, an account gone, or a day
+  // without a confirmation ends the session.
+  backing?: { accountId: number, checkedAt: Date, failedAt?: Date },
 }
 
 /**
@@ -365,11 +366,52 @@ export const SESSION_LIFETIME_MS = 30 * 24 * 60 * 60 * 1000;
 /** How long a backing sign-in's last confirmation stands before `authenticate` asks again. */
 export const SIGN_IN_CHECK_INTERVAL_MS = 5 * 60 * 1000;
 
+/** How long after a backing sign-in could not answer `authenticate` waits before asking again. */
+export const SIGN_IN_RETRY_INTERVAL_MS = 60 * 1000;
+
+/** How long a session a sign-in backs stands without that sign-in confirmed live (fail closed). */
+export const SIGN_IN_UNCONFIRMED_LIMIT_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * How often the user DO re-checks the sessions an open connection watches (watchSession), while at
+ * least one is watched. Each re-check is `authenticate`'s, so a backing sign-in is still asked at
+ * most every SIGN_IN_CHECK_INTERVAL_MS: a sign-out elsewhere closes an open connection within about
+ * that interval plus this one.
+ */
+export const SESSION_RECHECK_INTERVAL_MS = 60 * 1000;
+
 /** The account a sign-in that connects hands over (VendorDescription.signInConnects): it backs the session. */
 export type SignInConnection = { account: Fetcher<GatekeeperUser>, vendorId: string, expiresAt?: Date };
 
-/** The parts of a sign-in account `authenticate` and `signOut` call (VendorDescription.signInConnects). */
-type SignInAccount = Required<Pick<GatekeeperUser, "checkSignIn" | "endSignIn">>;
+/** The id a session token's record is stored under, or null for a token that is not Base64. */
+async function sessionTokenId(token: string): Promise<string | null> {
+  let tokenBytes: Uint8Array;
+  try {
+    tokenBytes = Uint8Array.fromBase64(token);
+  } catch {
+    return null;
+  }
+  return hashSecret(tokenBytes);
+}
+
+/** A watch on a session (UserDurableObject.watchSession), which disposing stops. */
+class SessionWatch extends NativeRpcTarget {
+  #stop: () => void;
+
+  constructor(stop: () => void) {
+    super();
+    this.#stop = stop;
+  }
+
+  [Symbol.dispose](): void {
+    this.#stop();
+  }
+}
+
+/** Whether connected account provenance `asked` still names the account as it is now (`now`). */
+function sameAccount(asked: HostBoardAccount | null, now: HostBoardAccount | null): boolean {
+  return asked !== null && now !== null && asked.incarnation === now.incarnation && asked.epoch === now.epoch;
+}
 
 // Blueprint record stored in the user's `blueprints` collection.
 type BlueprintUserRecord = {
@@ -726,16 +768,9 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   async authenticate(token: string): Promise<void> {
-    let tokenBytes: Uint8Array;
-    try {
-      tokenBytes = Uint8Array.fromBase64(token);
-    } catch {
-      // A corrupt (non-Base64) token must classify as an auth failure like any other bad token,
-      // not surface as the decoder's SyntaxError.
-      throw createAuthError(AUTH_ERROR_CODES.invalidSessionToken);
-    }
-    let tokenId = await hashSecret(tokenBytes);
-    let session = this.storage.sessions.get(tokenId);
+    // A corrupt (non-Base64) token classifies as an auth failure like any other bad token.
+    let tokenId = await sessionTokenId(token);
+    let session = tokenId === null ? undefined : this.storage.sessions.get(tokenId);
     if (!session || !await this.#sessionLive(session)) {
       throw createAuthError(AUTH_ERROR_CODES.invalidSessionToken);
     }
@@ -743,78 +778,200 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   // Whether `session` may still be used, ending it (deleting its record) when not: past its expiry,
-  // or backed by a sign-in that has ended. A backing sign-in is asked at most every
-  // SIGN_IN_CHECK_INTERVAL_MS; a provider that cannot answer leaves the session as it is, and is
-  // asked again next time.
+  // or backed by a sign-in that has ended (#checkSignIn). A backing sign-in is asked at most every
+  // SIGN_IN_CHECK_INTERVAL_MS. One that cannot answer leaves the session standing, and is asked
+  // again no sooner than SIGN_IN_RETRY_INTERVAL_MS later, until SIGN_IN_UNCONFIRMED_LIMIT_MS has
+  // passed since it was last confirmed live: the session ends then (fail closed).
   async #sessionLive(session: LoginSessionRecord): Promise<boolean> {
     let now = Date.now();
     let expiresAt = session.expiresAt?.getTime() ?? session.created.getTime() + SESSION_LIFETIME_MS;
     let live = now < expiresAt;
     let backing = session.backing;
     if (live && backing && now - backing.checkedAt.getTime() >= SIGN_IN_CHECK_INTERVAL_MS) {
-      let record = this.storage.connectedAccounts.get(backing.accountId);
-      let answer: boolean | null;
-      if (!record || record.credentialsExpired) {
-        answer = false;
-      } else {
-        try {
-          answer = await (record.account as unknown as SignInAccount).checkSignIn();
-        } catch (error) {
-          logger.warn("could not check the sign-in backing a session", {
-            event: "session.sign_in.check.failed", accountId: backing.accountId, error,
-          });
-          answer = null;
-        }
-      }
-      if (answer === false) {
-        live = false;
-        if (record) await this.markCredentialsExpired(backing.accountId);
-      } else if (answer === true) {
-        // Renewed only while the record still exists: a sign-out that ran meanwhile stands.
-        if (this.storage.sessions.get(session.tokenId)) {
+      let retrying = backing.failedAt !== undefined && now - backing.failedAt.getTime() < SIGN_IN_RETRY_INTERVAL_MS;
+      let answer = retrying ? null : await this.#checkSignIn(backing.accountId);
+      // Rewritten only while the record still exists: a sign-out that ran meanwhile stands.
+      let current = this.storage.sessions.get(session.tokenId);
+      if (answer === true) {
+        if (current) {
           this.storage.sessions.put({
-            ...session, expiresAt: new Date(now + SESSION_LIFETIME_MS),
-            backing: { ...backing, checkedAt: new Date(now) },
+            ...current, expiresAt: new Date(now + SESSION_LIFETIME_MS),
+            backing: { accountId: backing.accountId, checkedAt: new Date(now) },
           });
         }
+      } else if (answer === false || now - backing.checkedAt.getTime() >= SIGN_IN_UNCONFIRMED_LIMIT_MS) {
+        live = false;
+      } else if (!retrying && current?.backing) {
+        this.storage.sessions.put({ ...current, backing: { ...current.backing, failedAt: new Date(now) } });
       }
     }
     if (!live) this.storage.sessions.delete(session.tokenId);
     return live;
   }
 
+  // Asks whether the sign-in backing connected account `accountId` is still live: false when it has
+  // ended, or the account is gone or expired (before or while it is asked), and null when the
+  // provider could not answer or the account changed (a reconnect, a fresh sign-in) while it was
+  // asked, so the answer is about a grant it no longer holds. An ended sign-in ends every session it backs, and marks the account expired.
+  async #checkSignIn(accountId: number): Promise<boolean | null> {
+    let record = this.storage.connectedAccounts.get(accountId);
+    if (!record || record.credentialsExpired) {
+      this.#endBackedSessions(accountId);
+      return false;
+    }
+    let asked = accountProvenance(this.storage, accountId);
+    const account = record.account;
+    // A stub has every method; this narrows the optional one GatekeeperUser declares.
+    if (typeof account.checkSignIn !== "function") return null;
+    let answer: boolean;
+    try {
+      answer = await account.checkSignIn();
+    } catch (error) {
+      logger.warn("could not check the sign-in backing a session", {
+        event: "session.sign_in.check.failed", accountId, error,
+      });
+      return null;
+    }
+    let now = accountProvenance(this.storage, accountId);
+    if (now === null) {
+      // Disconnected while it was asked: nothing backs the session any more.
+      this.#endBackedSessions(accountId);
+      return false;
+    }
+    if (!sameAccount(asked, now)) return null;
+    if (answer === false) {
+      this.#endBackedSessions(accountId);
+      await this.markCredentialsExpired(accountId);
+    }
+    return answer;
+  }
+
+  // Ends every session the sign-in behind connected account `accountId` backs. Each connection
+  // authenticated with one is closed (watchSession).
+  #endBackedSessions(accountId: number): void {
+    for (let session of Array.from(this.storage.sessions.list())) {
+      if (session.backing?.accountId === accountId) this.storage.sessions.delete(session.tokenId);
+    }
+  }
+
+  /**
+   * Calls `ended` once the session `token` names has ended: signed out, or found expired or ended by
+   * `authenticate`, from any connection. Called at once when there is no such session. Disposing the
+   * returned handle stops watching without calling it. AuthenticatedApiImpl closes its connection
+   * when called, so a session ended anywhere stops working everywhere it is open. While any session
+   * is watched it is re-checked every SESSION_RECHECK_INTERVAL_MS (recheckWatchedSessions), so a
+   * sign-out in another app reaches an open connection though nobody authenticates again.
+   */
+  async watchSession(token: string, ended: NativeRpcStub<() => void>): Promise<SessionWatch> {
+    let tokenId = await sessionTokenId(token);
+    let sessions = this.storage.sessions;
+    let callback = ended.dup();  // keep the stub after return
+    let done = false;
+    let watches = this.#watchedSessions;
+    let subscriber = {
+      add() {},
+      update() {},
+      remove(record: LoginSessionRecord) {
+        if (record.tokenId === tokenId) finish(true);
+      },
+    };
+    // Runs inside the write that ended the session, so it must not throw.
+    let finish = (call: boolean) => {
+      if (done) return;
+      done = true;
+      sessions.unsubscribe(subscriber);
+      if (tokenId !== null) {
+        let count = (watches.get(tokenId) ?? 1) - 1;
+        if (count > 0) watches.set(tokenId, count);
+        else watches.delete(tokenId);
+      }
+      if (watches.size === 0) this.#stopRechecks();
+      if (!call) {
+        callback[Symbol.dispose]();
+        return;
+      }
+      callback().catch((error: unknown) => {
+        logger.warn("could not close a connection whose session ended", { event: "session.watch.notify.failed", error });
+      }).finally(() => callback[Symbol.dispose]());
+    };
+    if (tokenId === null || !sessions.get(tokenId)) {
+      finish(true);
+    } else {
+      watches.set(tokenId, (watches.get(tokenId) ?? 0) + 1);
+      sessions.subscribe(subscriber);
+      this.#startRechecks();
+    }
+    return new SessionWatch(() => finish(false));
+  }
+
+  // The token ids of the sessions open connections watch, each with its number of watches, and the
+  // timer that re-checks them, armed only while there is at least one. A watch exists only while a
+  // connection holds it, so an idle user costs nothing; a reset drops both, and the connections
+  // watch again (AuthenticatedApiImpl), which arms the timer again.
+  #watchedSessions = new Map<string, number>();
+  #recheckTimer: ReturnType<typeof setTimeout> | undefined;
+
+  #startRechecks(): void {
+    if (this.#recheckTimer !== undefined) return;
+    this.#recheckTimer = setTimeout(() => {
+      this.#recheckTimer = undefined;
+      this.recheckWatchedSessions().catch((error: unknown) => {
+        logger.warn("could not re-check watched sessions", { event: "session.recheck.failed", error });
+      }).finally(() => {
+        if (this.#watchedSessions.size > 0) this.#startRechecks();
+      });
+    }, SESSION_RECHECK_INTERVAL_MS);
+  }
+
+  #stopRechecks(): void {
+    clearTimeout(this.#recheckTimer);
+    this.#recheckTimer = undefined;
+  }
+
+  /**
+   * Runs `authenticate`'s check on every session an open connection watches, ending (and so closing
+   * the connections of) each that is no longer live: past its expiry, or backed by a sign-in that
+   * has ended, with the same interval, back-off and one-day limit. The re-check timer calls it.
+   */
+  async recheckWatchedSessions(): Promise<void> {
+    for (let tokenId of Array.from(this.#watchedSessions.keys())) {
+      let session = this.storage.sessions.get(tokenId);
+      if (session) await this.#sessionLive(session);
+    }
+  }
+
   /**
    * Ends the session `token` names (see AuthenticatedApi.signOut). When a provider sign-in backs it,
    * that sign-in is ended everywhere through its account, which also ends every other session of
-   * this account it backs. Ending the sign-in is best effort: the session record is gone first.
+   * this account it backs. The sessions are gone, and the account is marked expired, whether or not
+   * the provider could end its sign-in; when it could not, this throws, so a sign-out that did not
+   * reach the provider never reads as done.
    */
   async signOut(token: string): Promise<void> {
-    let tokenBytes: Uint8Array;
-    try {
-      tokenBytes = Uint8Array.fromBase64(token);
-    } catch {
-      return;
-    }
-    let tokenId = await hashSecret(tokenBytes);
-    let session = this.storage.sessions.get(tokenId);
+    let tokenId = await sessionTokenId(token);
+    let session = tokenId === null ? undefined : this.storage.sessions.get(tokenId);
     if (!session) return;
-    this.storage.sessions.delete(tokenId);
+    this.storage.sessions.delete(session.tokenId);
     let accountId = session.backing?.accountId;
     if (accountId === undefined) return;
-    for (let other of Array.from(this.storage.sessions.list())) {
-      if (other.backing?.accountId === accountId) this.storage.sessions.delete(other.tokenId);
-    }
+    this.#endBackedSessions(accountId);
     let record = this.storage.connectedAccounts.get(accountId);
     if (!record) return;
+    let asked = accountProvenance(this.storage, accountId);
+    const account = record.account;
+    let failure: { error: unknown } | null = null;
     try {
-      await (record.account as unknown as SignInAccount).endSignIn();
+      // A stub has every method; this narrows the optional one GatekeeperUser declares.
+      if (typeof account.endSignIn === "function") await account.endSignIn();
     } catch (error) {
       logger.error("could not end the sign-in backing a session", {
         event: "session.sign_in.end.failed", accountId, error,
       });
-      return;
+      failure = { error };
     }
-    if (this.storage.connectedAccounts.get(accountId)) await this.markCredentialsExpired(accountId);
+    // Only the account as it was: one a fresh sign-in replaced meanwhile holds a live grant.
+    if (sameAccount(asked, accountProvenance(this.storage, accountId))) await this.markCredentialsExpired(accountId);
+    if (failure) throw failure.error;
   }
 
   /**

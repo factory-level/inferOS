@@ -1,13 +1,19 @@
 // A Workshop session's life (FAC-300): every session expires, a session a provider sign-in backs
 // (a vendor that declares `signInConnects`, like InferOps) lives only while that sign-in does, and
-// signing out ends the session, the sign-in behind it everywhere, and every other session it backs.
-// Through the real login callback and user DO, with a sign-in account that stands in for InferOps'.
+// signing out ends the session, the sign-in behind it everywhere, and every other session it backs,
+// and closes every connection authenticated with one of them. Through the real login callback, user
+// DO and API Worker, with a sign-in account that stands in for InferOps'.
 import { describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
-import { runInDurableObject } from "cloudflare:test";
+import { createExecutionContext, runInDurableObject } from "cloudflare:test";
+import { newWebSocketRpcSession, type RpcStub } from "capnweb";
+import type { PublicApi } from "@gadgets/workshop-shared/api";
+import server from "../src/server.js";
 import type { PendingLogin } from "../src/auth/login-flow.js";
 import type { UserDurableObject } from "../src/user.js";
-import { SESSION_LIFETIME_MS, SIGN_IN_CHECK_INTERVAL_MS } from "../src/user.js";
+import {
+  SESSION_LIFETIME_MS, SIGN_IN_CHECK_INTERVAL_MS, SIGN_IN_RETRY_INTERVAL_MS, SIGN_IN_UNCONFIRMED_LIMIT_MS,
+} from "../src/user.js";
 import type { UserDirectoryDurableObject } from "../src/user-directory.js";
 import type { FakeSignInAccount, TestLoginCallback } from "./test-worker.js";
 
@@ -26,7 +32,7 @@ type Exports = {
     Fetcher<TestLoginCallback>;
 };
 type SessionRecord = {
-  tokenId: string; created: Date; expiresAt?: Date; backing?: { accountId: number; checkedAt: Date };
+  tokenId: string; created: Date; expiresAt?: Date; backing?: { accountId: number; checkedAt: Date; failedAt?: Date };
 };
 type AccountRecord = { id: number; vendorId: string; credentialsExpired?: boolean };
 // What a test reaches into a user DO for.
@@ -83,6 +89,8 @@ function account(key: string, body: (stub: Fetcher<FakeSignInAccount>) => Promis
 }
 const callsOf = async (key: string) => await account(key, stub => stub.calls()) as string[];
 const answer = (key: string, value: "live" | "ended" | "down") => account(key, stub => stub.setAnswer(value));
+const hold = (key: string) => account(key, stub => stub.hold());
+const release = (key: string) => account(key, stub => stub.release());
 
 /** "accepted", or the refusal's message, caught on the call itself (see account-subject.test.ts). */
 const authenticate = (name: string, secret: string) =>
@@ -108,6 +116,46 @@ const plantSession = (name: string, record: { created: Date; expiresAt?: Date })
   storage.sessions.put({ tokenId, ...record });
   return secret.toBase64();
 });
+
+/** Moves every backed session's last failed check `ageMs` into the past. */
+const ageFailures = (name: string, ageMs: number) => inUser(name, ({ storage }) => {
+  for (const session of Array.from(storage.sessions.list())) {
+    if (session.backing?.failedAt) {
+      storage.sessions.put({ ...session, backing: { ...session.backing, failedAt: new Date(Date.now() - ageMs) } });
+    }
+  }
+});
+
+/**
+ * A WebSocket API session with the Worker, sharing the test's execution context. This project binds
+ * no AdminSettings Durable Object, so the bundled-blueprint install the first API request starts
+ * finds one that reports it done.
+ */
+async function connect(): Promise<RpcStub<PublicApi>> {
+  const base = createExecutionContext();
+  const adminSettings = { getByName: () => ({ ensureBundledBlueprintsInstalled: async () => true }) };
+  const exports = new Proxy(base.exports, {
+    get: (target, name) => name === "AdminSettings" ? adminSettings : Reflect.get(target, name),
+  });
+  const ctx = new Proxy(base, {
+    get: (target, name) => {
+      if (name === "exports") return exports;
+      const value = Reflect.get(target, name);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  const response = await server.fetch(new Request("https://workshop.example/api", {
+    headers: { Upgrade: "websocket" },
+  }), env as never, ctx);
+  expect(response.status).toBe(101);
+  const socket = response.webSocket;
+  if (!socket) throw new TypeError("Expected a WebSocket response.");
+  socket.accept();
+  return newWebSocketRpcSession<PublicApi>(socket);
+}
+
+/** "working" while a connection's API answers, or "refused" once it does not. */
+const state = (api: { whoami(): Promise<unknown> }) => api.whoami().then(() => "working", () => "refused");
 
 const DAY = 24 * 60 * 60 * 1000;
 
@@ -170,15 +218,86 @@ describe("a session a sign-in backs", () => {
     expect(await callsOf(key)).toEqual(["checkSignIn"]);
   });
 
-  it("stands when InferLab cannot answer, and asks again next time", async () => {
+  it("stands when InferLab cannot answer, and asks again no sooner than a minute later", async () => {
     const { name, secret, key } = await signIn(person());
     await answer(key, "down");
     await ageChecks(name, SIGN_IN_CHECK_INTERVAL_MS);
 
     expect(await authenticate(name, secret)).toBe("accepted");
     expect(await authenticate(name, secret)).toBe("accepted");
+    expect(await callsOf(key)).toEqual(["checkSignIn"]);
+
+    await ageFailures(name, SIGN_IN_RETRY_INTERVAL_MS);
+    expect(await authenticate(name, secret)).toBe("accepted");
     expect(await callsOf(key)).toEqual(["checkSignIn", "checkSignIn"]);
     expect((await accounts(name))[0]!.credentialsExpired).toBe(false);
+
+    // Answering again ends the backoff.
+    await answer(key, "live");
+    await ageFailures(name, SIGN_IN_RETRY_INTERVAL_MS);
+    expect(await authenticate(name, secret)).toBe("accepted");
+    expect((await sessions(name))[0]!.backing!.failedAt).toBeUndefined();
+  });
+
+  it("fails closed once a day has passed without the sign-in confirmed live", async () => {
+    const { name, secret, key } = await signIn(person());
+    await answer(key, "down");
+    await ageChecks(name, SIGN_IN_UNCONFIRMED_LIMIT_MS - 60_000);
+    expect(await authenticate(name, secret)).toBe("accepted");
+
+    // Inside the backoff too: an unanswered day ends the session without asking again.
+    await ageChecks(name, SIGN_IN_UNCONFIRMED_LIMIT_MS);
+    expect(await authenticate(name, secret)).toBe("invalid session token");
+    expect(await callsOf(key)).toEqual(["checkSignIn"]);
+    expect(await sessions(name)).toEqual([]);
+    // Unanswered is not ended: the account is not marked expired.
+    expect((await accounts(name))[0]!.credentialsExpired).toBe(false);
+  });
+
+  it("ends every session the sign-in backs once one check finds it ended", async () => {
+    const who = person();
+    const first = await signIn(who);
+    const second = await signIn(who);
+    await answer(second.key, "ended");
+    await ageChecks(first.name, SIGN_IN_CHECK_INTERVAL_MS);
+
+    expect(await authenticate(first.name, first.secret)).toBe("invalid session token");
+    expect(await sessions(first.name)).toEqual([]);
+    expect(await authenticate(second.name, second.secret)).toBe("invalid session token");
+  });
+
+  it("refuses the session, not the request, when its account vanishes while the sign-in is asked", async () => {
+    const { name, secret, key } = await signIn(person());
+    await answer(key, "ended");
+    await hold(key);
+    await ageChecks(name, SIGN_IN_CHECK_INTERVAL_MS);
+
+    const pending = authenticate(name, secret);
+    await expect.poll(() => callsOf(key)).toEqual(["checkSignIn"]);
+    await inUser(name, ({ storage }) => {
+      for (const record of Array.from(storage.connectedAccounts.list())) storage.connectedAccounts.delete(record.id);
+    });
+    await release(key);
+
+    expect(await pending).toBe("invalid session token");
+  });
+
+  it("keeps the account and the session when a fresh sign-in replaces the account while it is asked", async () => {
+    const who = person();
+    const first = await signIn(who);
+    await answer(first.key, "ended");
+    await hold(first.key);
+    await ageChecks(first.name, SIGN_IN_CHECK_INTERVAL_MS);
+
+    const pending = authenticate(first.name, first.secret);
+    await expect.poll(() => callsOf(first.key)).toEqual(["checkSignIn"]);
+    // The answer is about the grant the second sign-in replaced, and says nothing of the new one.
+    const second = await signIn(who);
+    await release(first.key);
+
+    expect(await pending).toBe("accepted");
+    expect((await accounts(first.name))[0]!.credentialsExpired).toBe(false);
+    expect(await authenticate(second.name, second.secret)).toBe("accepted");
   });
 
   it("ends when its account was disconnected, asking nothing", async () => {
@@ -236,6 +355,22 @@ describe("signing out", () => {
     expect(await authenticate(first.name, unbacked)).toBe("accepted");
   });
 
+  it("throws when the sign-in could not be ended everywhere, with the sessions already gone and the account expired", async () => {
+    const who = person();
+    const first = await signIn(who);
+    const second = await signIn(who);
+    await answer(second.key, "down");
+
+    const failure = await env.TEST_USER.getByName(first.name).signOut(first.secret)
+      .then(() => null, (error: Error) => error.message);
+
+    expect(failure).toContain("HTTP 503");
+    expect(await callsOf(second.key)).toEqual(["endSignIn"]);
+    expect(await authenticate(first.name, first.secret)).toBe("invalid session token");
+    expect(await authenticate(second.name, second.secret)).toBe("invalid session token");
+    expect((await accounts(first.name))[0]!.credentialsExpired).toBe(true);
+  });
+
   it("ends a session no sign-in backs without asking any account", async () => {
     const { name, key } = await signIn(person());
     const secret = await plantSession(name, { created: new Date(), expiresAt: new Date(Date.now() + DAY) });
@@ -244,5 +379,73 @@ describe("signing out", () => {
 
     expect(await authenticate(name, secret)).toBe("invalid session token");
     expect(await callsOf(key)).toEqual([]);
+  });
+});
+
+describe("a connection authenticated with a session (FAC-300)", () => {
+  it("stops working once a sign-out on another connection ends its session", async () => {
+    const who = person();
+    const first = await signIn(who);
+    const second = await signIn(who);
+    // A session no sign-in backs, which the sign-out leaves alone.
+    const unbacked = await plantSession(first.name, { created: new Date(), expiresAt: new Date(Date.now() + DAY) });
+    using firstConnection = await connect();
+    using secondConnection = await connect();
+    using thirdConnection = await connect();
+    using signingOut = await firstConnection.authenticate(`${first.name}:${first.secret}`);
+    using other = await secondConnection.authenticate(`${second.name}:${second.secret}`);
+    using bystander = await thirdConnection.authenticate(`${first.name}:${unbacked}`);
+    expect(await state(other)).toBe("working");
+
+    // The connection that signs out is answered, not closed under its own call.
+    await signingOut.signOut();
+
+    await expect.poll(() => state(other)).toBe("refused");
+    expect(await state(bystander)).toBe("working");
+    using again = await connect();
+    await expect(again.authenticate(`${second.name}:${second.secret}`)).rejects.toThrow("invalid session token");
+  });
+
+  it("stops working once another connection's check finds the sign-in behind it ended", async () => {
+    const { name, secret, key } = await signIn(person());
+    using watching = await connect();
+    using api = await watching.authenticate(`${name}:${secret}`);
+    expect(await state(api)).toBe("working");
+
+    await answer(key, "ended");
+    await ageChecks(name, SIGN_IN_CHECK_INTERVAL_MS);
+    expect(await authenticate(name, secret)).toBe("invalid session token");
+
+    await expect.poll(() => state(api)).toBe("refused");
+  });
+
+  it("closes once the sign-in behind it ended at InferLab, with nobody authenticating again", async () => {
+    const { name, secret, key } = await signIn(person());
+    using watching = await connect();
+    using api = await watching.authenticate(`${name}:${secret}`);
+    expect(await state(api)).toBe("working");
+    // Signed out in another InferLab app: only InferLab knows.
+    await answer(key, "ended");
+
+    // The re-check the timer runs (SESSION_RECHECK_INTERVAL_MS) asks nothing before the interval.
+    await env.TEST_USER.getByName(name).recheckWatchedSessions();
+    expect(await callsOf(key)).toEqual([]);
+    expect(await state(api)).toBe("working");
+
+    await ageChecks(name, SIGN_IN_CHECK_INTERVAL_MS);
+    await env.TEST_USER.getByName(name).recheckWatchedSessions();
+
+    expect(await callsOf(key)).toEqual(["checkSignIn"]);
+    await expect.poll(() => state(api)).toBe("refused");
+    expect(await sessions(name)).toEqual([]);
+    expect((await accounts(name))[0]!.credentialsExpired).toBe(true);
+  });
+
+  it("is refused at once when its session ended before the watch began", async () => {
+    const { name, secret } = await signIn(person());
+    using connection = await connect();
+    const api = connection.authenticate(`${name}:${secret}`);
+    await env.TEST_USER.getByName(name).signOut(secret);
+    await expect.poll(() => state(api)).toBe("refused");
   });
 });

@@ -116,10 +116,12 @@ type Env = Cloudflare.Env & {
 @validateRpc()
 class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   // `sessionSecret` is the secret half of the session token this API was authenticated with, which
-  // `signOut()` ends; absent for a Cloudflare Access session, which has no token.
+  // `signOut()` ends; absent for a Cloudflare Access session, which has no token. `abortSession`
+  // closes the connection; absent for a one-shot request, which has none. With both, the connection
+  // is closed once the session ends anywhere (#watchSession).
   constructor(private ctx: ExecutionContext, private env: Env,
       userId: DurableObjectId,
-      private abortSession: (reason: Error) => void,
+      private abortSession: ((reason: Error) => void) | undefined,
       sessionSecret?: string) {
     super();
 
@@ -128,6 +130,7 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     this.overseers = this.ctx.exports.OverseerDurableObject;
     this.adminSettings = this.ctx.exports.AdminSettings;
     this.users = this.ctx.exports.UserDurableObject;
+    if (sessionSecret !== undefined && abortSession) this.#watchSession(sessionSecret, abortSession);
   }
 
   private overseers: DurableObjectNamespace<OverseerDurableObject>;
@@ -136,7 +139,42 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
 
   #userId: DurableObjectId;
   #sessionSecret?: string;
+  #sessionWatch?: Disposable;
+  #unwatched = false;
   #userSearchPolicyCache?: { expiresAt: number; promise: Promise<boolean> };
+
+  // Closes the connection once the session ends anywhere (UserDurableObject.watchSession): signed
+  // out from another connection, or ended by another connection's check of the sign-in behind it.
+  // A watch the user DO lost (it reset) is set up again, which finds a session that ended meanwhile.
+  #watchSession(secret: string, abortSession: (reason: Error) => void): void {
+    let established = false;
+    let ended = Object.assign(() => {
+      if (this.#unwatched) return;
+      this.#unwatched = true;
+      abortSession(createAuthError(AUTH_ERROR_CODES.invalidSessionToken));
+    }, {
+      [Symbol.dispose]: () => {
+        if (established && !this.#unwatched) this.#watchSession(secret, abortSession);
+      },
+    });
+    retryOnDoReset(() => this.#user.watchSession(secret, ended)).then(watch => {
+      established = true;
+      if (this.#unwatched) watch[Symbol.dispose]();
+      else this.#sessionWatch = watch;
+    }, (error: unknown) => {
+      logger.warn("could not watch the session", { event: "session.watch.failed", error });
+    });
+  }
+
+  #unwatch(): void {
+    this.#unwatched = true;
+    this.#sessionWatch?.[Symbol.dispose]();
+    this.#sessionWatch = undefined;
+  }
+
+  [Symbol.dispose](): void {
+    this.#unwatch();
+  }
 
   #userSearchEnabled(): Promise<boolean> {
     let cached = this.#userSearchPolicyCache;
@@ -192,7 +230,10 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
         .searchUsers(query, [this.#userId.name!, ...excludeIds]));
   }
   async signOut(): Promise<void> {
-    if (this.#sessionSecret !== undefined) await this.#user.signOut(this.#sessionSecret);
+    if (this.#sessionSecret === undefined) return;
+    // This connection ends its own session, so its watch must not close it under this call.
+    this.#unwatch();
+    await this.#user.signOut(this.#sessionSecret);
   }
   changePassword(oldHash: Uint8Array, newHash: Uint8Array): Promise<void> {
     return this.#user.changePassword(oldHash, newHash);
@@ -336,7 +377,7 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
       if (started && !closed) {
         // this.ctx.abort() would be nicer here, but it is still marked experimental in the
         // workers runtime.
-        this.abortSession(new Error(`lost connection to workspace DO (gadget ${id})`));
+        this.abortSession?.(new Error(`lost connection to workspace DO (gadget ${id})`));
       }
     }
 
@@ -1392,8 +1433,10 @@ class LoginAttemptImpl extends RpcTarget implements LoginAttempt {
 class PublicApiImpl extends RpcTarget implements PublicApi {
   users: DurableObjectNamespace<UserDurableObject>;
 
+  // `abortSession` closes the connection; absent for a one-shot request (an HTTP batch, or the
+  // operate AG-UI endpoint), which has none to close.
   constructor(private ctx: ExecutionContext, private env: Env,
-      private abortSession: (reason: Error) => void,
+      private abortSession: ((reason: Error) => void) | undefined,
       private accessPayload?: JWTPayload) {
     super();
     this.users = this.ctx.exports.UserDurableObject;
@@ -1435,13 +1478,13 @@ class PublicApiImpl extends RpcTarget implements PublicApi {
     // For most providers, sign-in needs only minimal scopes to verify the user's email (the grant is
     // transient); capability scopes are requested later via an explicit connectAccount. Cloudflare is
     // the exception: signing in with Cloudflare also links AI Gateway billing, so it requests and
-    // persists the billing-only scope set up front. A vendor whose sign-in connects asks for its
-    // full scopes, as its connect would.
+    // persists the billing-only scope set up front. A vendor whose sign-in connects is asked to
+    // connect (`connect`), with its full scopes, as its connect would be.
     const chooseAccount = desc.chooseAccountLabel && typeof options?.chooseAccount === "boolean"
       ? { chooseAccount: options.chooseAccount } : {};
     const connectOptions = vendorId === CLOUDFLARE_VENDOR_ID
       ? { scopes: "full" as const, resourceUrlPatterns: [] }
-      : connects ? { scopes: "full" as const, ...chooseAccount } : { scopes: "auth" as const, ...chooseAccount };
+      : connects ? { scopes: "full" as const, connect: true, ...chooseAccount } : { scopes: "auth" as const, ...chooseAccount };
     const { url } = await vendor.connectAccount(callback, connectOptions);
     // @ts-expect-error Cap'n Web RPC stubs and native RPC targets are compatible but the type
     //     system doesn't know this.
@@ -1646,7 +1689,7 @@ export default {
 
       if (url.pathname === "/api/operate/agui" || url.pathname === "/api/operate/agui/console" || url.pathname === "/api/operate/agui/approval" || url.pathname === "/api/operate/agui/prepare") {
         return handleOperateAgui(req, async () => {
-          const api = new PublicApiImpl(ctx, env, () => {}, accessPayload);
+          const api = new PublicApiImpl(ctx, env, undefined, accessPayload);
           const authorization = req.headers.get("Authorization");
           if (authorization?.startsWith("Bearer ")) return api.authenticate(authorization.slice(7));
           if (accessPayload) return api.authenticateFromCfAccess();
@@ -1663,8 +1706,10 @@ export default {
         abortController.abort(reason);
       };
 
+      // Only a WebSocket session has a connection to close (an HTTP batch ends with its response).
+      let connected = req.headers.get("Upgrade")?.toLowerCase() === "websocket";
       return await newWorkersRpcResponse(req,
-          new PublicApiImpl(ctx, env, abortSession, accessPayload),
+          new PublicApiImpl(ctx, env, connected ? abortSession : undefined, accessPayload),
           { abortSignal: abortController.signal });
     }
 

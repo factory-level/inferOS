@@ -1,5 +1,5 @@
 // Sign in and connect with InferLab: the Workshop's gatekeeper flows (`connectAccount`, for a
-// sign-in and a connect alike, and `GatekeeperUser.reconnect`), backed by InferLab central-auth's
+// sign-in and a connect, and `GatekeeperUser.reconnect`), backed by InferLab central-auth's
 // authorization-code + PKCE server.
 //
 // - InferOS is the public client `inferos` (no secret). Its redirect URI is this gatekeeper's
@@ -10,7 +10,9 @@
 // - `/authorize` carries a `prompt`. The Workshop's sign-in (FAC-300) asks for `prompt=none`
 //   unless the person chose another account or just signed out: a live central-auth session in the
 //   browser then completes the popup with no page at all, and InferLab's `login_required` answer
-//   sends the popup on to a second, interactive leg with no prompt, which goes straight to Google.
+//   (or `interaction_required`, `consent_required`, `account_selection_required`: whatever stops a
+//   silent leg short of a page) sends the popup on to a second, interactive leg with no prompt,
+//   which goes straight to Google.
 //   Every other flow (a sign-in asking for the chooser, a connect from the Gatekeepers page, a
 //   reconnect) carries `prompt=select_account`, so the person picks which account.
 // - `InferLabLogin` is one short-lived Durable Object per attempt. It holds the flow's purpose, the
@@ -18,11 +20,15 @@
 //   deletes itself by alarm.
 // - The code is exchanged server-side (`POST /auth/token`). What happens to the session depends on
 //   the purpose:
-//   - A connect, which is also what signing in to InferOS is (the vendor declares
-//     `signInConnects`, FAC-300), stores the session in the account's `InferOpsCredentials` object,
-//     so the person's own authority backs every request the account makes, and the Workshop session
-//     the sign-in mints is backed by it (inferops-credentials.ts). The email is passed on only when
-//     InferLab marks it `emailVerified: true`.
+//   - A connect, which is also what signing in to InferOS is when the Workshop asks for it
+//     (`GatekeeperConnectOptions.connect`; the vendor declares `signInConnects`, FAC-300), stores
+//     the session in the account's `InferOpsCredentials` object, so the person's own authority backs
+//     every request the account makes, and the Workshop session the sign-in mints is backed by it
+//     (inferops-credentials.ts). The email is passed on only when InferLab marks it
+//     `emailVerified: true`.
+//   - A sign-in the Workshop did not ask to connect (`scopes: "auth"` alone, from a Workshop that
+//     predates `signInConnects`) keeps only the email and the principal; its session is signed out
+//     again at once, so it leaves no InferLab session behind.
 //   - A reconnect stages the session there until the Workshop commits it.
 //   Before either stores a session, the slugs of the person's workspaces are read from InferOps
 //   (`GET /workspaces`) and kept beside the memberships InferLab reported, since a resource URL
@@ -84,13 +90,23 @@ export type InferLabLoginEnv = {
 };
 
 /**
- * What an attempt is for. A connect (a sign-in, or a connect from the Gatekeepers page) mints a
- * persistent account backed by the person's session; `silent` asks InferLab to reuse a sign-in the
- * browser holds before showing any page. A reconnect replaces an existing account's session.
+ * What an attempt is for. A connect (a sign-in that connects, or a connect from the Gatekeepers
+ * page) mints a persistent account backed by the person's session; `silent` asks InferLab to reuse
+ * a sign-in the browser holds before showing any page. A transient sign-in hands the Workshop an
+ * account carrying only the principal and verified email, and ends its session. A reconnect
+ * replaces an existing account's session.
  */
 export type LoginPurpose =
   | { kind: "connect"; silent?: boolean }
+  | { kind: "signin" }
   | { kind: "reconnect"; accountId: string };
+
+/**
+ * The `error` answers to a `prompt=none` leg that mean only that InferLab needs a page (OpenID
+ * Connect Core 3.1.2.6): the attempt goes on to an interactive leg instead of ending.
+ */
+const NEEDS_INTERACTION = new Set(["login_required", "interaction_required", "consent_required",
+                                   "account_selection_required"]);
 
 /** The `prompt` an attempt's authorize leg carries; null for the interactive leg after `none`. */
 type Prompt = "none" | "select_account" | null;
@@ -291,7 +307,8 @@ export class InferLabLogin extends DurableObject<Cloudflare.Env> {
   }
 
   /**
-   * After InferLab answered a silent leg with `login_required` (no live sign-in in the browser):
+   * After InferLab answered a silent leg with `login_required` or another error that means it
+   * needs a page (NEEDS_INTERACTION):
    * trades its state nonce for an interactive leg's, which asks for no prompt. Returns null, and
    * leaves the attempt alone, for anything but a live silent leg.
    */
@@ -363,6 +380,17 @@ export class InferLabLogin extends DurableObject<Cloudflare.Env> {
                 callback: Fetcher<GatekeeperConnectCallback> | undefined): Promise<ConnectHandoff> {
     const credentials = this.ctx.exports.InferOpsCredentials as unknown as CredentialsNamespace;
     switch (purpose.kind) {
+      case "signin": {
+        if (!callback) throw new Error("This sign-in attempt has no callback.");
+        // Only the principal and a vouched email are kept: the session itself is ended, since this
+        // sign-in grants nothing. The Workshop keys the account on the principal (ADR 0019), so an
+        // email InferLab doesn't vouch for (after an email change, say) is simply not passed on.
+        const email = exchange.emailVerified ? exchange.identity.email : undefined;
+        await logoutInferLabSession(origin, exchange.grant.refreshToken, inferLabFetch(this.env));
+        return callback.complete(this.#account({
+          accountId: crypto.randomUUID(), ...(email ? { email } : {}), subject: subjectOf(origin, exchange),
+        }));
+      }
       case "connect": {
         // A sign-in too (FAC-300): the session is kept, and the Workshop keys the account on the
         // principal (ADR 0019), so an email InferLab doesn't vouch for (after an email change, say)
@@ -560,7 +588,7 @@ export async function handleInferLabLogin(request: Request, env: InferLabLoginEn
 
     if (url.searchParams.has("error")) {
       // A silent leg InferLab could not complete without a page goes on to the interactive one.
-      if (url.searchParams.get("error") === "login_required") {
+      if (NEEDS_INTERACTION.has(url.searchParams.get("error") ?? "")) {
         const origin = inferLabAuthorizeOrigin(env);
         if (!origin) return notConfigured();
         const redirectUri = inferLabRedirectUri(env);

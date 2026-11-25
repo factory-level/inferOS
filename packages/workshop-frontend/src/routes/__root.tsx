@@ -25,7 +25,7 @@ export const Route = createRootRoute({
 function RootComponent() {
   const rpcStub = useRpcStub()
   const connectionLost = useConnectionLost()
-  const { isAuthenticated, authenticatedApi, accountKey, isLoading, error, logout, login } = useAuth(rpcStub)
+  const { isAuthenticated, authenticatedApi, accountKey, isLoading, error, logout, login, signOutFailed, dismissSignOutWarning } = useAuth(rpcStub)
   const pathname = useRouterState({ select: (s) => s.location.pathname })
 
   // Routes that don't require auth (public routes)
@@ -88,7 +88,8 @@ function RootComponent() {
 
   // Not authenticated and not a public route — show login
   if (!isAuthenticated && !standalone) {
-    return <LoginPage rpcStub={rpcStub} onLoginSuccess={handleLoginSuccess} />
+    return <LoginPage rpcStub={rpcStub} onLoginSuccess={handleLoginSuccess}
+      signOutFailed={signOutFailed} onDismissSignOutWarning={dismissSignOutWarning} />
   }
 
   // Signed-out visitors of public routes render without the auth wrapper / app shell.

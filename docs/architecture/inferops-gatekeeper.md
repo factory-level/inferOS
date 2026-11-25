@@ -37,6 +37,7 @@ covers:
   - packages/workshop-backend/__tests__/session-sign-in.test.ts
   - packages/workshop-frontend/src/components/auth/OAuthButtons.tsx
   - packages/workshop-frontend/src/features/auth/chooseAccount.ts
+  - packages/workshop-frontend/src/features/auth/SignOutWarning.tsx
   - packages/workshop-frontend/src/useAuth.ts
   - packages/integration-tests/__tests__/inferlab-sign-in.test.ts
 updated: 2026-11-25
@@ -149,17 +150,19 @@ gatekeeper-kit's shared conformance suite against a `project/board` binding.
   email?}`, where `email` is present only when InferLab marked it verified. An account declares no
   singleton and no management UI, so the Workshop reaches it only through URL-addressed resources.
 - **InferLab flows.** `connectAccount(callback, options)` creates an `InferLabLogin` object holding
-  the flow's purpose (`connect`, whatever the `scopes`: the vendor declares `signInConnects`, so a
-  sign-in connects too; `silent` when `options.chooseAccount` is `false`), the callback and an
+  the flow's purpose (`signin` for `scopes: "auth"` without `options.connect`, else `connect`: the
+  vendor declares `signInConnects`, so a sign-in the Workshop asks to connect is a connect;
+  `silent` when `options.chooseAccount` is `false`), the callback and an
   initiation nonce, and returns `<BASE_URL>/<attempt>/<nonce>`; `GatekeeperUser.reconnect()` does
   the same with purpose `reconnect` and no callback of its own. Without an InferLab origin all of
   them throw. The popup leg trades the nonce, once, for an OAuth nonce and a PKCE verifier, then
   redirects to `<origin>/authorize?client_id=inferos&redirect_uri=<BASE_URL>/oauth&state=<attempt>.<nonce>`
   with an S256 challenge and a `prompt`: `none` for a silent connect, `select_account` for every
-  other flow. When InferLab answers a silent leg with `error=login_required`, the `/oauth` leg
-  trades its state, once, for a new OAuth nonce and verifier (`InferLabLogin.resume`) and redirects
-  to an interactive `/authorize` leg with no `prompt`; any other error, or `login_required` on a leg
-  that was not silent, ends the attempt. The `/oauth` leg claims the state once and POSTs
+  other flow. When InferLab answers a silent leg with an error that means only that it needs a page
+  (`login_required`, `interaction_required`, `consent_required` or `account_selection_required`),
+  the `/oauth` leg trades its state, once, for a new OAuth nonce and verifier
+  (`InferLabLogin.resume`) and redirects to an interactive `/authorize` leg with no `prompt`; any
+  other error, or one of those on a leg that was not silent, ends the attempt. The `/oauth` leg claims the state once and POSTs
   `{clientId, code, codeVerifier, redirectUri}` to `<origin>/auth/token` (30 s timeout, capped
   body), parsing the session (`token`, `refreshToken`) and the identity (`user.id`, `email`,
   `tenantId`, the `product: "inferops"` entries of `user.workspaces`, `emailVerified`). A connect
@@ -178,7 +181,11 @@ gatekeeper-kit's shared conformance suite against a `project/board` binding.
     Set but malformed, the code isn't exchanged and sign-in is off. It only refuses.
 
   Then, by purpose:
-  - **Connect**, which is also the Workshop's sign-in (FAC-300), installs the session and identity
+  - **Sign-in** (a Workshop that predates `signInConnects` asks with `scopes: "auth"` alone) signs
+    the session out again with `POST /auth/logout`, and hands `callback.complete` an account
+    carrying the InferLab principal and the normalized email only when `emailVerified` is `true`.
+    It grants nothing, so deploy skew cannot leave a session no Workshop account holds.
+  - **Connect**, which is also the Workshop's sign-in when it asks with `connect` (FAC-300), installs the session and identity
     in the account's `InferOpsCredentials` object together with the callback, then calls
     `callback.complete` with the connected account: the InferLab principal (`subject`: the auth
     origin as issuer and `user.id`, `subjectOf`) and the normalized email only when
@@ -187,8 +194,8 @@ gatekeeper-kit's shared conformance suite against a `project/board` binding.
     doesn't vouch for (after an email change) is just not passed on. The exchange only answers for
     a `kind = 'sso'` root, opened after the provider edge authenticated the browser as that
     principal; invitations, impersonation and dev logins never reach it. If `complete` throws, the
-    session is signed out and the object wiped. An attempt stored before this deployment under the
-    retired `signin` purpose signs its session out and ends with "This sign-in attempt has expired".
+    session is signed out and the object wiped. An attempt stored under a purpose this deployment
+    does not know signs its session out and ends with "This sign-in attempt has expired".
   - **Reconnect** stages the session in the existing account's object and calls the stored
     callback's `reconnectComplete(stageId)`; `commitReconnect(stageId)` makes it live and signs
     the previous session out.
@@ -1062,8 +1069,9 @@ included, and any sign-out ends it everywhere.
 - **The vendor.** With an InferLab origin, `describe()` also reports `signInConnects`,
   `signInLabel: "Sign in with Google"` and `chooseAccountLabel: "Use a different Google account"`.
   The vendor's `displayName` stays "InferOps", which is what the Gatekeepers page shows.
-- **Sign-in is the connection.** The Workshop's `startGatekeeperLogin` requests full scopes for a
-  vendor that declares `signInConnects` and `providesSubject`, and the login callback
+- **Sign-in is the connection.** The Workshop's `startGatekeeperLogin` asks a vendor that declares
+  `signInConnects` and `providesSubject` to connect (`GatekeeperConnectOptions.connect`, with full
+  scopes), and the login callback
   (`LoginConnectCallbackImpl`, props `connects`) links the account the sign-in hands it:
   `UserDurableObject.loginOrCreateViaSubject(…, connection)` calls `linkConnectedAccountFromLogin`,
   which replaces the grant of an account with the same `uniqueName` (the person's email) and
@@ -1075,17 +1083,39 @@ included, and any sign-out ends it everywhere.
   Every session record has an `expiresAt` 30 days out (`SESSION_LIFETIME_MS`); one minted before
   that field existed expires 30 days after its `created`. `authenticate` asks a backing account's
   `checkSignIn()` once its last confirmation is 5 minutes old (`SIGN_IN_CHECK_INTERVAL_MS`): true
-  renews the session for 30 days, false (or an account that is gone or marked expired) deletes the
-  session, marks the account's credentials expired and refuses with `invalidSessionToken`, and a
-  throw leaves the session alone until the next check. The Workshop frontend then shows the sign-in
-  page, as for any refused token.
+  renews the session for 30 days; false (or an account that is gone or marked expired) deletes
+  every session that account backs, marks the account's credentials expired and refuses with
+  `invalidSessionToken`. A throw leaves the session alone and records `failedAt`, and the account is
+  not asked again for a minute (`SIGN_IN_RETRY_INTERVAL_MS`); once a day has passed since the last
+  confirmation (`SIGN_IN_UNCONFIRMED_LIMIT_MS`) the session is refused anyway (fail closed), with
+  the account left as it is. The account's provenance (incarnation and epoch) is read before the
+  check and compared after it: an account a fresh sign-in or a reconnect changed meanwhile is
+  treated as unanswered, never marked expired, and one deleted meanwhile refuses the session rather
+  than failing the request. The Workshop frontend then shows the sign-in page, as for any refused
+  token.
+- **Open connections.** A WebSocket API session authenticated with a token watches its session
+  (`UserDurableObject.watchSession`, a subscriber on the `sessions` collection): when the record is
+  deleted, by a sign-out or a check on any connection, the user DO calls back and the connection is
+  closed with `invalidSessionToken`, so its client reconnects and is refused. The connection that
+  signs out stops watching first and is answered. A watch the user DO lost to a reset is set up
+  again, which finds a session that ended meanwhile. An HTTP batch and the operate AG-UI endpoint
+  have no connection to close and watch nothing. While at least one session is watched, a timer in
+  the user DO runs `authenticate`'s check on every watched session each minute
+  (`SESSION_RECHECK_INTERVAL_MS`, `recheckWatchedSessions`), so a backing sign-in is still asked at
+  most every 5 minutes, with the same back-off and one-day limit, and a sign-out in another InferLab
+  app closes an open connection within about six minutes though nobody authenticates again. The
+  timer is cleared when the last watch ends, so a user with no open connection costs nothing.
 - **Sign-out.** `AuthenticatedApi.signOut()` (a Cloudflare Access session has nothing to end)
   calls `UserDurableObject.signOut(secret)`: it deletes the session, then every other session the
-  same account backs, then calls the account's `endSignIn()` and marks its credentials expired.
-  The person's sign-in ends even when they have connected other InferOps accounts, since the
-  sign-in identity is one person. `useAuth.logout` calls it before clearing the token, without
-  waiting for it (the stub is disposed when it answers, or after 5 seconds), and sets
-  `auth.chooseAccountNext`.
+  same account backs, then calls the account's `endSignIn()` and marks its credentials expired
+  (only the account as it was before the call). When `endSignIn()` fails it throws after all that,
+  so a sign-out that did not reach InferLab never reads as done. The person's sign-in ends even when
+  they have connected other InferOps accounts, since the sign-in identity is one person.
+  `useAuth.logout` clears the token and the stub at once, sets `auth.chooseAccountNext`, and waits
+  up to 5 seconds for the answer. A failure or no answer shows a warning on the sign-in page
+  (`SignOutWarning`): signed out of InferOS, but InferLab couldn't sign the person out everywhere.
+  There is no retry: the session that could reach the account is gone, so the warning says to sign
+  out from another InferLab app instead.
 - **Prompt.** The login page's main button calls `startGatekeeperLogin(vendor, { chooseAccount })`
   with `chooseAccount` from `auth.chooseAccountNext` (set at sign-out, cleared by the next sign-in
   that succeeds); "Use a different Google account" passes `true`. `false` becomes the silent
@@ -1097,14 +1127,26 @@ included, and any sign-out ends it everywhere.
   separate from `auth.dev.inferlab.io`'s, so a sign-in to the other apps on dev is not reused by
   InferOS (its first sign-in still goes straight to Google). A sign-out from either ends both, since
   `/auth/sign-out` ends every root of the person. Prod has no proxy.
-- **Not yet.** An open Workshop connection keeps working until it reconnects: the backing check
-  runs only in `authenticate`. A sign-out from InferOS whose backing session had already ended
-  (401) cannot end the person's other roots, since InferLab no longer accepts that refresh token.
+- **Blast radius.** Every Workshop sign-in now holds a person-level InferLab session at the
+  gatekeeper (in the account's `InferOpsCredentials` object), where before only a connected
+  InferOps account did. A compromised gatekeeper therefore reaches the InferLab session of every
+  person who signs in, not only of those who connected InferOps.
+- **Sessions from before this change.** A session record without `backing` (a password sign-in,
+  a sign-in through any other vendor, or an InferOps sign-in from before FAC-300) is never
+  re-checked, and lives until 30 days after its `created`. Since every session now expires, a
+  session older than 30 days is refused at the first `authenticate` after the deploy, and its
+  person signs in again.
+- **Not yet.** A sign-out from InferOS whose backing session had already ended (401) cannot end the
+  person's other roots, since InferLab no longer accepts that refresh token.
 - **Tests:** `session-sign-in.test.ts` (backend-sign-in project: the link, a second sign-in
-  replacing the grant, the 5-minute check and its three answers, a disconnected account, expiry and
-  the pre-expiry records, sign-out and its idempotence), the gatekeeper's `inferlab-login.test.ts`
-  (prompts, the `login_required` leg, the kept session) and `account.test.ts` ("the sign-in behind a
-  Workshop session"), `OAuthButtons.test.tsx` and `useAuth.test.tsx`, and the integration suite's
+  replacing the grant, the 5-minute check and its three answers, the one-minute backoff and the
+  one-day fail-closed limit, a check ending every session the sign-in backs, an account deleted or
+  replaced while it is asked, a disconnected account, expiry and the pre-expiry records, sign-out,
+  its idempotence and a failed `endSignIn`, and open WebSocket connections closed by a sign-out, a
+  check on another connection, or the periodic re-check after a sign-out at InferLab), the gatekeeper's `inferlab-login.test.ts` (prompts, the interactive
+  leg after each needs-a-page error, the kept session, a transient sign-in without `connect`, an
+  unknown stored purpose) and `account.test.ts` ("the sign-in behind a Workshop session"),
+  `OAuthButtons.test.tsx` and `useAuth.test.tsx` (the sign-out warning), and the integration suite's
   `inferlab-sign-in.test.ts` against `inferops-fake.ts`, which models central auth's root and child
   sessions, `prompt=none` and `/auth/sign-out`.
 

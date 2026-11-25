@@ -10,14 +10,18 @@ import { useDocumentTitle } from './useDocumentTitle'
 import { useConnectionLost } from './RpcContext'
 import OAuthButtons from './components/auth/OAuthButtons'
 import SiteLogo from './components/SiteLogo'
+import SignOutWarning from './features/auth/SignOutWarning'
 
 
 interface LoginPageProps {
   rpcStub: RpcStub<PublicApi>
   onLoginSuccess?: () => void
+  /** The last sign-out could not end the InferLab sign-in everywhere (useAuth's `signOutFailed`). */
+  signOutFailed?: boolean
+  onDismissSignOutWarning?: () => void
 }
 
-export default function LoginPage({ rpcStub, onLoginSuccess }: LoginPageProps) {
+export default function LoginPage({ rpcStub, onLoginSuccess, signOutFailed, onDismissSignOutWarning }: LoginPageProps) {
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [loading, setLoading] = useState(false)
@@ -99,6 +103,8 @@ export default function LoginPage({ rpcStub, onLoginSuccess }: LoginPageProps) {
           <h1 className="text-[18px] leading-[26px] font-semibold text-kumo-default">{siteName}</h1>
           <p className="text-sm text-kumo-subtle mt-1">Sign in to your account</p>
         </div>
+
+        {signOutFailed && <SignOutWarning onDismiss={() => onDismissSignOutWarning?.()} />}
 
         {passwordAuthEnabled && (
           <>

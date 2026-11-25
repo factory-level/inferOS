@@ -1,8 +1,9 @@
 // Sign in with InferLab: the vendor offers sign-in only when configured, the popup leg redirects to
 // InferLab's /authorize with PKCE, and the callback leg exchanges the code once, server-side, and
-// hands the Workshop an account carrying the verified email. Signing in connects that account and
-// keeps its session (FAC-300); a sign-in first asks InferLab to reuse a live sign-in (`prompt=none`)
-// and goes on to an interactive leg when there is none.
+// hands the Workshop an account carrying the verified email. A sign-in the Workshop asks to connect
+// keeps that account's session (FAC-300); it first asks InferLab to reuse a live sign-in
+// (`prompt=none`) and goes on to an interactive leg when there is none. A sign-in it does not ask to
+// connect stays transient.
 
 import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
@@ -197,8 +198,11 @@ describe("sign-in flow", () => {
         [{ scopes: "full" as const }, "select_account"],
         [{ scopes: "full" as const, chooseAccount: true }, "select_account"],
         [{ scopes: "full" as const, chooseAccount: false }, "none"],
-        // The vendor's sign-in connects, so a transient-scope request is a connect too.
-        [{ scopes: "auth" as const, chooseAccount: false }, "none"],
+        // A sign-in the Workshop asks to connect is a connect.
+        [{ scopes: "auth" as const, connect: true, chooseAccount: false }, "none"],
+        // Without `connect`, a sign-in is the transient one, which always shows the chooser.
+        [{ scopes: "auth" as const }, "select_account"],
+        [{ scopes: "auth" as const, chooseAccount: false }, "select_account"],
       ] as const) {
         const { url } = await vendor.connectAccount(callback as never, options);
         const response = await get(url);
@@ -242,6 +246,20 @@ describe("sign-in flow", () => {
     expect(await ended!.text()).toContain("not completed");
   });
 
+  it("goes on to an interactive leg for every answer that means InferLab needs a page", async () => {
+    for (const error of ["interaction_required", "consent_required", "account_selection_required"]) {
+      const silent = await authorize(`needs-page-${error}`);
+      const resumed = await get(`${REDIRECT_URI}?error=${error}&state=${silent.get("state")}`);
+      expect(resumed?.status, error).toBe(302);
+      const params = new URL(resumed!.headers.get("Location")!).searchParams;
+      expect(params.has("prompt"), error).toBe(false);
+      expect(params.get("state"), error).not.toBe(silent.get("state"));
+    }
+    // Any other error ends a silent leg too.
+    const denied = await authorize("needs-page-denied");
+    expect((await get(`${REDIRECT_URI}?error=access_denied&state=${denied.get("state")}`))?.status).toBe(400);
+  });
+
   it("ends an attempt that asked for the chooser when InferLab answers login_required", async () => {
     const params = await authorize("chooser-login-required", { kind: "connect" });
     const response = await get(`${REDIRECT_URI}?error=login_required&state=${params.get("state")}`);
@@ -272,6 +290,42 @@ describe("sign-in flow", () => {
     // The state is single-use: a replay neither exchanges again nor signs in again.
     expect((await get(callbackUrl))?.status).toBe(400);
     expect(requests).toHaveLength(1);
+  });
+
+  // A Workshop that predates `signInConnects` signs in with `scopes: "auth"` alone, and must not
+  // be handed a connected account it would never hold (whose InferLab session would be orphaned).
+  it("keeps a sign-in the Workshop did not ask to connect transient, ending its session", async () => {
+    const url = await withExports(async exports => {
+      const callback = exports.TestConnectCallback({ props: { label: "transient" } });
+      return (await exports.GatekeeperVendor({}).connectAccount(callback as never, { scopes: "auth" })).url;
+    });
+    const popup = await get(url);
+    const params = new URL(popup!.headers.get("Location")!).searchParams;
+    expect(params.get("prompt")).toBe("select_account");
+    const requests = tokenEndpoint(signedIn("ada@example.com"));
+
+    const response = await get(`${REDIRECT_URI}?code=c&state=${params.get("state")}`);
+
+    expect(response?.status).toBe(200);
+    expect(signIns).toContainEqual({ label: "transient", email: "ada@example.com" });
+    expect(signInSubjects).toContainEqual({ label: "transient", subject: { issuer: "http://localhost:8080", subject: "u1" } });
+    // Signing in kept nothing: the InferLab session it opened is signed out again.
+    expect(requests.logouts).toEqual(["refresh"]);
+  });
+
+  it("refuses an attempt stored under a purpose this deployment does not know, ending its session", async () => {
+    const params = await authorize("unknown-purpose");
+    const requests = tokenEndpoint(signedIn("ada@example.com"));
+    const [attempt] = params.get("state")!.split(".");
+    await runInDurableObject(env.INFERLAB_LOGIN.get(env.INFERLAB_LOGIN.idFromString(attempt!)),
+      (_: InferLabLogin, state) => { state.storage.kv.put("purpose", { kind: "retired" }); });
+
+    const response = await get(`${REDIRECT_URI}?code=c&state=${params.get("state")}`);
+
+    expect(response?.status).toBe(502);
+    expect(await response!.text()).toContain("has expired");
+    expect(requests.logouts).toEqual(["refresh"]);
+    expect(signIns.some(s => s.label === "unknown-purpose")).toBe(false);
   });
 
   it("accepts the popup link only once", async () => {

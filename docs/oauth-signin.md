@@ -105,9 +105,11 @@ INFERLAB_AUTH_ORIGIN=https://auth.inferlab.io
   `user.email` only when the response marks it `emailVerified: true`. A missing flag fails closed,
   because InferLab also issues sessions for emails nobody proved, such as invitations and
   impersonation.
-- **One Google sign-in (FAC-300).** The vendor declares `signInConnects`, so signing in also
-  connects InferOps: the InferLab session the sign-in opened is kept as the connected account's
-  session, and it backs the Workshop session. There is no separate connect step. Extra accounts can
+- **One Google sign-in (FAC-300).** The vendor declares `signInConnects`, and the Workshop asks its
+  sign-in to connect (`connect: true` in the connect options), so signing in also connects
+  InferOps: the InferLab session the sign-in opened is kept as the connected account's session,
+  and it backs the Workshop session. There is no separate connect step. A sign-in without
+  `connect` (a Workshop from before this change) stays transient and keeps no session. Extra accounts can
   still be connected from the Gatekeepers page, which asks for InferLab's account chooser.
   Signing in again as the same person replaces that account's session (the old one is ended with
   `POST /auth/logout`) instead of adding a second account.
@@ -115,7 +117,8 @@ INFERLAB_AUTH_ORIGIN=https://auth.inferlab.io
   **Use a different Google account**. No button names a product.
 - **Prompt.** The main button first asks InferLab for `prompt=none`, so a live central-auth sign-in
   in the browser completes the popup without any page. InferLab's `login_required` answer sends the
-  popup on to an interactive leg with no prompt, which goes straight to Google. "Use a different
+  popup on to an interactive leg with no prompt, which goes straight to Google, as do
+  `interaction_required`, `consent_required` and `account_selection_required`. "Use a different
   Google account", and the first sign-in after a sign-out (the frontend's `auth.chooseAccountNext`
   flag, set at sign-out and cleared by the next successful sign-in), ask for
   `prompt=select_account` instead. A popup can't be opened without a click, so InferOS signs you in
@@ -124,11 +127,21 @@ INFERLAB_AUTH_ORIGIN=https://auth.inferlab.io
   `POST /auth/sign-out` with the backing session's refresh token. That ends every central-auth
   sign-in of the person and every app session under them, so InferOps, InferMind, the console and
   InferWork are signed out too. The Workshop also ends every other session of the account that the
-  same sign-in backs.
+  same sign-in backs, and closes every open connection authenticated with one. A sign-out in another
+  InferLab app closes an open InferOS connection within about six minutes: the Workshop re-checks
+  the sessions open connections hold every minute, asking InferLab at most every 5 minutes. When InferLab could
+  not be reached, the sign-out still ends the Workshop sessions, and the sign-in page warns that
+  InferLab couldn't sign the person out everywhere, and to sign out from another InferLab app.
 - **Session life.** A Workshop session expires 30 days after it was minted. While a backing InferLab
   session exists, `authenticate` refreshes it at most every 5 minutes; each refresh that succeeds
   renews the session for 30 days, and a refusal (401) ends it, so the client returns to the sign-in
-  page. A session minted before sessions expired is treated as expiring 30 days after it was created.
+  page. An InferLab that cannot answer is asked again no sooner than a minute later, and after a day
+  without a successful refresh the session ends anyway. A session minted before sessions expired is
+  treated as expiring 30 days after it was created, and is not re-checked, so after this change
+  ships any session older than 30 days is refused and its person signs in again.
+- **Blast radius.** Every sign-in now leaves a person-level InferLab session at the InferOps
+  gatekeeper, so a compromised gatekeeper reaches the InferLab session of every person who has
+  signed in.
 - With the origin set, the InferOps gatekeeper no longer auto-provisions demo accounts: every
   account is a person's own, connected through the same PKCE sign-in, and it keeps their InferLab
   session so every board request is made with their own token and workspace. See

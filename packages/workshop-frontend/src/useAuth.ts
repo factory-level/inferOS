@@ -8,7 +8,8 @@ import { setChooseAccountNext } from './features/auth/chooseAccount'
 
 const CF_ACCESS_MODE = import.meta.env.VITE_CF_ACCESS_MODE === 'true'
 
-// How long logout waits for the server to end the session before disposing the stub anyway.
+// How long logout waits for the server to end the session before disposing the stub anyway, and
+// reporting that the sign-out may not have reached InferLab.
 const SIGN_OUT_TIMEOUT_MS = 5000
 
 interface AuthState {
@@ -33,6 +34,9 @@ export function useAuth(publicApi: RpcStub<PublicApi>) {
   const authenticatedApiRef = useRef<RpcStub<AuthenticatedApi> | null>(null)
   authenticatedApiRef.current = authState.authenticatedApi
   const loginGeneration = useRef(0)
+  // The last sign-out ended the session here but not, as far as this browser knows, the InferLab
+  // sign-in behind it everywhere (see logout). Cleared by the next sign-in or by dismissing it.
+  const [signOutFailed, setSignOutFailed] = useState(false)
 
   /**
    * Names the signed-in user on error reports, for as long as this stub is the current one.
@@ -131,6 +135,7 @@ export function useAuth(publicApi: RpcStub<PublicApi>) {
 
   const authenticateWithToken = (token: string) => {
     loginGeneration.current++
+    setSignOutFailed(false)
     setAuthState(prev => {
       // Dispose the previous authenticated API stub if it exists
       if (prev.authenticatedApi) {
@@ -159,25 +164,34 @@ export function useAuth(publicApi: RpcStub<PublicApi>) {
     authenticateWithToken(token)
   }
 
-  const logout = () => {
-    loginGeneration.current++
+  /**
+   * Signs out. The browser forgets the session at once; the returned promise settles once the
+   * server has answered, or after SIGN_OUT_TIMEOUT_MS. The server ends the session too (FAC-300):
+   * its token is refused from then on, and a provider sign-in backing it is ended everywhere. When
+   * that failed or did not answer in time, `signOutFailed` is set, so the sign-in page can say so.
+   * The next sign-in asks for the provider's account chooser.
+   */
+  const logout = (): Promise<void> => {
+    const generation = ++loginGeneration.current
     setReportedUserId(undefined)
 
     if (CF_ACCESS_MODE) {
       window.location.assign('/cdn-cgi/access/logout')
-      return
+      return Promise.resolve()
     }
 
-    // End the session on the server too (FAC-300): its token is refused from then on, and a provider
-    // sign-in backing it is ended everywhere. Best effort, and never awaited by the UI: the stub is
-    // disposed once the server answers, or after SIGN_OUT_TIMEOUT_MS, and the browser forgets the
-    // session at once either way. The next sign-in asks for the provider's account chooser.
     const signingOut = authenticatedApiRef.current
+    let finished = Promise.resolve()
     if (signingOut) {
-      const ended = Promise.resolve().then(() => signingOut.signOut()).catch(() => {})
-      const timeout = new Promise<void>(resolve => setTimeout(resolve, SIGN_OUT_TIMEOUT_MS))
-      void Promise.race([ended, timeout]).then(() => signingOut[Symbol.dispose]())
+      const ended = Promise.resolve().then(() => signingOut.signOut()).then(() => true, () => false)
+      const timeout = new Promise<boolean>(resolve => setTimeout(() => resolve(false), SIGN_OUT_TIMEOUT_MS))
+      finished = Promise.race([ended, timeout]).then(done => {
+        signingOut[Symbol.dispose]()
+        // A sign-in since then is a new session, which this warning is not about.
+        if (!done && generation === loginGeneration.current) setSignOutFailed(true)
+      })
     }
+    setSignOutFailed(false)
     setChooseAccountNext()
 
     // Use functional updater to read current state (avoids stale closure).
@@ -194,7 +208,10 @@ export function useAuth(publicApi: RpcStub<PublicApi>) {
     })
 
     localStorage.removeItem('authToken')
+    return finished
   }
+
+  const dismissSignOutWarning = () => setSignOutFailed(false)
 
   /**
    * An opaque key for the signed-in account, equal across two authenticated stubs only when both
@@ -211,6 +228,8 @@ export function useAuth(publicApi: RpcStub<PublicApi>) {
     accountKey,
     login,
     logout,
+    signOutFailed,
+    dismissSignOutWarning,
     isAuthenticated: !!authState.authenticatedApi
   }
 }
