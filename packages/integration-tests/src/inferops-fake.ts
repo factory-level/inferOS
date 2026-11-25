@@ -2,9 +2,15 @@
 // drive the real InferOps gatekeeper through the real Workshop.
 //
 // It answers what the gatekeeper calls and nothing more: InferLab's authorization-code + PKCE token
-// exchange, refresh and logout; InferOps' `GET /workspaces`, project list, board, issue read, the
+// exchange, refresh, logout and sign-out; InferOps' `GET /workspaces`, project list, board, issue read, the
 // three issue writes, and coding dispatch (repositories, runs, dispatch and cancel). Its rules are the ones the isolation suite leans on, taken from InferOps:
 //
+// - Sessions are central auth's (FAC-300). Signing in at `/authorize` opens a root session for the
+//   one browser the fake models, or reuses the live one; each code exchange opens a child session
+//   under it, and refresh rotates the child. `/authorize?prompt=none` answers with a code only while
+//   the browser holds a live root, and with `error=login_required` otherwise; `prompt` anything
+//   else signs the named person in. `POST /auth/logout` ends one child, `POST /auth/sign-out` every
+//   root of the person and every child under them (idempotent; 401 for a dead refresh token).
 // - A token belongs to one person. Every InferOps request is authorized by that token *and* the
 //   person's current membership of the `x-workspace-id` workspace (401 for a dead token, 403 for a
 //   workspace the person is not in). Projects and issues are scoped to the header's workspace, so
@@ -248,8 +254,10 @@ export type FakeCommit = {
   person: string;
 };
 
-type Session = { person: FakePerson; access: string; refresh: string; live: boolean };
-type PendingCode = { person: FakePerson; challenge: string; redirectUri: string };
+/** A central-auth sign-in in the browser: the root every session it hands out is a child of. */
+type Root = { person: FakePerson; live: boolean };
+type Session = { person: FakePerson; root: Root; access: string; refresh: string; live: boolean };
+type PendingCode = { person: FakePerson; root: Root; challenge: string; redirectUri: string };
 type Stored = { status: number; body: unknown };
 
 const json = (body: unknown, status = 200) => Response.json(body, { status });
@@ -273,8 +281,12 @@ export class InferOpsFake {
   readonly commits: FakeCommit[] = [];
   /** Requests answered from the idempotency store rather than written again. */
   readonly replays: FakeRequest[] = [];
-  /** Refresh tokens InferLab was asked to sign out. */
+  /** Refresh tokens InferLab was asked to sign out (`/auth/logout`, one session). */
   readonly logouts: string[] = [];
+  /** Refresh tokens InferLab was asked to end the person's sign-in with (`/auth/sign-out`). */
+  readonly signOuts: string[] = [];
+  /** The `prompt` of every `/authorize` request, in order (null for none). */
+  readonly prompts: (string | null)[] = [];
   /** Every Wiki section write committed, in order. */
   readonly sectionWrites: FakeSectionWrite[] = [];
   /** The widget definitions InferOps holds, by `<workspace>/<sourceId>/<sourceVersion>`. */
@@ -301,6 +313,9 @@ export class InferOpsFake {
 
   readonly #people = new Map<string, FakePerson>();
   readonly #sessions: Session[] = [];
+  readonly #roots: Root[] = [];
+  /** The root the one modelled browser holds, if it has signed in. */
+  #browser: Root | null = null;
   readonly #codes = new Map<string, PendingCode>();
   readonly #issues = new Map<string, FakeIssue>();
   readonly #idempotency = new Map<string, Stored>();
@@ -480,10 +495,13 @@ export class InferOpsFake {
   }
 
   /**
-   * The person signs in at InferLab's `/authorize`: returns the redirect back to the gatekeeper with
-   * a fresh code, bound to the request's PKCE challenge and redirect URI.
+   * The browser opens InferLab's `/authorize`: returns the redirect back to the gatekeeper with a
+   * fresh code, bound to the request's PKCE challenge and redirect URI. With `prompt=none` the
+   * browser's live root answers, whoever `person` names, and with no live root the redirect carries
+   * `error=login_required` and no code; `person` may then be omitted. Otherwise `person` signs in,
+   * reusing the browser's root when it is theirs and live.
    */
-  authorize(authorizeUrl: string, person: FakePerson): string {
+  authorize(authorizeUrl: string, person?: FakePerson): string {
     const url = new URL(authorizeUrl);
     if (url.origin !== INFERLAB_ORIGIN || url.pathname !== "/authorize") {
       throw new Error(`Not an InferLab authorize URL: ${authorizeUrl}`);
@@ -492,18 +510,41 @@ export class InferOpsFake {
     if (params.get("client_id") !== "inferos" || params.get("code_challenge_method") !== "S256") {
       throw new Error("Unexpected authorize parameters");
     }
+    const prompt = params.get("prompt");
+    this.prompts.push(prompt);
+    const back = new URL(params.get("redirect_uri")!);
+    back.searchParams.set("state", params.get("state")!);
+    let root: Root;
+    if (prompt === "none") {
+      if (!this.#browser?.live) {
+        back.searchParams.set("error", "login_required");
+        return back.toString();
+      }
+      root = this.#browser;
+    } else {
+      if (!person) throw new Error("An interactive sign-in needs the person who signs in");
+      if (!this.#browser?.live || this.#browser.person !== person) {
+        this.#browser = { person, live: true };
+        this.#roots.push(this.#browser);
+      }
+      root = this.#browser;
+    }
     const code = `code-${randomHex()}`;
     this.#codes.set(code, {
-      person, challenge: params.get("code_challenge")!, redirectUri: params.get("redirect_uri")!,
+      person: root.person, root, challenge: params.get("code_challenge")!, redirectUri: params.get("redirect_uri")!,
     });
-    const back = new URL(params.get("redirect_uri")!);
     back.searchParams.set("code", code);
-    back.searchParams.set("state", params.get("state")!);
     return back.toString();
+  }
+
+  /** Whether the modelled browser holds a live central-auth sign-in, and whose. */
+  browserSignedIn(): FakePerson | null {
+    return this.#browser?.live ? this.#browser.person : null;
   }
 
   /** End every session of `person` at InferLab: their tokens stop working, refresh included. */
   revokeSessions(person: FakePerson): void {
+    for (const root of this.#roots) if (root.person === person) root.live = false;
     for (const session of this.#sessions) if (session.person === person) session.live = false;
   }
 
@@ -556,10 +597,10 @@ export class InferOpsFake {
   // -------------------------------------------------------------------------
   // InferLab
 
-  #issue(person: FakePerson): Session {
+  #issue(person: FakePerson, root: Root): Session {
     const n = ++this.#serial;
     const session: Session = {
-      person,
+      person, root,
       access: `ilab-access-${n}-${randomHex()}`,
       refresh: `ilab-refresh-${n}-${randomHex()}`,
       live: true,
@@ -580,7 +621,8 @@ export class InferOpsFake {
           return failure(400, "INVALID_GRANT", "invalid grant");
         }
         const { person } = pending;
-        const session = this.#issue(person);
+        if (!pending.root.live) return failure(400, "INVALID_GRANT", "invalid grant");
+        const session = this.#issue(person, pending.root);
         return json({
           token: session.access,
           refreshToken: session.refresh,
@@ -598,13 +640,20 @@ export class InferOpsFake {
         const session = this.#sessions.find(s => s.refresh === body.refreshToken && s.live);
         if (!session) return failure(401, "UNAUTHORIZED", "session ended");
         session.live = false;
-        const next = this.#issue(session.person);
+        const next = this.#issue(session.person, session.root);
         return json({ token: next.access, refreshToken: next.refresh });
       }
       case "/auth/logout": {
         this.logouts.push(String(body.refreshToken));
         const session = this.#sessions.find(s => s.refresh === body.refreshToken);
         if (session) session.live = false;
+        return new Response(null, { status: 204 });
+      }
+      case "/auth/sign-out": {
+        this.signOuts.push(String(body.refreshToken));
+        const session = this.#sessions.find(s => s.refresh === body.refreshToken && s.live);
+        if (!session) return failure(401, "UNAUTHORIZED", "session ended");
+        this.revokeSessions(session.person);
         return new Response(null, { status: 204 });
       }
       default:

@@ -113,10 +113,16 @@ export interface PublicApi extends RpcTarget {
    * Workshop's own /connect/handoff page, which calls `confirmLogin(ticket, nonce)`. The vendor must
    * be auth-capable and allowlisted (see ServerConfig.authVendors); throws otherwise.
    *
+   * `options.chooseAccount` is passed on to a vendor that offers an account chooser
+   * (`AuthVendorInfo.chooseAccountLabel`): `true` asks the provider for its chooser, `false` asks it
+   * to reuse a sign-in the browser already holds without showing a page (see
+   * `GatekeeperConnectOptions.chooseAccount`). Other vendors ignore it.
+   *
    * Dispose `attempt` to abandon the sign-in (e.g. the user closed the popup). Nothing is cancelled
    * server-side: the browser just stops polling, and an unreceived token expires on its own.
    */
-  startGatekeeperLogin(vendorId: string): Promise<{ url: string; nonce: string; attempt: RpcStub<LoginAttempt> }>;
+  startGatekeeperLogin(vendorId: string, options?: { chooseAccount?: boolean })
+      : Promise<{ url: string; nonce: string; attempt: RpcStub<LoginAttempt> }>;
 
   /**
    * Confirm a finished sign-in flow. Called by the /connect/handoff page in the sign-in popup, which
@@ -129,7 +135,12 @@ export interface PublicApi extends RpcTarget {
    */
   confirmLogin(ticket: string, nonce: string): Promise<void>;
 
-  /** Authenticates the user using an auth token (typically stored in localStorage). */
+  /**
+   * Authenticates the user using an auth token (typically stored in localStorage). Refuses, with
+   * `AUTH_ERROR_CODES.invalidSessionToken`, a token whose session has ended: signed out
+   * (`AuthenticatedApi.signOut`), past its expiry, or backed by a provider sign-in that has ended
+   * (`VendorDescription.signInConnects`), which is checked at most every few minutes.
+   */
   authenticate(token: string): Promise<AuthenticatedApi>;
 
   /**
@@ -931,6 +942,14 @@ export interface AuthenticatedApi extends RpcTarget {
    * `Overseer.addCollaborator()` still works then.
    */
   searchUsers(query: string, excludeIds: string[]): Promise<UserDirectoryRecord[]>;
+
+  /**
+   * Signs out: ends the session this API was authenticated with, so its token is refused from now
+   * on. When a provider sign-in backs the session (`VendorDescription.signInConnects`), that sign-in
+   * is ended too, everywhere it is live, and with it every session of this account it backs. A
+   * Cloudflare Access session has no token, and nothing here ends it. Idempotent.
+   */
+  signOut(): Promise<void>;
 
   /**
    * Change the user's password, if using password-based authentication.
@@ -1862,6 +1881,13 @@ export type AuthVendorInfo = {
   displayName: string;
   logo?: AvatarImage;
   color?: string;
+  /** The button's whole text when the vendor names one (VendorDescription.signInLabel). */
+  signInLabel?: string;
+  /**
+   * The text of a second button that asks the provider for its account chooser, when the vendor
+   * offers one (VendorDescription.chooseAccountLabel); see `startGatekeeperLogin`'s `chooseAccount`.
+   */
+  chooseAccountLabel?: string;
 };
 
 /**

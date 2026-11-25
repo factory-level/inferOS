@@ -7,6 +7,9 @@
 //   `POST /auth/refresh {refreshToken}` at InferLab, which rotates both tokens; a 401 there is the
 //   session's death, which is recorded, announced to the Workshop once, and refused ever after
 //   until a reconnect replaces it. Revoking the account signs the session out (`POST /auth/logout`).
+// - When the account backs a Workshop sign-in (FAC-300), the Workshop checks the session by
+//   refreshing it (`checkSession`), and signing out of InferOS ends the person's InferLab sign-in
+//   everywhere (`POST /auth/sign-out`, `signOutEverywhere`), not only this session.
 // - What leaves this object is an `InferOpsAuthority` (the access token and one workspace id): the
 //   refresh token never crosses the RPC boundary. The workspace is always one the person is a
 //   member of; a binding in another workspace is refused here, before any request is made.
@@ -20,7 +23,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { skipRpcValidation, validateRpc } from "capnweb-validate";
 import {
-  CredentialCoordinator, CredentialsExpiredError, type CredentialsWithIdentity,
+  CredentialCoordinator, CredentialsExpiredError, isCredentialsExpired, type CredentialsWithIdentity,
   type RejectionVerdict,
 } from "@gadgets/gatekeeper-kit/credentials";
 import { notifyCredentialsExpiredOnce } from "@gadgets/gatekeeper-kit/credential-expiry";
@@ -170,6 +173,22 @@ export async function logoutInferLabSession(origin: string, refreshToken: string
   }
 }
 
+/**
+ * Ends the person's InferLab sign-in everywhere: every central-auth session of theirs and every
+ * session under them, the one `refreshToken` names included (`POST /auth/sign-out`, idempotent).
+ * Throws when InferLab could not be reached or refused for any reason but an already-dead session
+ * (401), since a sign-out that did not happen must not read as done.
+ */
+export async function signOutInferLabEverywhere(origin: string, refreshToken: string,
+                                                fetcher: typeof fetch): Promise<void> {
+  const response = await postSession(origin, "/auth/sign-out", refreshToken, fetcher);
+  await response.body?.cancel();
+  if (!response.ok && response.status !== 401) {
+    logger.warn("InferLab sign-out failed", { event: "session.sign_out.failed", status: response.status });
+    throw new Error(`InferLab refused to sign out (HTTP ${response.status}).`);
+  }
+}
+
 /** The configured InferLab origin for session calls, or null. Kept local so the DO has no cycle. */
 function sessionOrigin(env: InferLabSessionEnv): string | null {
   const raw = env.INFERLAB_AUTH_ORIGIN?.trim();
@@ -302,6 +321,36 @@ export class InferOpsCredentials extends DurableObject<Cloudflare.Env> {
     return this.#coordinator.adjudicateRejection(identity, {
       refresh: this.#refresh, notify: this.#notify,
     });
+  }
+
+  /**
+   * Whether the session is still live, found by refreshing it now (`CredentialCoordinator.rotate`):
+   * false once InferLab has refused it (or nothing is connected), and the death is recorded so every
+   * binding refuses the grant. Any other failure throws; it says nothing about the session.
+   */
+  async checkSession(): Promise<boolean> {
+    try {
+      await this.#coordinator.rotate(this.#refresh);
+      return true;
+    } catch (error) {
+      if (isCredentialsExpired(error)) return false;
+      throw error;
+    }
+  }
+
+  /**
+   * Ends the person's InferLab sign-in everywhere, this session included (`POST /auth/sign-out`).
+   * The stored grant is kept, dead: the next use finds it refused and reports it, as for any ended
+   * session, and a later sign-in replaces it. A staged reconnect's session is signed out too.
+   */
+  async signOutEverywhere(): Promise<void> {
+    const origin = sessionOrigin(this.env);
+    if (!origin) throw new Error("InferLab sign-in is not configured on this deployment.");
+    const current = this.#coordinator.stored();
+    const staged = discardStagedCredentials<InferOpsConnection>(this.ctx.storage.kv);
+    const fetcher = inferLabFetch(this.env);
+    if (staged) await logoutInferLabSession(origin, staged.grant.refreshToken, fetcher);
+    if (current) await signOutInferLabEverywhere(origin, current.refreshToken, fetcher);
   }
 
   /** Signs the session out at InferLab and forgets everything held for this account. */

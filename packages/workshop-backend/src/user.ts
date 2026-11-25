@@ -40,7 +40,7 @@ import { assertPublicationFlagOn, byRequestedDesc, PUBLICATION_AUDIENCES, readPu
 import { filterEnabledResources, isResourceDisabled, readAdminConfig } from "./admin-config.js";
 import { buildGatekeeperVendorMap } from "./auth/auth-vendors.js";
 import { getSharedConfigurationGatekeeper } from "./auth/config.js";
-import { CONNECT_FLOW_LIFETIME_MS, handoffTargetOrigin, hashPresentedSecret, newSecretToken, PENDING_HANDOFF_LIFETIME_MS } from "./connect-handoff.js";
+import { CONNECT_FLOW_LIFETIME_MS, handoffTargetOrigin, hashPresentedSecret, hashSecret, newSecretToken, PENDING_HANDOFF_LIFETIME_MS } from "./connect-handoff.js";
 
 const logger = createWorkshopLogger("workshop.user");
 
@@ -347,7 +347,29 @@ export type UserChatContext = {
 type LoginSessionRecord = {
   tokenId: string,  // sha256 hash of token, hex-formatted
   created: Date,
+  // When the session ends (FAC-300). A session minted before sessions expired has none, and ends
+  // SESSION_LIFETIME_MS after `created`, like a new one that is never renewed.
+  expiresAt?: Date,
+  // The connected account whose provider sign-in backs this session (VendorDescription
+  // .signInConnects), and when that sign-in was last confirmed live: each confirmation renews
+  // `expiresAt`, and a sign-in confirmed ended, or an account gone, ends the session.
+  backing?: { accountId: number, checkedAt: Date },
 }
+
+/**
+ * How long a session lives: from its creation, or for a session a provider sign-in backs, from the
+ * last time that sign-in was confirmed live. InferLab's refresh sessions live as long.
+ */
+export const SESSION_LIFETIME_MS = 30 * 24 * 60 * 60 * 1000;
+
+/** How long a backing sign-in's last confirmation stands before `authenticate` asks again. */
+export const SIGN_IN_CHECK_INTERVAL_MS = 5 * 60 * 1000;
+
+/** The account a sign-in that connects hands over (VendorDescription.signInConnects): it backs the session. */
+export type SignInConnection = { account: Fetcher<GatekeeperUser>, vendorId: string, expiresAt?: Date };
+
+/** The parts of a sign-in account `authenticate` and `signOut` call (VendorDescription.signInConnects). */
+type SignInAccount = Required<Pick<GatekeeperUser, "checkSignIn" | "endSignIn">>;
 
 // Blueprint record stored in the user's `blueprints` collection.
 type BlueprintUserRecord = {
@@ -712,13 +734,87 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       // not surface as the decoder's SyntaxError.
       throw createAuthError(AUTH_ERROR_CODES.invalidSessionToken);
     }
-    let hash = await crypto.subtle.digest('SHA-256', tokenBytes);
-    let tokenId = new Uint8Array(hash).toHex();
+    let tokenId = await hashSecret(tokenBytes);
     let session = this.storage.sessions.get(tokenId);
-    if (!session) {
+    if (!session || !await this.#sessionLive(session)) {
       throw createAuthError(AUTH_ERROR_CODES.invalidSessionToken);
     }
     this.#syncDirectory();
+  }
+
+  // Whether `session` may still be used, ending it (deleting its record) when not: past its expiry,
+  // or backed by a sign-in that has ended. A backing sign-in is asked at most every
+  // SIGN_IN_CHECK_INTERVAL_MS; a provider that cannot answer leaves the session as it is, and is
+  // asked again next time.
+  async #sessionLive(session: LoginSessionRecord): Promise<boolean> {
+    let now = Date.now();
+    let expiresAt = session.expiresAt?.getTime() ?? session.created.getTime() + SESSION_LIFETIME_MS;
+    let live = now < expiresAt;
+    let backing = session.backing;
+    if (live && backing && now - backing.checkedAt.getTime() >= SIGN_IN_CHECK_INTERVAL_MS) {
+      let record = this.storage.connectedAccounts.get(backing.accountId);
+      let answer: boolean | null;
+      if (!record || record.credentialsExpired) {
+        answer = false;
+      } else {
+        try {
+          answer = await (record.account as unknown as SignInAccount).checkSignIn();
+        } catch (error) {
+          logger.warn("could not check the sign-in backing a session", {
+            event: "session.sign_in.check.failed", accountId: backing.accountId, error,
+          });
+          answer = null;
+        }
+      }
+      if (answer === false) {
+        live = false;
+        if (record) await this.markCredentialsExpired(backing.accountId);
+      } else if (answer === true) {
+        // Renewed only while the record still exists: a sign-out that ran meanwhile stands.
+        if (this.storage.sessions.get(session.tokenId)) {
+          this.storage.sessions.put({
+            ...session, expiresAt: new Date(now + SESSION_LIFETIME_MS),
+            backing: { ...backing, checkedAt: new Date(now) },
+          });
+        }
+      }
+    }
+    if (!live) this.storage.sessions.delete(session.tokenId);
+    return live;
+  }
+
+  /**
+   * Ends the session `token` names (see AuthenticatedApi.signOut). When a provider sign-in backs it,
+   * that sign-in is ended everywhere through its account, which also ends every other session of
+   * this account it backs. Ending the sign-in is best effort: the session record is gone first.
+   */
+  async signOut(token: string): Promise<void> {
+    let tokenBytes: Uint8Array;
+    try {
+      tokenBytes = Uint8Array.fromBase64(token);
+    } catch {
+      return;
+    }
+    let tokenId = await hashSecret(tokenBytes);
+    let session = this.storage.sessions.get(tokenId);
+    if (!session) return;
+    this.storage.sessions.delete(tokenId);
+    let accountId = session.backing?.accountId;
+    if (accountId === undefined) return;
+    for (let other of Array.from(this.storage.sessions.list())) {
+      if (other.backing?.accountId === accountId) this.storage.sessions.delete(other.tokenId);
+    }
+    let record = this.storage.connectedAccounts.get(accountId);
+    if (!record) return;
+    try {
+      await (record.account as unknown as SignInAccount).endSignIn();
+    } catch (error) {
+      logger.error("could not end the sign-in backing a session", {
+        event: "session.sign_in.end.failed", accountId, error,
+      });
+      return;
+    }
+    if (this.storage.connectedAccounts.get(accountId)) await this.markCredentialsExpired(accountId);
   }
 
   /**
@@ -746,9 +842,15 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     return isNew;
   }
 
-  async #newSessionToken(): Promise<string> {
+  // `backingAccountId` names the connected account whose sign-in backs the session, if any; it was
+  // confirmed live just now, by the sign-in that connected it.
+  async #newSessionToken(backingAccountId?: number): Promise<string> {
     let { secret, hash: tokenId } = await newSecretToken();
-    this.storage.sessions.put({ tokenId, created: new Date() });
+    let created = new Date();
+    this.storage.sessions.put({
+      tokenId, created, expiresAt: new Date(created.getTime() + SESSION_LIFETIME_MS),
+      ...(backingAccountId !== undefined ? { backing: { accountId: backingAccountId, checkedAt: created } } : {}),
+    });
     return secret.toBase64();
   }
 
@@ -869,10 +971,14 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
    * the address of the email-keyed account it bound), so a profile id still names its account. A
    * new account is bound to `subject` as it is made; an existing one must already be bound to it.
    * `email` is the address the provider vouches for now, or null; it is kept for display only.
-   * Returns the session secret, or null when signups are closed and there is no account yet.
+   * `connection`, for a vendor whose sign-in connects (VendorDescription.signInConnects), is the
+   * account the sign-in connected: it is linked as `linkConnectedAccountFromLogin` links one, and its
+   * sign-in backs the session. Returns the session secret and the linked account's id, or null when
+   * signups are closed and there is no account yet, in which case nothing is linked.
    */
-  async loginOrCreateViaSubject(name: string, subject: string, email: string | null, allowCreate: boolean)
-      : Promise<string | null> {
+  async loginOrCreateViaSubject(name: string, subject: string, email: string | null, allowCreate: boolean,
+                                connection?: SignInConnection)
+      : Promise<{ secret: string, accountId?: number } | null> {
     if (!this.storage.created.get()) {
       if (!allowCreate) return null;
       this.storage.created.put(true);
@@ -888,7 +994,10 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     recordAnalytics(this.ctx, this.env, {
       event_name: "user_authenticated", user_id: this.ctx.id.toString(), source: "gatekeeper",
     });
-    return this.#newSessionToken();
+    let accountId = connection
+      ? await this.linkConnectedAccountFromLogin(connection.account, connection.vendorId, connection.expiresAt)
+      : undefined;
+    return { secret: await this.#newSessionToken(accountId), ...(accountId !== undefined ? { accountId } : {}) };
   }
 
   /**

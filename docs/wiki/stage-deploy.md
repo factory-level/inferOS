@@ -1,6 +1,6 @@
 ---
 title: Deploy a persistent stage
-updated: 2026-11-12
+updated: 2026-11-25
 ---
 
 # Deploy a persistent stage
@@ -20,7 +20,7 @@ How to deploy, update, roll back and delete the two persistent InferOS instances
    - An **Allow** policy for the people (and test agents' mailboxes) who may reach the stage, with One-time PIN or an identity provider as the login method. Give each external test agent its own policy naming its own address (plus aliases such as `bot+owner@…` count as separate addresses), so Access logs say which one signed in.
    - A **Service Auth** policy for a service token (for example `inferos-dev-smoke`), used by the post-deploy smoke.
    The deploy cannot create these; it only checks afterwards that an unauthenticated request is redirected to Access, and fails loudly if not.
-3. **InferLab registration.** InferLab's `inferos` sign-in client must allow the stage origin (`auth.sso.inferosOrigins` in InferOps' `config/development.js` for `dev`, `config/production.js` for `prod`); the callback is `<origin>/gatekeeper/inferops/oauth`. Without it "Sign in with InferLab" is refused at InferLab.
+3. **InferLab registration.** InferLab's `inferos` sign-in client must allow the stage origin (`auth.sso.inferosOrigins` in InferOps' `config/development.js` for `dev`, `config/production.js` for `prod`); the callback is `<origin>/gatekeeper/inferops/oauth`. Without it "Sign in with Google" is refused at InferLab.
 4. **Wrangler login.** `pnpm exec wrangler login` (opens a browser), then `export CLOUDFLARE_ACCOUNT_ID=<account id>`.
 5. **Inputs.** Put them in the shell or in a gitignored `.stage-<stage>.vars` at the repository root (`KEY=value` lines; the shell wins):
 
@@ -37,7 +37,7 @@ How to deploy, update, roll back and delete the two persistent InferOS instances
 1. Rehearse with no network: `pnpm stage:deploy dev --dry-run`. It prints every worker, its vars, the backend's secret names (never values), the KV namespaces and the bucket.
 2. Confirm the InferOps release reported by `/status` (`version`, for example `v1.297.0`). InferOps runs on Cloud Run; its release tag identifies the deployed application revision. `stage:deploy` refreshes tags in the checkout at `INFEROPS_REPO` (or sibling `../inferops`) and resolves the tag with `git rev-list -n 1 <tag>`. If the deployed tag is unavailable or cannot be resolved, use `--inferops-sha <full-40-character-sha>` with the exact commit confirmed by the service owner. The checkout must contain the release commit. Deploy refuses a revision not descended from `connection.json`'s reviewed pin or whose board DTO changed since that pin; regenerate and review `scripts/consumer/project-board.schema.json` and update the pin before deploying such a change. Do not infer the deployed revision from a branch name or an InferOS Cloudflare Worker version.
 3. Deploy: `pnpm stage:deploy dev`. It builds the workspace (frontend in non-Access mode), creates any missing KV namespace, writes `wrangler.stage-dev.jsonc` beside each package, deploys gatekeepers, then the backend, then the router, checks that only the router (and, on `dev`, the gatekeeper's sign-in proxy) has a URL, checks the Access redirect on every stage hostname, and runs the smoke when a service token is set. `dev` refuses a dirty tree unless `--allow-dirty`; `prod` always refuses one. The successful command prints a JSON deploy record containing the InferOS commit, stage config digest, resolved InferOps commit and compatibility pin, and smoke report or skip reason. Save that record with the deployment evidence.
-4. Accept it by hand: sign in through Access, choose "Sign in with InferLab", and open a board you hold (`inferops://<tenant>.<workspace>/project/board/<KEY>`). A config that validates is not acceptance. On `dev`, the reserved grokbot personas and their board are set up as in [set up the grokbot tenant for dev-os](grokbot-dev-os.md).
+4. Accept it by hand: sign in through Access, choose "Sign in with Google", and open a board you hold (`inferops://<tenant>.<workspace>/project/board/<KEY>`). A config that validates is not acceptance. On `dev`, the reserved grokbot personas and their board are set up as in [set up the grokbot tenant for dev-os](grokbot-dev-os.md).
 5. Re-deploying is the same command; KV namespaces, the bucket and every Durable Object are kept.
 
 ## InferLab edge secret
@@ -46,7 +46,7 @@ Dev InferLab's WAF lets the stage through only when the InferOps side and this s
 
 1. Add `INFEROPS_EDGE_SECRET=<value>` to `.stage-dev.vars`.
 2. Rehearse with `pnpm stage:deploy dev --dry-run`. The `inferos-dev-gatekeeper-inferops` line should read `secrets: INFEROPS_EDGE_SECRET`, with no value anywhere.
-3. Deploy with `pnpm stage:deploy dev`, then sign in with InferLab.
+3. Deploy with `pnpm stage:deploy dev`, then sign in with Google.
 4. **Rotate.** Change both values and redeploy both sides. Requests are refused between the two deploys.
 5. **Remove.** Leaving the variable out does not delete the value, because a deploy without it keeps the previous version's secret. Delete it with `pnpm exec wrangler secret delete INFEROPS_EDGE_SECRET --name inferos-dev-gatekeeper-inferops`.
 
@@ -63,8 +63,8 @@ Dev InferLab's WAF lets the stage through only when the InferOps side and this s
 ### How a tester seat signs in
 
 1. Open `https://dev-os.factorylevel.dev`. **Cloudflare Access** asks for an email: use the address its Allow policy names for this tester. A one-time code goes to that mailbox.
-2. Choose **Sign in with InferLab**. The persona page (`auth.dev-os.factorylevel.dev`) lists the reserved test seats. Pick one: `owner@grokbot.inferlab.dev`, `power@grokbot.inferlab.dev` or `operate@grokbot.inferlab.dev`. No password or secret is involved.
-3. **Your InferOS account is that email.** A different seat, or a seat whose address changed, is a different account, with its own empty list of workspaces, not lost ones. Check `/profile` to see which you're in. To switch seats, sign out of InferOS and sign in again: the persona page is shown every time. Do not open `https://auth.dev-os.factorylevel.dev/logout`, which also ends the session behind every connected InferOps account.
+2. Choose **Use a different Google account**. The persona page (`auth.dev-os.factorylevel.dev`) lists the reserved test seats. Pick one: `owner@grokbot.inferlab.dev`, `power@grokbot.inferlab.dev` or `operate@grokbot.inferlab.dev`. No password or secret is involved.
+3. **Your InferOS account is that email.** A different seat, or a seat whose address changed, is a different account, with its own empty list of workspaces, not lost ones. Check `/profile` to see which you're in. To switch seats, sign out of InferOS and sign in again: the first sign-in after a sign-out shows the persona page, and **Use a different Google account** always does. Signing out ends the seat's InferLab sign-in everywhere, so it is signed out of the other InferLab apps too.
 
 When the day's turns are used up, the chat says so and when they reset. Nothing else changes.
 
@@ -118,7 +118,7 @@ A company's InferOS is deployed from its wrapper repository, at the InferOS revi
 | An Access application covering the hostname | The account admin, in the dashboard | Gating the instance; the deploy only checks it |
 | `STAGE_ADMINS` | The company | The instance's `/admin` users |
 | The company's InferLab tenant id (`inferops.tenantId`) | InferLab | Binding the deployment to its one company |
-| InferLab registering the origin in `auth.sso.inferosOrigins` and mapping it to the tenant id in `auth.sso.inferosCompanies` | InferLab (an InferOps configuration change) | "Sign in with InferLab", for that company's people only |
+| InferLab registering the origin in `auth.sso.inferosOrigins` and mapping it to the tenant id in `auth.sso.inferosCompanies` | InferLab (an InferOps configuration change) | "Sign in with Google", for that company's people only |
 | Optional: `CF_ACCESS_CLIENT_ID`/`_SECRET`, `CF_AI_GATEWAY*`, `INFEROPS_EDGE_SECRET` | As above | The smoke, server-managed models, an edge-restricted InferLab |
 
 **What it costs.** The account must be on Workers Paid (the deploy uses bundle sizes, Browser Rendering and the Worker Loader that need it): $5 a month per account at the time of writing, plus usage beyond the plan's included requests, Durable Objects, KV, R2 storage and Workers AI. Access is free up to its free plan's seat limit. The custom domain has no charge of its own, but the zone and domain are the company's. Check Cloudflare's current pricing before a deploy; this deploy adds nothing on the InferLab side but a configuration entry.

@@ -4,8 +4,12 @@ import { PublicApi, AuthenticatedApi } from '@gadgets/workshop-shared/api'
 import { setReportedUserId } from './errorReporting'
 import { classifyRpcError } from './rpcErrors'
 import { getDevLoginToken } from './features/auth/devLogin'
+import { setChooseAccountNext } from './features/auth/chooseAccount'
 
 const CF_ACCESS_MODE = import.meta.env.VITE_CF_ACCESS_MODE === 'true'
+
+// How long logout waits for the server to end the session before disposing the stub anyway.
+const SIGN_OUT_TIMEOUT_MS = 5000
 
 interface AuthState {
   token: string | null
@@ -164,9 +168,21 @@ export function useAuth(publicApi: RpcStub<PublicApi>) {
       return
     }
 
+    // End the session on the server too (FAC-300): its token is refused from then on, and a provider
+    // sign-in backing it is ended everywhere. Best effort, and never awaited by the UI: the stub is
+    // disposed once the server answers, or after SIGN_OUT_TIMEOUT_MS, and the browser forgets the
+    // session at once either way. The next sign-in asks for the provider's account chooser.
+    const signingOut = authenticatedApiRef.current
+    if (signingOut) {
+      const ended = Promise.resolve().then(() => signingOut.signOut()).catch(() => {})
+      const timeout = new Promise<void>(resolve => setTimeout(resolve, SIGN_OUT_TIMEOUT_MS))
+      void Promise.race([ended, timeout]).then(() => signingOut[Symbol.dispose]())
+    }
+    setChooseAccountNext()
+
     // Use functional updater to read current state (avoids stale closure).
     setAuthState(prev => {
-      if (prev.authenticatedApi) {
+      if (prev.authenticatedApi && prev.authenticatedApi !== signingOut) {
         prev.authenticatedApi[Symbol.dispose]()
       }
       return {

@@ -115,12 +115,16 @@ type Env = Cloudflare.Env & {
 
 @validateRpc()
 class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
+  // `sessionSecret` is the secret half of the session token this API was authenticated with, which
+  // `signOut()` ends; absent for a Cloudflare Access session, which has no token.
   constructor(private ctx: ExecutionContext, private env: Env,
       userId: DurableObjectId,
-      private abortSession: (reason: Error) => void) {
+      private abortSession: (reason: Error) => void,
+      sessionSecret?: string) {
     super();
 
     this.#userId = userId;
+    this.#sessionSecret = sessionSecret;
     this.overseers = this.ctx.exports.OverseerDurableObject;
     this.adminSettings = this.ctx.exports.AdminSettings;
     this.users = this.ctx.exports.UserDurableObject;
@@ -131,6 +135,7 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   private users: DurableObjectNamespace<UserDurableObject>;
 
   #userId: DurableObjectId;
+  #sessionSecret?: string;
   #userSearchPolicyCache?: { expiresAt: number; promise: Promise<boolean> };
 
   #userSearchEnabled(): Promise<boolean> {
@@ -185,6 +190,9 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     if (!(await this.#userSearchEnabled())) return [];
     return retryOnDoReset(() => this.ctx.exports.UserDirectoryDurableObject.getByName("")
         .searchUsers(query, [this.#userId.name!, ...excludeIds]));
+  }
+  async signOut(): Promise<void> {
+    if (this.#sessionSecret !== undefined) await this.#user.signOut(this.#sessionSecret);
   }
   changePassword(oldHash: Uint8Array, newHash: Uint8Array): Promise<void> {
     return this.#user.changePassword(oldHash, newHash);
@@ -1397,7 +1405,7 @@ class PublicApiImpl extends RpcTarget implements PublicApi {
     return getServerConfig(this.env);
   }
 
-  async startGatekeeperLogin(vendorId: string)
+  async startGatekeeperLogin(vendorId: string, options?: { chooseAccount?: boolean })
       : Promise<{ url: string; nonce: string; attempt: RpcStub<LoginAttempt> }> {
     if (!getAuthGatekeeperAllowlist(this.env).includes(vendorId)) {
       throw new Error(`Sign-in via "${vendorId}" is not enabled on this deployment.`);
@@ -1418,16 +1426,23 @@ class PublicApiImpl extends RpcTarget implements PublicApi {
     // while it is still running instead of reporting it expired.
     await pending.begin();
     // A vendor that yields a stable subject keys the account on it, not the email (ADR 0019).
-    const callback = this.ctx.exports.LoginConnectCallbackImpl(
-        { props: { pendingId: pendingId.toString(), vendorId, ...(desc.providesSubject ? { subject: true } : {}) } });
+    // A vendor whose sign-in connects (FAC-300) keeps the account, and its sign-in backs the session.
+    const connects = desc.providesSubject === true && desc.signInConnects === true;
+    const callback = this.ctx.exports.LoginConnectCallbackImpl({ props: {
+      pendingId: pendingId.toString(), vendorId,
+      ...(desc.providesSubject ? { subject: true } : {}), ...(connects ? { connects: true } : {}),
+    } });
     // For most providers, sign-in needs only minimal scopes to verify the user's email (the grant is
     // transient); capability scopes are requested later via an explicit connectAccount. Cloudflare is
     // the exception: signing in with Cloudflare also links AI Gateway billing, so it requests and
-    // persists the billing-only scope set up front.
-    const options = vendorId === CLOUDFLARE_VENDOR_ID
+    // persists the billing-only scope set up front. A vendor whose sign-in connects asks for its
+    // full scopes, as its connect would.
+    const chooseAccount = desc.chooseAccountLabel && typeof options?.chooseAccount === "boolean"
+      ? { chooseAccount: options.chooseAccount } : {};
+    const connectOptions = vendorId === CLOUDFLARE_VENDOR_ID
       ? { scopes: "full" as const, resourceUrlPatterns: [] }
-      : { scopes: "auth" as const };
-    const { url } = await vendor.connectAccount(callback, options);
+      : connects ? { scopes: "full" as const, ...chooseAccount } : { scopes: "auth" as const, ...chooseAccount };
+    const { url } = await vendor.connectAccount(callback, connectOptions);
     // @ts-expect-error Cap'n Web RPC stubs and native RPC targets are compatible but the type
     //     system doesn't know this.
     return { url, nonce: secret.toHex(), attempt: new LoginAttemptImpl(pending) };
@@ -1455,7 +1470,7 @@ class PublicApiImpl extends RpcTarget implements PublicApi {
       user_id: userId.toString(),
       source: "session_token",
     });
-    return new AuthenticatedApiImpl(this.ctx, this.env, userId, this.abortSession);
+    return new AuthenticatedApiImpl(this.ctx, this.env, userId, this.abortSession, split[1]);
   }
 
   async authenticateFromCfAccess(): Promise<AuthenticatedApi> {

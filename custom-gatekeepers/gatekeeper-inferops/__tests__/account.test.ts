@@ -154,6 +154,9 @@ class FakeInferLab {
   emailVerified = true;
   accessTtlMs = HOUR;
   logouts: string[] = [];
+  /** Refresh tokens `/auth/sign-out` was presented, and whether it answers 503. */
+  signOuts: string[] = [];
+  signOutDown = false;
   refreshes: string[] = [];
   exchanges = 0;
   apiCalls: ApiCall[] = [];
@@ -274,7 +277,7 @@ class FakeInferLab {
       strays.push({ path: url.pathname + url.search, token, workspaceId: headers.get("x-workspace-id"), issuer });
       return Response.json({ error: { code: "UNAUTHORIZED", message: "this test has ended" } }, { status: 401 });
     }
-    if (url.pathname === "/auth/refresh" || url.pathname === "/auth/logout") {
+    if (url.pathname === "/auth/refresh" || url.pathname === "/auth/logout" || url.pathname === "/auth/sign-out") {
       const { tag } = refreshParts(body.refreshToken);
       if (tag !== this.#tag) {
         this.#foreignAuth.push({ path: url.pathname, token: null, workspaceId: null, issuer: issuers.get(tag) ?? null });
@@ -304,6 +307,14 @@ class FakeInferLab {
     if (url.pathname === "/auth/logout") {
       this.logouts.push(body.refreshToken!);
       this.endSession(body.refreshToken!);
+      return new Response(null, { status: 204 });
+    }
+    if (url.pathname === "/auth/sign-out") {
+      // Every session of the person ends: this fake's sessions are all one person's (FAC-300).
+      this.signOuts.push(body.refreshToken!);
+      if (this.signOutDown) return new Response("down", { status: 503 });
+      if (!this.sessions.has(body.refreshToken!)) return Response.json({ error: "unauthorized" }, { status: 401 });
+      for (const session of this.sessions.keys()) this.endSession(session);
       return new Response(null, { status: 204 });
     }
     const workspaceId = headers.get("x-workspace-id");
@@ -772,6 +783,68 @@ describe("revoking", () => {
     expect(await failure(session.readBoard())).toContain("not connected");
     // A disconnect is the person's own action, not an expiry.
     expect(expired).not.toContain("revoke");
+  });
+});
+
+// FAC-300: the account a sign-in connects backs the Workshop session, which checks the InferLab
+// session through it and ends the person's sign-in everywhere through it.
+describe("the sign-in behind a Workshop session", () => {
+  it("is live while InferLab refreshes the session, which rotates it", async () => {
+    const account = await connect("check-live");
+
+    expect(await hooks().checkSignIn(account)).toBe(true);
+
+    expect(inferlab.refreshes).toEqual(["refresh-1"]);
+    expect(inferlab.sessions.has("refresh-2")).toBe(true);
+    expect(await hooks().checkSignIn(account)).toBe(true);
+    expect(inferlab.refreshes).toEqual(["refresh-1", "refresh-2"]);
+  });
+
+  it("has ended once InferLab refuses the refresh, and the account refuses its bindings", async () => {
+    const account = await connect("check-ended");
+    const session = await bindBoard(account, "check-ended");
+    inferlab.endSession("refresh-1");
+
+    expect(await hooks().checkSignIn(account)).toBe(false);
+    expect(await failure(session.readBoard())).toContain("UNAUTHORIZED");
+    // The death is recorded: a second check asks InferLab nothing.
+    expect(await hooks().checkSignIn(account)).toBe(false);
+    expect(inferlab.refreshes).toEqual(["refresh-1"]);
+  });
+
+  it("says nothing either way when InferLab cannot answer", async () => {
+    const account = await connect("check-down");
+    const real = globalThis.fetch;
+    vi.stubGlobal("fetch", async (input: string | URL | Request, init?: RequestInit) =>
+      String(input).endsWith("/auth/refresh") ? new Response("down", { status: 503 }) : real(input, init));
+
+    expect(await hooks().checkSignIn(account)).toMatch(/HTTP 503/);
+    vi.stubGlobal("fetch", real);
+    expect(await hooks().checkSignIn(account)).toBe(true);
+  });
+
+  it("is ended everywhere with /auth/sign-out, not only this session with /auth/logout", async () => {
+    const account = await connect("sign-out");
+    const session = await bindBoard(account, "sign-out");
+    await session.readBoard();
+
+    expect(await hooks().endSignIn(account)).toBeNull();
+
+    expect(inferlab.signOuts).toEqual(["refresh-1"]);
+    expect(inferlab.logouts).toEqual([]);
+    expect(inferlab.sessions.size).toBe(0);
+    expect(await failure(session.readBoard())).toContain("UNAUTHORIZED");
+    expect(await hooks().checkSignIn(account)).toBe(false);
+    // Idempotent: an ended session's sign-out is not a failure.
+    expect(await hooks().endSignIn(account)).toBeNull();
+  });
+
+  it("reports a sign-out InferLab refused, so it never reads as done", async () => {
+    const account = await connect("sign-out-down");
+    inferlab.signOutDown = true;
+
+    expect(await hooks().endSignIn(account)).toContain("HTTP 503");
+    expect(inferlab.sessions.has("refresh-1")).toBe(true);
   });
 });
 

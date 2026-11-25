@@ -1,6 +1,8 @@
 // Sign in with InferLab: the vendor offers sign-in only when configured, the popup leg redirects to
 // InferLab's /authorize with PKCE, and the callback leg exchanges the code once, server-side, and
-// hands the Workshop an account carrying the verified email.
+// hands the Workshop an account carrying the verified email. Signing in connects that account and
+// keeps its session (FAC-300); a sign-in first asks InferLab to reuse a live sign-in (`prompt=none`)
+// and goes on to an interactive leg when there is none.
 
 import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
@@ -8,7 +10,7 @@ import { pkceChallenge } from "@gadgets/gatekeeper-kit/oauth-client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   exchangeFromTokenResponse, handleInferLabLogin, inferLabAuthOrigin, startInferLabLogin,
-  verifiedEmail,
+  verifiedEmail, type LoginPurpose,
 } from "../src/inferlab-login.js";
 import { companyAdmits, deploymentCompany } from "../src/deployment-company.js";
 import { signIns, signInSubjects, type InferLabLogin, type SignInExports } from "./worker.js";
@@ -28,11 +30,14 @@ async function withExports<R>(body: (exports: SignInExports) => Promise<R>): Pro
     body(state.exports as unknown as SignInExports));
 }
 
+/** The Workshop's sign-in: a connect that first asks InferLab to reuse a live sign-in. */
+const SIGN_IN: LoginPurpose = { kind: "connect", silent: true };
+
 /** Starts an attempt whose callback records under `label`; returns the popup URL. */
-async function start(label: string): Promise<string> {
+async function start(label: string, purpose: LoginPurpose = SIGN_IN): Promise<string> {
   return withExports(async exports => {
     const callback = exports.TestConnectCallback({ props: { label } });
-    return (await startInferLabLogin(env.INFERLAB_LOGIN, LOGIN_ENV, { kind: "signin" }, callback as never)).url;
+    return (await startInferLabLogin(env.INFERLAB_LOGIN, LOGIN_ENV, purpose, callback as never)).url;
   });
 }
 
@@ -42,8 +47,8 @@ function get(url: string, company?: string): Promise<Response | null> {
 }
 
 /** Follows the popup URL to InferLab; returns the authorize request's parameters. */
-async function authorize(label: string): Promise<URLSearchParams> {
-  const response = await get(await start(label));
+async function authorize(label: string, purpose: LoginPurpose = SIGN_IN): Promise<URLSearchParams> {
+  const response = await get(await start(label, purpose));
   expect(response?.status).toBe(302);
   const location = new URL(response!.headers.get("Location")!);
   expect(`${location.origin}${location.pathname}`).toBe("http://localhost:8080/authorize");
@@ -54,7 +59,8 @@ type TokenRequest = { clientId: string; code: string; codeVerifier: string; redi
 
 /**
  * Stubs InferLab: the token endpoint answers with `reply`, recording each exchange it is asked for;
- * `/auth/logout` is recorded in `logouts` and always succeeds.
+ * `/auth/logout` is recorded in `logouts` and always succeeds; InferOps' `GET /workspaces` lists
+ * the one workspace `user` reports.
  */
 function tokenEndpoint(reply: (request: TokenRequest) => Response) {
   const requests: Array<{ url: string; body: TokenRequest }> = [];
@@ -64,6 +70,11 @@ function tokenEndpoint(reply: (request: TokenRequest) => Response) {
     if (url.endsWith("/auth/logout")) {
       logouts.push((JSON.parse(String(init.body)) as { refreshToken: string }).refreshToken);
       return new Response(null, { status: 204 });
+    }
+    if (url.endsWith("/workspaces")) {
+      return Response.json([{
+        id: "90000000-0000-4000-8000-000000000001", tenant_id: "t1", product: "inferops", name: "Ops", slug: "ops",
+      }]);
     }
     const body = JSON.parse(String(init.body)) as TokenRequest;
     requests.push({ url, body });
@@ -169,14 +180,76 @@ describe("sign-in flow", () => {
     expect(params.get("client_id")).toBe("inferos");
     expect(params.get("redirect_uri")).toBe(REDIRECT_URI);
     expect(params.get("code_challenge_method")).toBe("S256");
-    // Asks for the sign-in page even without a sign-in proxy, so a live InferLab session left from
-    // an earlier sign-in is not silently reused after signing out of InferOS.
-    expect(params.get("prompt")).toBe("select_account");
+    // A sign-in first asks InferLab to reuse a live sign-in in the browser, without any page.
+    expect(params.get("prompt")).toBe("none");
     expect(params.get("code_challenge")).toMatch(/^[A-Za-z0-9_-]{43}$/);
     expect(params.get("state")).toMatch(/^[0-9a-f]{64}\.[0-9a-f]{64}$/);
   });
 
-  it("exchanges the code once, hands the Workshop the verified email and ends the session", async () => {
+  it("asks for the account chooser for another account, after a sign-out, and on a Gatekeepers-page connect", async () => {
+    expect((await authorize("chooser", { kind: "connect" })).get("prompt")).toBe("select_account");
+    expect((await authorize("chooser-false", { kind: "connect", silent: false })).get("prompt"))
+      .toBe("select_account");
+    await withExports(async exports => {
+      const vendor = exports.GatekeeperVendor({});
+      const callback = exports.TestConnectCallback({ props: { label: "vendor-chooser" } });
+      for (const [options, prompt] of [
+        [{ scopes: "full" as const }, "select_account"],
+        [{ scopes: "full" as const, chooseAccount: true }, "select_account"],
+        [{ scopes: "full" as const, chooseAccount: false }, "none"],
+        // The vendor's sign-in connects, so a transient-scope request is a connect too.
+        [{ scopes: "auth" as const, chooseAccount: false }, "none"],
+      ] as const) {
+        const { url } = await vendor.connectAccount(callback as never, options);
+        const response = await get(url);
+        expect(new URL(response!.headers.get("Location")!).searchParams.get("prompt"), JSON.stringify(options))
+          .toBe(prompt);
+      }
+    });
+  });
+
+  it("goes on to an interactive leg with no prompt when InferLab has no live sign-in", async () => {
+    const silent = await authorize("login-required");
+    const requests = tokenEndpoint(signedIn("ada@example.com"));
+
+    const resumed = await get(`${REDIRECT_URI}?error=login_required&state=${silent.get("state")}`);
+
+    expect(resumed?.status).toBe(302);
+    const location = new URL(resumed!.headers.get("Location")!);
+    expect(`${location.origin}${location.pathname}`).toBe("http://localhost:8080/authorize");
+    const params = location.searchParams;
+    expect(params.has("prompt")).toBe(false);
+    expect(params.get("client_id")).toBe("inferos");
+    expect(params.get("state")).not.toBe(silent.get("state"));
+    expect(params.get("state")!.split(".")[0]).toBe(silent.get("state")!.split(".")[0]);
+    expect(params.get("code_challenge")).not.toBe(silent.get("code_challenge"));
+    // The silent leg's state is spent: neither a replay of the error nor a code under it does anything.
+    expect((await get(`${REDIRECT_URI}?error=login_required&state=${silent.get("state")}`))?.status).toBe(400);
+    expect((await get(`${REDIRECT_URI}?code=c&state=${silent.get("state")}`))?.status).toBe(400);
+
+    // The interactive leg completes the sign-in with its own verifier.
+    const done = await get(`${REDIRECT_URI}?code=c&state=${params.get("state")}`);
+    expect(done?.status).toBe(200);
+    expect(await pkceChallenge(requests[0].body.codeVerifier)).toBe(params.get("code_challenge"));
+    expect(signIns).toContainEqual({ label: "login-required", email: "ada@example.com" });
+
+    // An interactive leg InferLab cannot complete ends the attempt: there is no third leg.
+    const second = await authorize("login-required-twice");
+    const interactive = new URL((await get(
+      `${REDIRECT_URI}?error=login_required&state=${second.get("state")}`))!.headers.get("Location")!).searchParams;
+    const ended = await get(`${REDIRECT_URI}?error=login_required&state=${interactive.get("state")}`);
+    expect(ended?.status).toBe(400);
+    expect(await ended!.text()).toContain("not completed");
+  });
+
+  it("ends an attempt that asked for the chooser when InferLab answers login_required", async () => {
+    const params = await authorize("chooser-login-required", { kind: "connect" });
+    const response = await get(`${REDIRECT_URI}?error=login_required&state=${params.get("state")}`);
+    expect(response?.status).toBe(400);
+    expect((await get(`${REDIRECT_URI}?code=c&state=${params.get("state")}`))?.status).toBe(400);
+  });
+
+  it("exchanges the code once, hands the Workshop the verified email and keeps the session", async () => {
     const params = await authorize("ok");
     const requests = tokenEndpoint(signedIn("ada@example.com"));
     const callbackUrl = `${REDIRECT_URI}?code=the-code&state=${params.get("state")}`;
@@ -193,8 +266,8 @@ describe("sign-in flow", () => {
     expect(requests[0].body).toMatchObject(
       { clientId: "inferos", code: "the-code", redirectUri: REDIRECT_URI });
     expect(await pkceChallenge(requests[0].body.codeVerifier)).toBe(params.get("code_challenge"));
-    // Signing in grants nothing: the InferLab session it opened is signed out again.
-    expect(requests.logouts).toEqual(["refresh"]);
+    // Signing in connects the account (FAC-300): the InferLab session it opened is kept.
+    expect(requests.logouts).toEqual([]);
 
     // The state is single-use: a replay neither exchanges again nor signs in again.
     expect((await get(callbackUrl))?.status).toBe(400);
@@ -269,11 +342,10 @@ describe("sign-in flow", () => {
   it("sends the browser to the authorize origin but exchanges the code at the InferLab origin", async () => {
     const proxied = { ...LOGIN_ENV, INFERLAB_AUTHORIZE_ORIGIN: "http://127.0.0.1:8788" };
     const popup = await handleInferLabLogin(new Request(await start("proxied")), proxied, env.INFERLAB_LOGIN);
-    // Straight to /authorize on the proxy, asking for the sign-in page: no /logout, which would also
-    // end the InferLab session behind an account already connected through this host.
+    // Straight to /authorize on the proxy, first reusing a live sign-in on that host.
     const location = new URL(popup!.headers.get("Location")!);
     expect(`${location.origin}${location.pathname}`).toBe("http://127.0.0.1:8788/authorize");
-    expect(location.searchParams.get("prompt")).toBe("select_account");
+    expect(location.searchParams.get("prompt")).toBe("none");
     expect(location.searchParams.get("client_id")).toBe("inferos");
     expect(location.searchParams.get("redirect_uri")).toBe(REDIRECT_URI);
     expect(location.searchParams.get("code_challenge_method")).toBe("S256");

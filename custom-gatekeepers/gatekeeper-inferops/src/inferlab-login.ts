@@ -1,5 +1,5 @@
-// Sign in and connect with InferLab: the Workshop's gatekeeper flows (`connectAccount` with
-// `scopes: "auth"` or `"full"`, and `GatekeeperUser.reconnect`), backed by InferLab central-auth's
+// Sign in and connect with InferLab: the Workshop's gatekeeper flows (`connectAccount`, for a
+// sign-in and a connect alike, and `GatekeeperUser.reconnect`), backed by InferLab central-auth's
 // authorization-code + PKCE server.
 //
 // - InferOS is the public client `inferos` (no secret). Its redirect URI is this gatekeeper's
@@ -7,17 +7,22 @@
 //   server. With no valid origin configured the vendor offers neither sign-in nor a connect flow.
 //   `INFERLAB_AUTHORIZE_ORIGIN`, when set, is where the browser is sent for `/authorize` instead
 //   (the sign-in proxy, auth-proxy.ts); every server-side call still goes to the InferLab origin.
-//   `/authorize` always carries `prompt=select_account`, so the sign-in page is shown even while
-//   the browser holds a central-auth session, and a person can choose again after signing out.
+// - `/authorize` carries a `prompt`. The Workshop's sign-in (FAC-300) asks for `prompt=none`
+//   unless the person chose another account or just signed out: a live central-auth session in the
+//   browser then completes the popup with no page at all, and InferLab's `login_required` answer
+//   sends the popup on to a second, interactive leg with no prompt, which goes straight to Google.
+//   Every other flow (a sign-in asking for the chooser, a connect from the Gatekeepers page, a
+//   reconnect) carries `prompt=select_account`, so the person picks which account.
 // - `InferLabLogin` is one short-lived Durable Object per attempt. It holds the flow's purpose, the
 //   Workshop's callback, the single-use initiation and OAuth nonces, and the PKCE verifier, and
 //   deletes itself by alarm.
 // - The code is exchanged server-side (`POST /auth/token`). What happens to the session depends on
 //   the purpose:
-//   - Sign-in keeps only the email, and only when InferLab marks it `emailVerified: true`; the
-//     session is signed out again at once, so signing in leaves no InferLab session behind.
-//   - A connect stores the session in the account's `InferOpsCredentials` object, so the person's
-//     own authority backs every request the account makes (inferops-credentials.ts).
+//   - A connect, which is also what signing in to InferOS is (the vendor declares
+//     `signInConnects`, FAC-300), stores the session in the account's `InferOpsCredentials` object,
+//     so the person's own authority backs every request the account makes, and the Workshop session
+//     the sign-in mints is backed by it (inferops-credentials.ts). The email is passed on only when
+//     InferLab marks it `emailVerified: true`.
 //   - A reconnect stages the session there until the Workshop commits it.
 //   Before either stores a session, the slugs of the person's workspaces are read from InferOps
 //   (`GET /workspaces`) and kept beside the memberships InferLab reported, since a resource URL
@@ -79,14 +84,16 @@ export type InferLabLoginEnv = {
 };
 
 /**
- * What an attempt is for. A sign-in hands the Workshop a transient account carrying the verified
- * email; a connect mints a persistent account backed by the person's session; a reconnect replaces
- * an existing account's session.
+ * What an attempt is for. A connect (a sign-in, or a connect from the Gatekeepers page) mints a
+ * persistent account backed by the person's session; `silent` asks InferLab to reuse a sign-in the
+ * browser holds before showing any page. A reconnect replaces an existing account's session.
  */
 export type LoginPurpose =
-  | { kind: "signin" }
-  | { kind: "connect" }
+  | { kind: "connect"; silent?: boolean }
   | { kind: "reconnect"; accountId: string };
+
+/** The `prompt` an attempt's authorize leg carries; null for the interactive leg after `none`. */
+type Prompt = "none" | "select_account" | null;
 
 /**
  * The configured InferLab auth origin, or null when sign-in is off. Anything but a bare HTTPS origin
@@ -172,9 +179,12 @@ export function inferLabLoginUrl(env: InferLabLoginEnv, attemptId: string, nonce
   return `${baseUrl(env)}/${attemptId}/${nonce}`;
 }
 
+// `silent`: the oauth leg asked for `prompt=none`, so InferLab's `login_required` moves it on to an
+// interactive leg instead of ending it.
 type Flow =
   | { stage: "initiation"; nonce: string; expiresAt: number }
-  | { stage: "oauth"; nonce: string; expiresAt: number; codeVerifier: string; redirectUri: string };
+  | { stage: "oauth"; nonce: string; expiresAt: number; codeVerifier: string; redirectUri: string;
+      silent?: boolean };
 
 /** What a `POST /auth/token` response yields: the session and whom it belongs to. */
 export type InferLabExchange = InferOpsConnection & {
@@ -268,18 +278,39 @@ export class InferLabLogin extends DurableObject<Cloudflare.Env> {
   }
 
   /**
-   * Trades the initiation nonce for the authorization request's state nonce and PKCE challenge.
-   * Returns null when the link is unknown, used or expired.
+   * Trades the initiation nonce for the authorization request's state nonce, PKCE challenge and
+   * prompt. Returns null when the link is unknown, used or expired.
    */
   async begin(initiationNonce: string, redirectUri: string)
-      : Promise<{ oauthNonce: string; codeChallenge: string } | null> {
+      : Promise<{ oauthNonce: string; codeChallenge: string; prompt: Prompt } | null> {
     const flow = this.#claim("initiation", initiationNonce);
     if (!flow) return null;
+    const purpose = this.ctx.storage.kv.get<LoginPurpose>(PURPOSE_KEY);
+    const silent = purpose?.kind === "connect" && purpose.silent === true;
+    return { ...await this.#oauthLeg(redirectUri, silent), prompt: silent ? "none" : "select_account" };
+  }
+
+  /**
+   * After InferLab answered a silent leg with `login_required` (no live sign-in in the browser):
+   * trades its state nonce for an interactive leg's, which asks for no prompt. Returns null, and
+   * leaves the attempt alone, for anything but a live silent leg.
+   */
+  async resume(oauthNonce: string, redirectUri: string)
+      : Promise<{ oauthNonce: string; codeChallenge: string; prompt: Prompt } | null> {
+    const current = this.ctx.storage.kv.get<Flow>(FLOW_KEY);
+    if (current?.stage !== "oauth" || current.silent !== true) return null;
+    if (!this.#claim("oauth", oauthNonce)) return null;
+    const leg = await this.#oauthLeg(redirectUri, false);
+    await this.ctx.storage.setAlarm(Date.now() + OAUTH_NONCE_LIFETIME_MS);
+    return { ...leg, prompt: null };
+  }
+
+  async #oauthLeg(redirectUri: string, silent: boolean): Promise<{ oauthNonce: string; codeChallenge: string }> {
     const pkce = await createPkce();
     const oauthNonce = generateNonce();
     this.ctx.storage.kv.put<Flow>(FLOW_KEY, {
       stage: "oauth", nonce: oauthNonce, expiresAt: Date.now() + OAUTH_NONCE_LIFETIME_MS,
-      codeVerifier: pkce.codeVerifier, redirectUri,
+      codeVerifier: pkce.codeVerifier, redirectUri, ...(silent ? { silent: true } : {}),
     });
     return { oauthNonce, codeChallenge: pkce.codeChallenge };
   }
@@ -332,18 +363,10 @@ export class InferLabLogin extends DurableObject<Cloudflare.Env> {
                 callback: Fetcher<GatekeeperConnectCallback> | undefined): Promise<ConnectHandoff> {
     const credentials = this.ctx.exports.InferOpsCredentials as unknown as CredentialsNamespace;
     switch (purpose.kind) {
-      case "signin": {
-        if (!callback) throw new Error("This sign-in attempt has no callback.");
-        // Only the principal and a vouched email are kept: the session itself is ended, since
-        // signing in grants nothing. The Workshop keys the account on the principal (ADR 0019), so an
-        // email InferLab doesn't vouch for (after an email change, say) is simply not passed on.
-        const email = exchange.emailVerified ? exchange.identity.email : undefined;
-        await logoutInferLabSession(origin, exchange.grant.refreshToken, inferLabFetch(this.env));
-        return callback.complete(this.#account({
-          accountId: crypto.randomUUID(), ...(email ? { email } : {}), subject: subjectOf(origin, exchange),
-        }));
-      }
       case "connect": {
+        // A sign-in too (FAC-300): the session is kept, and the Workshop keys the account on the
+        // principal (ADR 0019), so an email InferLab doesn't vouch for (after an email change, say)
+        // is simply not passed on.
         if (!callback) throw new Error("This connect attempt has no callback.");
         const connection = await this.#withSlugs(origin, exchange);
         const accountId = crypto.randomUUID();
@@ -366,6 +389,10 @@ export class InferLabLogin extends DurableObject<Cloudflare.Env> {
         const store = credentials.get(credentials.idFromName(purpose.accountId));
         return store.completeReconnect(connection);
       }
+      default:
+        // An attempt started before this deployment, for a purpose that no longer exists.
+        await logoutInferLabSession(origin, exchange.grant.refreshToken, inferLabFetch(this.env));
+        throw new SignInFailure("This sign-in attempt has expired. Close this window and try again.");
     }
   }
 
@@ -478,6 +505,28 @@ function attemptStub(namespace: LoginNamespace, attemptId: string) {
 
 const invalidLink = () => htmlResponse(INVALID_LINK_HTML, 400);
 
+const notConfigured = () => htmlResponse(errorPageHtml("InferLab sign-in is not configured",
+  "Ask the administrator of this deployment to check INFERLAB_AUTH_ORIGIN and " +
+  "INFERLAB_AUTHORIZE_ORIGIN."), 503);
+
+/**
+ * The browser's redirect to InferLab's `/authorize` for one oauth leg of attempt `attemptId`.
+ * `prompt=none` reuses a live central-auth session silently; `prompt=select_account` asks for the
+ * account chooser even while one is live (factory-level/inferops#2528), so a person can choose
+ * again; no prompt is the interactive leg after `none`, which InferLab sends straight to Google.
+ */
+function authorizeRedirect(origin: string, attemptId: string, redirectUri: string,
+                           leg: { oauthNonce: string; codeChallenge: string; prompt: Prompt }): Response {
+  const authorize = new URL("/authorize", origin);
+  authorize.searchParams.set("client_id", INFERLAB_CLIENT_ID);
+  authorize.searchParams.set("redirect_uri", redirectUri);
+  authorize.searchParams.set("state", `${attemptId}.${leg.oauthNonce}`);
+  authorize.searchParams.set("code_challenge", leg.codeChallenge);
+  authorize.searchParams.set("code_challenge_method", "S256");
+  if (leg.prompt) authorize.searchParams.set("prompt", leg.prompt);
+  return Response.redirect(authorize.toString(), 302);
+}
+
 /**
  * Serves the two browser legs of the flow under BASE_URL: `/<attempt>/<nonce>` redirects to InferLab's
  * `/authorize`, and `/oauth` is the registered redirect URI. A request on the authorize origin is the
@@ -494,30 +543,13 @@ export async function handleInferLabLogin(request: Request, env: InferLabLoginEn
 
   if (segments.length === 2 && HEX_64.test(segments[1])) {
     const origin = inferLabAuthorizeOrigin(env);
-    if (!origin) {
-      return htmlResponse(errorPageHtml("InferLab sign-in is not configured",
-        "Ask the administrator of this deployment to check INFERLAB_AUTH_ORIGIN and " +
-        "INFERLAB_AUTHORIZE_ORIGIN."), 503);
-    }
+    if (!origin) return notConfigured();
     const stub = attemptStub(namespace, segments[0]);
     if (!stub) return invalidLink();
     const redirectUri = inferLabRedirectUri(env);
     const begun = await stub.begin(segments[1], redirectUri);
     if (!begun) return invalidLink();
-
-    const authorize = new URL("/authorize", origin);
-    authorize.searchParams.set("client_id", INFERLAB_CLIENT_ID);
-    authorize.searchParams.set("redirect_uri", redirectUri);
-    authorize.searchParams.set("state", `${segments[0]}.${begun.oauthNonce}`);
-    authorize.searchParams.set("code_challenge", begun.codeChallenge);
-    authorize.searchParams.set("code_challenge_method", "S256");
-    // A live central-auth session in the browser makes `/authorize` answer at once as whoever signed
-    // in last, and signing out of InferOS does not end it. `prompt=select_account` asks InferLab for
-    // the sign-in page anyway (factory-level/inferops#2528), on every deployment, so a person can
-    // choose again, while that session, InferLab's own apps under it, and every connection opened
-    // under it stay live.
-    authorize.searchParams.set("prompt", "select_account");
-    return Response.redirect(authorize.toString(), 302);
+    return authorizeRedirect(origin, segments[0], redirectUri, begun);
   }
 
   if (segments.length === 1 && `/${segments[0]}` === CALLBACK_PATH) {
@@ -527,6 +559,14 @@ export async function handleInferLabLogin(request: Request, env: InferLabLoginEn
     if (!stub) return invalidLink();
 
     if (url.searchParams.has("error")) {
+      // A silent leg InferLab could not complete without a page goes on to the interactive one.
+      if (url.searchParams.get("error") === "login_required") {
+        const origin = inferLabAuthorizeOrigin(env);
+        if (!origin) return notConfigured();
+        const redirectUri = inferLabRedirectUri(env);
+        const resumed = await stub.resume(oauthNonce, redirectUri);
+        if (resumed) return authorizeRedirect(origin, attemptId, redirectUri, resumed);
+      }
       if (!await stub.abandon(oauthNonce)) return invalidLink();
       return htmlResponse(errorPageHtml("Sign-in was not completed",
         "InferLab did not complete the sign-in. Close this window and try again."), 400);

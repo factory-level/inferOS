@@ -266,3 +266,84 @@ describe('useAuth error reporting identity', () => {
     expect(containers[1].textContent).toBe('Signed out')
   })
 })
+
+// FAC-300: signing out ends the session on the server, not only in this browser.
+describe('useAuth sign-out', () => {
+  const roots: Root[] = []
+
+  afterEach(() => {
+    act(() => roots.forEach(root => root.unmount()))
+    roots.length = 0
+    document.body.replaceChildren()
+    localStorage.clear()
+    vi.useRealTimers()
+    vi.mocked(getDevLoginToken).mockReset().mockResolvedValue(null)
+  })
+
+  /** A public API whose authenticated stub records `signOut` and disposal, in order. */
+  function signOutApi(signOut: () => Promise<void>) {
+    const events: string[] = []
+    const authenticated = {
+      whoami: async () => person,
+      signOut: () => { events.push('signOut'); return signOut() },
+      [Symbol.dispose]: () => { events.push('dispose') },
+    }
+    const api = { authenticate: () => authenticated } as unknown as RpcStub<PublicApi>
+    return { api, events }
+  }
+
+  async function mountWith(api: RpcStub<PublicApi>): Promise<Controls> {
+    const captured: { controls?: Controls } = {}
+    function Consumer() {
+      const { login, logout, isAuthenticated } = useAuth(api)
+      useEffect(() => { captured.controls = { login, logout } })
+      return <p>{isAuthenticated ? 'Signed in' : 'Signed out'}</p>
+    }
+    const container = document.createElement('div')
+    document.body.append(container)
+    const root = createRoot(container)
+    roots.push(root)
+    await act(async () => root.render(<Consumer />))
+    return captured.controls!
+  }
+
+  it('ends the session on the server before disposing the stub, and asks for the chooser next time', async () => {
+    localStorage.setItem('authToken', 'stored-token')
+    const { api, events } = signOutApi(async () => {})
+    const controls = await mountWith(api)
+
+    await act(async () => controls.logout())
+
+    expect(events).toEqual(['signOut', 'dispose'])
+    expect(localStorage.getItem('authToken')).toBeNull()
+    expect(localStorage.getItem('auth.chooseAccountNext')).toBe('1')
+    expect(document.body.textContent).toBe('Signed out')
+  })
+
+  it('signs out in the browser at once even when the server never answers, and disposes after a timeout', async () => {
+    vi.useFakeTimers()
+    localStorage.setItem('authToken', 'stored-token')
+    const { api, events } = signOutApi(() => new Promise<void>(() => {}))
+    const controls = await mountWith(api)
+
+    await act(async () => controls.logout())
+    expect(document.body.textContent).toBe('Signed out')
+    expect(localStorage.getItem('authToken')).toBeNull()
+    expect(events).toEqual(['signOut'])
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
+    expect(events).toEqual(['signOut', 'dispose'])
+  })
+
+  it('signs out in the browser when the server refuses', async () => {
+    localStorage.setItem('authToken', 'stored-token')
+    const { api, events } = signOutApi(async () => { throw new Error('Peer closed WebSocket') })
+    const controls = await mountWith(api)
+
+    await act(async () => controls.logout())
+
+    expect(events).toEqual(['signOut', 'dispose'])
+    expect(localStorage.getItem('authToken')).toBeNull()
+    expect(document.body.textContent).toBe('Signed out')
+  })
+})

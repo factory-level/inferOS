@@ -685,6 +685,25 @@ export class TestHooks extends DurableObject<Cloudflare.Env> {
     await this.#account(props).revoke();
   }
 
+  /** The account's `checkSignIn()` answer (FAC-300), or its failure message. */
+  async checkSignIn(props: AccountProps): Promise<boolean | string> {
+    try {
+      return await (this.#account(props) as unknown as Required<Pick<GatekeeperUser, "checkSignIn">>).checkSignIn();
+    } catch (error) {
+      return messageOf(error);
+    }
+  }
+
+  /** Ends the account's InferLab sign-in everywhere (FAC-300); the failure message, or null. */
+  async endSignIn(props: AccountProps): Promise<string | null> {
+    try {
+      await (this.#account(props) as unknown as Required<Pick<GatekeeperUser, "endSignIn">>).endSignIn();
+      return null;
+    } catch (error) {
+      return messageOf(error);
+    }
+  }
+
   async reconnectAccount(props: AccountProps): Promise<string> {
     return (await this.#account(props).reconnect()).url;
   }

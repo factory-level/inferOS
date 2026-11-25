@@ -334,3 +334,90 @@ describe('OAuthButtons', () => {
     expect(receive).toHaveBeenCalledTimes(2)
   })
 })
+
+// FAC-300: one Google sign-in through InferLab. The button names no product, and a vendor with an
+// account chooser asks for it only when the person picks another account or has just signed out.
+describe('OAuthButtons with an account chooser', () => {
+  let root: Root | undefined
+  let container: HTMLDivElement | undefined
+  const INFEROPS: AuthVendorInfo = {
+    vendorId: 'inferops', displayName: 'InferOps',
+    signInLabel: 'Sign in with Google', chooseAccountLabel: 'Use a different Google account',
+  }
+  const receive = vi.fn<() => Promise<string | null>>()
+  const attempt = { receive, [Symbol.dispose]() {} } as unknown as RpcStub<LoginAttempt>
+  const startGatekeeperLogin = vi.fn<(vendorId: string, options?: { chooseAccount?: boolean }) =>
+    Promise<{ url: string; nonce: string; attempt: RpcStub<LoginAttempt> }>>(
+    async () => ({ url: URL, nonce: NONCE, attempt }))
+  const rpcStub = { startGatekeeperLogin } as unknown as RpcStub<PublicApi>
+
+  function mount(vendors: AuthVendorInfo[] = [INFEROPS]) {
+    container = document.createElement('div')
+    document.body.appendChild(container)
+    root = createRoot(container)
+    act(() => root!.render(<OAuthButtons rpcStub={rpcStub} vendors={vendors} onSuccess={() => {}} />))
+  }
+
+  const buttons = () => [...container!.querySelectorAll('button')]
+  const click = (label: string) => act(async () => {
+    buttons().find(b => b.textContent === label)!.click()
+  })
+
+  beforeEach(() => {
+    vi.useFakeTimers()
+    vi.spyOn(window, 'open').mockReturnValue(fakePopup() as unknown as Window)
+  })
+
+  afterEach(() => {
+    act(() => root?.unmount())
+    container?.remove()
+    vi.restoreAllMocks()
+    vi.useRealTimers()
+    receive.mockReset()
+    startGatekeeperLogin.mockClear()
+    localStorage.clear()
+  })
+
+  it('reads "Sign in with Google" and offers a different Google account, naming no product', () => {
+    mount()
+    expect(buttons().map(b => b.textContent)).toEqual(['Sign in with Google', 'Use a different Google account'])
+    expect(container!.textContent).not.toContain('InferOps')
+  })
+
+  it('asks to reuse a live sign-in by default', async () => {
+    receive.mockResolvedValue(null)
+    mount()
+    await click('Sign in with Google')
+    await settle()
+    expect(startGatekeeperLogin).toHaveBeenCalledExactlyOnceWith('inferops', { chooseAccount: false })
+  })
+
+  it('asks for the chooser for a different account', async () => {
+    receive.mockResolvedValue(null)
+    mount()
+    await click('Use a different Google account')
+    await settle()
+    expect(startGatekeeperLogin).toHaveBeenCalledExactlyOnceWith('inferops', { chooseAccount: true })
+  })
+
+  it('asks for the chooser after a sign-out, and stops asking once a sign-in succeeds', async () => {
+    localStorage.setItem('auth.chooseAccountNext', '1')
+    receive.mockResolvedValueOnce(TOKEN)
+    mount()
+    await click('Sign in with Google')
+    await settle()
+    await tick()
+    expect(startGatekeeperLogin).toHaveBeenCalledExactlyOnceWith('inferops', { chooseAccount: true })
+    expect(localStorage.getItem('authToken')).toBe(TOKEN)
+    expect(localStorage.getItem('auth.chooseAccountNext')).toBeNull()
+  })
+
+  it('keeps "Continue with" and passes no chooser option for a vendor without one', async () => {
+    receive.mockResolvedValue(null)
+    mount([{ vendorId: 'github', displayName: 'GitHub' }])
+    expect(buttons().map(b => b.textContent)).toEqual(['Continue with GitHub'])
+    await click('Continue with GitHub')
+    await settle()
+    expect(startGatekeeperLogin).toHaveBeenCalledExactlyOnceWith('github', undefined)
+  })
+})

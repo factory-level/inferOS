@@ -87,9 +87,9 @@ import { GovernedRequestError, listGoverned, parseGovernedListRequest } from "@g
 //   InferOps account can open that project.
 //
 // - Identity: when INFERLAB_AUTH_ORIGIN is set the vendor provides authentication ("Sign in with
-//   InferLab", `connectAccount` with `scopes: "auth"`) and a real connect flow (`scopes: "full"`),
-//   both InferLab PKCE sign-ins (inferlab-login.ts). A connected account is backed by the person's
-//   own InferLab session, held in its `InferOpsCredentials` object (inferops-credentials.ts), and
+//   Google", FAC-300), and its sign-in also connects the account: the same InferLab PKCE flow as a
+//   connect from the Gatekeepers page (inferlab-login.ts). A connected account is backed by the
+//   person's own InferLab session, held in its `InferOpsCredentials` object (inferops-credentials.ts), and
 //   every request it makes carries that person's token and one of their workspaces. Auto-provisioned
 //   accounts exist only while no auth origin is configured: they carry no identity and serve demo
 //   data, or the local-development stopgap connection.
@@ -807,6 +807,13 @@ export class GatekeeperVendor extends WorkerEntrypoint<Cloudflare.Env> {
       providesAuth: identity,
       // Sign-in keys the Workshop account on the InferLab principal, not the email (ADR 0019).
       providesSubject: identity,
+      // One Google sign-in through InferLab central auth (FAC-300): it also connects the account,
+      // whose InferLab session backs the Workshop session, and the button names no product.
+      ...(identity ? {
+        signInConnects: true,
+        signInLabel: "Sign in with Google",
+        chooseAccountLabel: "Use a different Google account",
+      } : {}),
     };
   }
 
@@ -822,14 +829,16 @@ export class GatekeeperVendor extends WorkerEntrypoint<Cloudflare.Env> {
   }
 
   /**
-   * Both flows are InferLab sign-ins: `scopes: "auth"` hands back only the verified email, anything
-   * else connects an account backed by the person's own session. Without an InferLab origin the
-   * demo account is provided automatically and there is no flow at all.
+   * Every flow is an InferLab sign-in that connects an account backed by the person's own session:
+   * the vendor declares `signInConnects`, so `scopes` changes nothing (FAC-300). `chooseAccount:
+   * false` asks InferLab to reuse a sign-in the browser holds (`prompt=none`), falling back to the
+   * normal sign-in; anything else asks for the account chooser (inferlab-login.ts). Without an
+   * InferLab origin the demo account is provided automatically and there is no flow at all.
    */
   async connectAccount(callback: Fetcher<GatekeeperConnectCallback>,
                        options?: GatekeeperConnectOptions): Promise<{ url: string }> {
     if (inferLabAuthOrigin(this.env) === null) throw new Error(NO_CONNECT_FLOW);
-    const purpose = options?.scopes === "auth" ? { kind: "signin" as const } : { kind: "connect" as const };
+    const purpose = { kind: "connect" as const, silent: options?.chooseAccount === false };
     return startInferLabLogin(this.ctx.exports.InferLabLogin, this.env, purpose, callback);
   }
 
@@ -1284,6 +1293,23 @@ export class InferOpsAccount extends WorkerEntrypoint<Cloudflare.Env, AccountPro
   async commitReconnect(stageId: string): Promise<void> {
     if (!this.ctx.props.connected) throw new Error(NO_CONNECT_FLOW);
     await this.#credentials().commitReconnect(stageId);
+  }
+
+  /**
+   * Whether the InferLab session behind this account is still live (`GatekeeperUser.checkSignIn`):
+   * the session is refreshed now, and a refusal there is its end. False for an account with none.
+   */
+  async checkSignIn(): Promise<boolean> {
+    if (!this.ctx.props.connected) return false;
+    return this.#credentials().checkSession();
+  }
+
+  /**
+   * Ends the person's InferLab sign-in everywhere (`GatekeeperUser.endSignIn`): every central-auth
+   * session of theirs and every app session under it, this account's included.
+   */
+  async endSignIn(): Promise<void> {
+    if (this.ctx.props.connected) await this.#credentials().signOutEverywhere();
   }
 
   /** The InferLab-verified email of a sign-in or connected account; null without one. */
