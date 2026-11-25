@@ -18,7 +18,7 @@ import { validateRpc } from "capnweb-validate";
 import type { JWTPayload } from "jose";
 import { checkFlowDestination } from './flow-navigation.js';
 import { deliverHandover } from './handover-delivery.js';
-import { PublicApi, AuthenticatedApi, Overseer, GadgetMetadataWithTimestamps, AiChatAuthorInfo, RedactedAiModelConfig, AiGatewayInfo, AiModelProvider, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, ObserverConfigCallback, BlueprintLibrarySummary, BlueprintPublicInfo, BlueprintUserSummary, BlueprintBindingAssignment, WorkpieceId, BLUEPRINT_SCREENSHOT_PATH_PREFIX, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ServerConfig, CloudflareUsageInfo, CloudflareAccountOption, LoginAttempt, GatekeeperAppInfo, AdminApi, GatekeeperVendorInfo, OutputFormatOffer, ListOutputsResult, UserDirectoryRecord, createOpenGadgetError, getOpenGadgetErrorCode, OPEN_GADGET_ERROR_CODES, AUTH_ERROR_CODES, createAuthError, ConnectFlowStart, ConsoleHostBoard, BoundViewDescription, OperateSession, OperateSessionUpdate, OperateSubjectAuditCursor, OperateSubjectAuditPage, OperateSubjectParticipant, PresenceSubscriber, WorkspaceKind, DEFAULT_WORKSPACE_KIND, OPERATE_SESSION_ERROR_CODES, createOperateSessionError, BlueprintInstallOptions, createPublicationError, PUBLICATION_ERROR_CODES, PublicationDestination, PublicationRecord, BlueprintScreenshotUpload, WIDGET_SEARCH_LIMIT } from '@gadgets/workshop-shared/api';
+import { PublicApi, AuthenticatedApi, Overseer, GadgetMetadataWithTimestamps, AiChatAuthorInfo, RedactedAiModelConfig, AiGatewayInfo, AiModelProvider, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, ObserverConfigCallback, BlueprintLibrarySummary, BlueprintPublicInfo, BlueprintUserSummary, BlueprintBindingAssignment, WorkpieceId, BLUEPRINT_SCREENSHOT_PATH_PREFIX, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ServerConfig, CloudflareUsageInfo, CloudflareAccountOption, LoginAttempt, GatekeeperAppInfo, AdminApi, GatekeeperVendorInfo, OutputFormatOffer, ListOutputsResult, UserDirectoryRecord, createOpenGadgetError, getOpenGadgetErrorCode, OPEN_GADGET_ERROR_CODES, AUTH_ERROR_CODES, createAuthError, SIGN_OUT_ERROR_CODES, SIGN_OUT_ERROR_MESSAGES, createSignOutError, ConnectFlowStart, ConsoleHostBoard, BoundViewDescription, OperateSession, OperateSessionUpdate, OperateSubjectAuditCursor, OperateSubjectAuditPage, OperateSubjectParticipant, PresenceSubscriber, WorkspaceKind, DEFAULT_WORKSPACE_KIND, OPERATE_SESSION_ERROR_CODES, createOperateSessionError, BlueprintInstallOptions, createPublicationError, PUBLICATION_ERROR_CODES, PublicationDestination, PublicationRecord, BlueprintScreenshotUpload, WIDGET_SEARCH_LIMIT } from '@gadgets/workshop-shared/api';
 import { consoleEventMismatch, consoleScreenMove, type ConsoleRef, type HostBoardEntry, type OperateConsole, type HostBoardReadAudit, type HostBoardSelection, type HostBoardSelectionUpdate, type HostBoardView } from '@gadgets/workshop-shared/operate-console';
 import { boundViewsEnabled, describeBoundView } from "./console-store.js";
 import { HOST_BOARDS_OFF, HostBoardSelectionRelay, hostBoardsEnabled, readByDeadline, type HostBoardContext, type HostBoardSelectionState } from "./host-boards.js";
@@ -113,15 +113,27 @@ type Env = Cloudflare.Env & {
 
 // =======================================================================================
 
+/**
+ * One WebSocket API connection, shared by every API authenticated on it: `close` closes it, and
+ * `signingOut` is true once a `signOut()` on it has begun. From then on no session watch closes it
+ * (another API on the connection has one too, which the sign-out ends), so the sign-out is answered;
+ * the sign-out closes it itself once it has been.
+ */
+type ApiConnection = { close(reason: Error): void; signingOut: boolean };
+
+// How long after a sign-out has been answered its connection is closed, so the answer reaches the
+// client first (as OverseerImpl.scheduleAccessRestart delays its abort).
+const SIGN_OUT_CLOSE_DELAY_MS = 100;
+
 @validateRpc()
 class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   // `sessionSecret` is the secret half of the session token this API was authenticated with, which
-  // `signOut()` ends; absent for a Cloudflare Access session, which has no token. `abortSession`
-  // closes the connection; absent for a one-shot request, which has none. With both, the connection
-  // is closed once the session ends anywhere (#watchSession).
+  // `signOut()` ends; absent for a Cloudflare Access session, which has no token. `connection` is
+  // absent for a one-shot request, which has none. With both, the connection is closed once the
+  // session ends anywhere (#watchSession).
   constructor(private ctx: ExecutionContext, private env: Env,
       userId: DurableObjectId,
-      private abortSession: ((reason: Error) => void) | undefined,
+      private connection: ApiConnection | undefined,
       sessionSecret?: string) {
     super();
 
@@ -130,7 +142,7 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     this.overseers = this.ctx.exports.OverseerDurableObject;
     this.adminSettings = this.ctx.exports.AdminSettings;
     this.users = this.ctx.exports.UserDurableObject;
-    if (sessionSecret !== undefined && abortSession) this.#watchSession(sessionSecret, abortSession);
+    if (sessionSecret !== undefined && connection) this.#watchSession(sessionSecret, connection);
   }
 
   private overseers: DurableObjectNamespace<OverseerDurableObject>;
@@ -146,15 +158,16 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   // Closes the connection once the session ends anywhere (UserDurableObject.watchSession): signed
   // out from another connection, or ended by another connection's check of the sign-in behind it.
   // A watch the user DO lost (it reset) is set up again, which finds a session that ended meanwhile.
-  #watchSession(secret: string, abortSession: (reason: Error) => void): void {
+  // One that cannot be set up closes the connection, which its client treats as a reconnect.
+  #watchSession(secret: string, connection: ApiConnection): void {
     let established = false;
     let ended = Object.assign(() => {
-      if (this.#unwatched) return;
+      if (this.#unwatched || connection.signingOut) return;
       this.#unwatched = true;
-      abortSession(createAuthError(AUTH_ERROR_CODES.invalidSessionToken));
+      connection.close(createAuthError(AUTH_ERROR_CODES.invalidSessionToken));
     }, {
       [Symbol.dispose]: () => {
-        if (established && !this.#unwatched) this.#watchSession(secret, abortSession);
+        if (established && !this.#unwatched) this.#watchSession(secret, connection);
       },
     });
     retryOnDoReset(() => this.#user.watchSession(secret, ended)).then(watch => {
@@ -162,7 +175,10 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
       if (this.#unwatched) watch[Symbol.dispose]();
       else this.#sessionWatch = watch;
     }, (error: unknown) => {
-      logger.warn("could not watch the session", { event: "session.watch.failed", error });
+      if (this.#unwatched) return;
+      this.#unwatched = true;
+      logger.warn("could not watch the session; closing the connection", { event: "session.watch.failed", error });
+      connection.close(new Error("could not watch the session"));
     });
   }
 
@@ -230,10 +246,28 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
         .searchUsers(query, [this.#userId.name!, ...excludeIds]));
   }
   async signOut(): Promise<void> {
-    if (this.#sessionSecret === undefined) return;
-    // This connection ends its own session, so its watch must not close it under this call.
+    let secret = this.#sessionSecret;
+    if (secret === undefined) return;
+    // This connection ends its own session, so no watch on it (this API's, or another API's on the
+    // same connection) may close it under this call. Once it has been answered the connection is
+    // closed, so nothing authenticated with the session goes on working on it; its client
+    // reconnects signed out.
+    let connection = this.connection;
     this.#unwatch();
-    await this.#user.signOut(this.#sessionSecret);
+    if (connection) connection.signingOut = true;
+    try {
+      await this.#user.signOut(secret);
+    } catch (error) {
+      // Native RPC from the user DO keeps the message but not the code; the client reads the code.
+      if (error instanceof Error && error.message === SIGN_OUT_ERROR_MESSAGES[SIGN_OUT_ERROR_CODES.providerSignOutFailed]) {
+        throw createSignOutError(SIGN_OUT_ERROR_CODES.providerSignOutFailed);
+      }
+      throw error;
+    } finally {
+      if (connection) {
+        setTimeout(() => connection.close(createAuthError(AUTH_ERROR_CODES.invalidSessionToken)), SIGN_OUT_CLOSE_DELAY_MS);
+      }
+    }
   }
   changePassword(oldHash: Uint8Array, newHash: Uint8Array): Promise<void> {
     return this.#user.changePassword(oldHash, newHash);
@@ -377,7 +411,7 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
       if (started && !closed) {
         // this.ctx.abort() would be nicer here, but it is still marked experimental in the
         // workers runtime.
-        this.abortSession?.(new Error(`lost connection to workspace DO (gadget ${id})`));
+        this.connection?.close(new Error(`lost connection to workspace DO (gadget ${id})`));
       }
     }
 
@@ -1436,11 +1470,14 @@ class PublicApiImpl extends RpcTarget implements PublicApi {
   // `abortSession` closes the connection; absent for a one-shot request (an HTTP batch, or the
   // operate AG-UI endpoint), which has none to close.
   constructor(private ctx: ExecutionContext, private env: Env,
-      private abortSession: ((reason: Error) => void) | undefined,
+      abortSession: ((reason: Error) => void) | undefined,
       private accessPayload?: JWTPayload) {
     super();
     this.users = this.ctx.exports.UserDurableObject;
+    this.#connection = abortSession ? { close: abortSession, signingOut: false } : undefined;
   }
+
+  #connection: ApiConnection | undefined;
 
   async ping(): Promise<void> {}
 
@@ -1513,7 +1550,7 @@ class PublicApiImpl extends RpcTarget implements PublicApi {
       user_id: userId.toString(),
       source: "session_token",
     });
-    return new AuthenticatedApiImpl(this.ctx, this.env, userId, this.abortSession, split[1]);
+    return new AuthenticatedApiImpl(this.ctx, this.env, userId, this.#connection, split[1]);
   }
 
   async authenticateFromCfAccess(): Promise<AuthenticatedApi> {
@@ -1538,7 +1575,7 @@ class PublicApiImpl extends RpcTarget implements PublicApi {
       user_id: userId.toString(),
       source: "cf_access",
     });
-    return new AuthenticatedApiImpl(this.ctx, this.env, userId, this.abortSession);
+    return new AuthenticatedApiImpl(this.ctx, this.env, userId, this.#connection);
   }
 
   async login(username: string, passwordHash: Uint8Array): Promise<string | null> {

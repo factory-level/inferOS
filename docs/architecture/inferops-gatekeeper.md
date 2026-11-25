@@ -1096,26 +1096,33 @@ included, and any sign-out ends it everywhere.
 - **Open connections.** A WebSocket API session authenticated with a token watches its session
   (`UserDurableObject.watchSession`, a subscriber on the `sessions` collection): when the record is
   deleted, by a sign-out or a check on any connection, the user DO calls back and the connection is
-  closed with `invalidSessionToken`, so its client reconnects and is refused. The connection that
-  signs out stops watching first and is answered. A watch the user DO lost to a reset is set up
-  again, which finds a session that ended meanwhile. An HTTP batch and the operate AG-UI endpoint
+  closed with `invalidSessionToken`, so its client reconnects and is refused. Once a sign-out has
+  begun on a connection, no watch closes it (another API on it, such as the blueprint page's, holds
+  one too), so the sign-out is answered; 100 ms after the answer (or the failure), the sign-out
+  closes the connection itself, so the API it was called on stops working there too. A watch the
+  user DO lost to a reset is set up again, which finds a session that ended meanwhile; one that
+  cannot be set up closes the connection, which its client treats as a reconnect. An HTTP batch and the operate AG-UI endpoint
   have no connection to close and watch nothing. While at least one session is watched, a timer in
   the user DO runs `authenticate`'s check on every watched session each minute
   (`SESSION_RECHECK_INTERVAL_MS`, `recheckWatchedSessions`), so a backing sign-in is still asked at
   most every 5 minutes, with the same back-off and one-day limit, and a sign-out in another InferLab
   app closes an open connection within about six minutes though nobody authenticates again. The
-  timer is cleared when the last watch ends, so a user with no open connection costs nothing.
+  timer is cleared when the last watch ends, so a user with no open connection costs nothing. The
+  counts, the timer and its interval are `UserDurableObject.sessionWatches`, which tests read and
+  shorten through `runInDurableObject`.
 - **Sign-out.** `AuthenticatedApi.signOut()` (a Cloudflare Access session has nothing to end)
   calls `UserDurableObject.signOut(secret)`: it deletes the session, then every other session the
   same account backs, then calls the account's `endSignIn()` and marks its credentials expired
   (only the account as it was before the call). When `endSignIn()` fails it throws after all that,
-  so a sign-out that did not reach InferLab never reads as done. The person's sign-in ends even when
+  with `SIGN_OUT_ERROR_CODES.providerSignOutFailed` (the provider's own error is only logged), so a
+  sign-out that did not reach InferLab never reads as done. The person's sign-in ends even when
   they have connected other InferOps accounts, since the sign-in identity is one person.
   `useAuth.logout` clears the token and the stub at once, sets `auth.chooseAccountNext`, and waits
   up to 5 seconds for the answer. A failure or no answer shows a warning on the sign-in page
-  (`SignOutWarning`): signed out of InferOS, but InferLab couldn't sign the person out everywhere.
-  There is no retry: the session that could reach the account is gone, so the warning says to sign
-  out from another InferLab app instead.
+  (`SignOutWarning`). With `providerSignOutFailed` it says the person is signed out of InferOS but
+  InferLab couldn't sign them out everywhere; there is no retry, since the session that could reach
+  the account is gone, so it says to sign out from another InferLab app instead. Any other failure,
+  or no answer, says only that the server didn't confirm the sign-out, naming no provider.
 - **Prompt.** The login page's main button calls `startGatekeeperLogin(vendor, { chooseAccount })`
   with `chooseAccount` from `auth.chooseAccountNext` (set at sign-out, cleared by the next sign-in
   that succeeds); "Use a different Google account" passes `true`. `false` becomes the silent
@@ -1131,6 +1138,13 @@ included, and any sign-out ends it everywhere.
   gatekeeper (in the account's `InferOpsCredentials` object), where before only a connected
   InferOps account did. A compromised gatekeeper therefore reaches the InferLab session of every
   person who signs in, not only of those who connected InferOps.
+- **A silent sign-in commits before confirm.** A `prompt=none` sign-in completes with no page, and
+  the login callback links the account and mints the Workshop session as soon as InferLab answers,
+  before the popup's `confirmLogin` redeems it; an unconfirmed sign-in leaves that account linked
+  and that session in storage until it expires or a sign-out ends it, though no browser holds the
+  token. This is accepted: the session is unreachable without the ticket the popup holds, and moving
+  the link and the mint behind `confirmLogin` would rework the login callback and `PendingLogin`
+  for every vendor.
 - **Sessions from before this change.** A session record without `backing` (a password sign-in,
   a sign-in through any other vendor, or an InferOps sign-in from before FAC-300) is never
   re-checked, and lives until 30 days after its `created`. Since every session now expires, a
@@ -1143,7 +1157,10 @@ included, and any sign-out ends it everywhere.
   one-day fail-closed limit, a check ending every session the sign-in backs, an account deleted or
   replaced while it is asked, a disconnected account, expiry and the pre-expiry records, sign-out,
   its idempotence and a failed `endSignIn`, and open WebSocket connections closed by a sign-out, a
-  check on another connection, or the periodic re-check after a sign-out at InferLab), the gatekeeper's `inferlab-login.test.ts` (prompts, the interactive
+  check on another connection, or the periodic re-check after a sign-out at InferLab; a sign-out
+  answered though a second API on its connection watches, and the connection closed after it; the
+  re-check timer arming, re-arming and stopping, a disposed client stub releasing its watch, and a
+  watch set up again after a user-DO reset), the gatekeeper's `inferlab-login.test.ts` (prompts, the interactive
   leg after each needs-a-page error, the kept session, a transient sign-in without `connect`, an
   unknown stored purpose) and `account.test.ts` ("the sign-in behind a Workshop session"),
   `OAuthButtons.test.tsx` and `useAuth.test.tsx` (the sign-out warning), and the integration suite's

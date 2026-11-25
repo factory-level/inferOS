@@ -458,6 +458,28 @@ export const createAuthError = authErrors.create;
 /** Reads the machine-readable code from an authentication failure. */
 export const getAuthErrorCode = authErrors.getCode;
 
+/** Stable error codes attached to a sign-out that ended the session but not all it should have. */
+export const SIGN_OUT_ERROR_CODES = {
+  /** The provider sign-in backing the session could not be ended everywhere (`signOut`). */
+  providerSignOutFailed: "PROVIDER_SIGN_OUT_FAILED",
+} as const;
+
+/** An expected sign-out failure code. */
+export type SignOutErrorCode = typeof SIGN_OUT_ERROR_CODES[keyof typeof SIGN_OUT_ERROR_CODES];
+
+/** Messages for sign-out failures, as the codes are created with. */
+export const SIGN_OUT_ERROR_MESSAGES: Record<SignOutErrorCode, string> = {
+  [SIGN_OUT_ERROR_CODES.providerSignOutFailed]: "The sign-in provider could not end the sign-in everywhere.",
+};
+
+const signOutErrors = codedErrorFamily(SIGN_OUT_ERROR_MESSAGES);
+
+/** Creates a sign-out failure with a machine-readable code. */
+export const createSignOutError = signOutErrors.create;
+
+/** Reads the machine-readable code from a sign-out failure. */
+export const getSignOutErrorCode = signOutErrors.getCode;
+
 /** One new, non-resumable read chat, optionally preceded by sequence-checked board navigation. */
 export type OperateReadRun = {
   /** Person-scoped one-shot thread selector. Reuse is refused after interruption too. */
@@ -946,8 +968,11 @@ export interface AuthenticatedApi extends RpcTarget {
   /**
    * Signs out: ends the session this API was authenticated with, so its token is refused from now
    * on. When a provider sign-in backs the session (`VendorDescription.signInConnects`), that sign-in
-   * is ended too, everywhere it is live, and with it every session of this account it backs. A
-   * Cloudflare Access session has no token, and nothing here ends it. Idempotent.
+   * is ended too, everywhere it is live, and with it every session of this account it backs. When the
+   * provider could not end it, the session is ended anyway and this rejects with
+   * `SIGN_OUT_ERROR_CODES.providerSignOutFailed`. Once this has settled, the connection it was
+   * called on is closed shortly afterwards, so nothing authenticated with the session goes on
+   * working on it. A Cloudflare Access session has no token, and nothing here ends it. Idempotent.
    */
   signOut(): Promise<void>;
 

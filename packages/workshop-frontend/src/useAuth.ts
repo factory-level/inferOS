@@ -1,10 +1,11 @@
 import { useState, useEffect, useMemo, useRef } from 'react'
 import { RpcStub } from 'capnweb'
-import { PublicApi, AuthenticatedApi } from '@gadgets/workshop-shared/api'
+import { PublicApi, AuthenticatedApi, SIGN_OUT_ERROR_CODES, getSignOutErrorCode } from '@gadgets/workshop-shared/api'
 import { setReportedUserId } from './errorReporting'
 import { classifyRpcError } from './rpcErrors'
 import { getDevLoginToken } from './features/auth/devLogin'
 import { setChooseAccountNext } from './features/auth/chooseAccount'
+import type { SignOutWarningKind } from './features/auth/SignOutWarning'
 
 const CF_ACCESS_MODE = import.meta.env.VITE_CF_ACCESS_MODE === 'true'
 
@@ -34,9 +35,9 @@ export function useAuth(publicApi: RpcStub<PublicApi>) {
   const authenticatedApiRef = useRef<RpcStub<AuthenticatedApi> | null>(null)
   authenticatedApiRef.current = authState.authenticatedApi
   const loginGeneration = useRef(0)
-  // The last sign-out ended the session here but not, as far as this browser knows, the InferLab
-  // sign-in behind it everywhere (see logout). Cleared by the next sign-in or by dismissing it.
-  const [signOutFailed, setSignOutFailed] = useState(false)
+  // Why the last sign-out may not have ended everything on the server (see logout), or null.
+  // Cleared by the next sign-in or by dismissing it.
+  const [signOutWarning, setSignOutWarning] = useState<SignOutWarningKind | null>(null)
 
   /**
    * Names the signed-in user on error reports, for as long as this stub is the current one.
@@ -135,7 +136,7 @@ export function useAuth(publicApi: RpcStub<PublicApi>) {
 
   const authenticateWithToken = (token: string) => {
     loginGeneration.current++
-    setSignOutFailed(false)
+    setSignOutWarning(null)
     setAuthState(prev => {
       // Dispose the previous authenticated API stub if it exists
       if (prev.authenticatedApi) {
@@ -168,7 +169,8 @@ export function useAuth(publicApi: RpcStub<PublicApi>) {
    * Signs out. The browser forgets the session at once; the returned promise settles once the
    * server has answered, or after SIGN_OUT_TIMEOUT_MS. The server ends the session too (FAC-300):
    * its token is refused from then on, and a provider sign-in backing it is ended everywhere. When
-   * that failed or did not answer in time, `signOutFailed` is set, so the sign-in page can say so.
+   * that failed or did not answer in time, `signOutWarning` says how, so the sign-in page can say
+   * so: `provider` when the server reports the provider's sign-out failed, `unconfirmed` otherwise.
    * The next sign-in asks for the provider's account chooser.
    */
   const logout = (): Promise<void> => {
@@ -183,15 +185,18 @@ export function useAuth(publicApi: RpcStub<PublicApi>) {
     const signingOut = authenticatedApiRef.current
     let finished = Promise.resolve()
     if (signingOut) {
-      const ended = Promise.resolve().then(() => signingOut.signOut()).then(() => true, () => false)
-      const timeout = new Promise<boolean>(resolve => setTimeout(() => resolve(false), SIGN_OUT_TIMEOUT_MS))
-      finished = Promise.race([ended, timeout]).then(done => {
+      const ended = Promise.resolve().then(() => signingOut.signOut()).then(
+        () => null,
+        (error: unknown): SignOutWarningKind =>
+          getSignOutErrorCode(error) === SIGN_OUT_ERROR_CODES.providerSignOutFailed ? 'provider' : 'unconfirmed')
+      const timeout = new Promise<SignOutWarningKind>(resolve => setTimeout(() => resolve('unconfirmed'), SIGN_OUT_TIMEOUT_MS))
+      finished = Promise.race([ended, timeout]).then(warning => {
         signingOut[Symbol.dispose]()
         // A sign-in since then is a new session, which this warning is not about.
-        if (!done && generation === loginGeneration.current) setSignOutFailed(true)
+        if (warning && generation === loginGeneration.current) setSignOutWarning(warning)
       })
     }
-    setSignOutFailed(false)
+    setSignOutWarning(null)
     setChooseAccountNext()
 
     // Use functional updater to read current state (avoids stale closure).
@@ -211,7 +216,7 @@ export function useAuth(publicApi: RpcStub<PublicApi>) {
     return finished
   }
 
-  const dismissSignOutWarning = () => setSignOutFailed(false)
+  const dismissSignOutWarning = () => setSignOutWarning(null)
 
   /**
    * An opaque key for the signed-in account, equal across two authenticated stubs only when both
@@ -228,7 +233,7 @@ export function useAuth(publicApi: RpcStub<PublicApi>) {
     accountKey,
     login,
     logout,
-    signOutFailed,
+    signOutWarning,
     dismissSignOutWarning,
     isAuthenticated: !!authState.authenticatedApi
   }

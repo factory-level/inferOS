@@ -1,26 +1,36 @@
-// Shown on the sign-in page when signing out ended the session here but the server could not end
-// the InferLab sign-in behind it everywhere (FAC-300): it failed, or did not answer in time. The
-// session is already gone, so there is nothing left here to retry with; the person finishes from an
-// app still signed in through InferLab.
+// Shown on the sign-in page when signing out ended the session in this browser but the server did
+// not confirm it all (FAC-300). `provider`: the server ended the session but InferLab could not end
+// the sign-in behind it everywhere (`SIGN_OUT_ERROR_CODES.providerSignOutFailed`); the session is
+// gone, so there is nothing left here to retry with, and the person finishes from an app still
+// signed in through InferLab. `unconfirmed`: the server failed otherwise, or did not answer in time,
+// so nothing is known about any provider.
 
 import { Banner, Button } from '@cloudflare/kumo'
 
-/** The warning's heading. */
-export const SIGN_OUT_INCOMPLETE_TITLE =
-  "You're signed out of InferOS, but InferLab couldn't sign you out everywhere."
+/** Why the last sign-out may not have ended everything (useAuth's `signOutWarning`). */
+export type SignOutWarningKind = 'provider' | 'unconfirmed'
 
-/** What the person can do about it. */
-export const SIGN_OUT_INCOMPLETE_DESCRIPTION =
-  "InferOS can't try again now that this session has ended. To finish, sign out from another InferLab app."
+/** The warning's heading and what the person can do, by kind. */
+export const SIGN_OUT_WARNINGS: Record<SignOutWarningKind, { title: string; description: string }> = {
+  provider: {
+    title: "You're signed out of InferOS, but InferLab couldn't sign you out everywhere.",
+    description: "InferOS can't try again now that this session has ended. To finish, sign out from another InferLab app.",
+  },
+  unconfirmed: {
+    title: "You're signed out here, but the server didn't confirm the sign-out.",
+    description: "Your session may stay open on the server until it expires. If you signed in through another app, sign out there too.",
+  },
+}
 
-export default function SignOutWarning({ onDismiss }: { onDismiss: () => void }) {
+export default function SignOutWarning({ kind, onDismiss }: { kind: SignOutWarningKind; onDismiss: () => void }) {
+  const { title, description } = SIGN_OUT_WARNINGS[kind]
   return (
     <Banner
       variant="alert"
       role="status"
       className="mb-6"
-      title={SIGN_OUT_INCOMPLETE_TITLE}
-      description={SIGN_OUT_INCOMPLETE_DESCRIPTION}
+      title={title}
+      description={description}
       action={<Button size="sm" variant="secondary" onClick={onDismiss}>Dismiss</Button>}
     />
   )

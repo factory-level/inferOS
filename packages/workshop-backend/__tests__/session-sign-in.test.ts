@@ -7,7 +7,7 @@ import { describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
 import { createExecutionContext, runInDurableObject } from "cloudflare:test";
 import { newWebSocketRpcSession, type RpcStub } from "capnweb";
-import type { PublicApi } from "@gadgets/workshop-shared/api";
+import { SIGN_OUT_ERROR_CODES, SIGN_OUT_ERROR_MESSAGES, getSignOutErrorCode, type AuthenticatedApi, type PublicApi } from "@gadgets/workshop-shared/api";
 import server from "../src/server.js";
 import type { PendingLogin } from "../src/auth/login-flow.js";
 import type { UserDurableObject } from "../src/user.js";
@@ -37,6 +37,7 @@ type SessionRecord = {
 type AccountRecord = { id: number; vendorId: string; credentialsExpired?: boolean };
 // What a test reaches into a user DO for.
 type Internals = {
+  sessionWatches: { counts: Map<string, number>; timer: unknown; intervalMs: number };
   ctx: DurableObjectState & { exports: Exports };
   storage: {
     sessions: { list(): Iterable<SessionRecord>; get(id: string): SessionRecord | undefined; put(r: SessionRecord): void };
@@ -364,7 +365,8 @@ describe("signing out", () => {
     const failure = await env.TEST_USER.getByName(first.name).signOut(first.secret)
       .then(() => null, (error: Error) => error.message);
 
-    expect(failure).toContain("HTTP 503");
+    // The provider's own error is logged; the caller is told only that the provider's sign-out failed.
+    expect(failure).toBe(SIGN_OUT_ERROR_MESSAGES[SIGN_OUT_ERROR_CODES.providerSignOutFailed]);
     expect(await callsOf(second.key)).toEqual(["endSignIn"]);
     expect(await authenticate(first.name, first.secret)).toBe("invalid session token");
     expect(await authenticate(second.name, second.secret)).toBe("invalid session token");
@@ -445,6 +447,106 @@ describe("a connection authenticated with a session (FAC-300)", () => {
     const { name, secret } = await signIn(person());
     using connection = await connect();
     const api = connection.authenticate(`${name}:${secret}`);
+    await env.TEST_USER.getByName(name).signOut(secret);
+    await expect.poll(() => state(api)).toBe("refused");
+  });
+});
+
+describe("signing out on a connection (FAC-300)", () => {
+  it("is answered though another API on the same connection watches the same session", async () => {
+    const { name, secret, key } = await signIn(person());
+    using connection = await connect();
+    // As the root route and the blueprint page each authenticate with the stored token.
+    using signingOut = await connection.authenticate(`${name}:${secret}`);
+    using other = await connection.authenticate(`${name}:${secret}`);
+    expect(await state(other)).toBe("working");
+    await hold(key);
+
+    const outcome = signingOut.signOut().then(() => "done", (error: Error) => error.message);
+    await expect.poll(() => callsOf(key)).toEqual(["endSignIn"]);
+    // The session is gone and the other API's watch has fired while InferLab is still being asked.
+    await expect.poll(() => sessions(name)).toEqual([]);
+    await release(key);
+
+    expect(await outcome).toBe("done");
+  });
+
+  it("stops working on the connection it was called on once it has been answered", async () => {
+    const { name, secret } = await signIn(person());
+    using connection = await connect();
+    using api = await connection.authenticate(`${name}:${secret}`);
+
+    await api.signOut();
+
+    await expect.poll(() => state(api)).toBe("refused");
+  });
+
+  it("stops working there too when InferLab could not sign out, telling the client so", async () => {
+    const { name, secret, key } = await signIn(person());
+    await answer(key, "down");
+    using connection = await connect();
+    using api = await connection.authenticate(`${name}:${secret}`);
+
+    const failure = await api.signOut().then(() => null, (error: unknown) => error);
+
+    expect(getSignOutErrorCode(failure)).toBe(SIGN_OUT_ERROR_CODES.providerSignOutFailed);
+    await expect.poll(() => state(api)).toBe("refused");
+  });
+});
+
+/** How many sessions the user DO `name` watches, and whether its re-check timer is armed. */
+const watches = (name: string) => inUser(name, ({ sessionWatches }) =>
+  ({ watched: sessionWatches.counts.size, armed: sessionWatches.timer !== undefined }));
+
+describe("the user DO's session watches (FAC-300)", () => {
+
+  it("arms the re-check with the first watch, and stops it when the client lets the last one go", async () => {
+    const { name, secret } = await signIn(person());
+    expect(await watches(name)).toEqual({ watched: 0, armed: false });
+    using connection = await connect();
+    const api: RpcStub<AuthenticatedApi> = await connection.authenticate(`${name}:${secret}`);
+    await expect.poll(() => watches(name)).toEqual({ watched: 1, armed: true });
+
+    api[Symbol.dispose]();
+
+    // The DO-side subscriber and its count go with the client's stub, and the timer with them.
+    await expect.poll(() => watches(name)).toEqual({ watched: 0, armed: false });
+  });
+
+  it("re-arms after each re-check, and closes the connection once the sign-in has ended", async () => {
+    const { name, secret, key } = await signIn(person());
+    await inUser(name, ({ sessionWatches }) => { sessionWatches.intervalMs = 20; });
+    using connection = await connect();
+    using api = await connection.authenticate(`${name}:${secret}`);
+    await expect.poll(() => watches(name)).toEqual({ watched: 1, armed: true });
+    await answer(key, "ended");
+
+    // Several re-checks run, asking nothing while the last confirmation is fresh.
+    const first = await inUser(name, ({ sessionWatches }) => sessionWatches.timer);
+    await expect.poll(() => inUser(name, ({ sessionWatches }) => sessionWatches.timer !== first
+      && sessionWatches.timer !== undefined)).toBe(true);
+    expect(await callsOf(key)).toEqual([]);
+    expect(await state(api)).toBe("working");
+
+    await ageChecks(name, SIGN_IN_CHECK_INTERVAL_MS);
+
+    await expect.poll(() => state(api)).toBe("refused");
+    expect(await callsOf(key)).toEqual(["checkSignIn"]);
+  });
+
+  it("is set up again after the user DO resets, and still closes the connection", async () => {
+    const { name, secret } = await signIn(person());
+    using connection = await connect();
+    using api = await connection.authenticate(`${name}:${secret}`);
+    await expect.poll(() => watches(name)).toEqual({ watched: 1, armed: true });
+
+    await runInDurableObject(env.TEST_USER.getByName(name), (_instance, doState) => {
+      doState.abort("user-DO reset injected by test");
+    }).catch(() => {});
+
+    // The new incarnation knows the watch only because the connection set it up again.
+    await expect.poll(() => watches(name)).toEqual({ watched: 1, armed: true });
+    expect(await state(api)).toBe("working");
     await env.TEST_USER.getByName(name).signOut(secret);
     await expect.poll(() => state(api)).toBe("refused");
   });

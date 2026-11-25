@@ -5,7 +5,7 @@ import { isOpenAiPluginEnabled, modelsSchema, stateSchema } from '@gadgets/assis
 import { localApiModels } from './local-api-models.js';
 import { modelNotOfferedMessage } from './model-allowlist.js';
 import { isCloudflareLimitsEnabled } from './ai-gateway-billing/config.js';
-import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, RedactedAiModelConfig, SUGGESTED_MODELS, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, BlueprintOutput, OutputSummary, WorkpieceId, ListOutputsResult, AUTH_ERROR_CODES, createAuthError, ConnectFlowStart, validateCommitEmail, OperateSessionUpdate, OPERATE_SESSION_ERROR_CODES, createOperateSessionError, getOperateSessionErrorCode, WorkspaceKind, createPublicationError, PUBLICATION_ERROR_CODES, PublicationDestination, PublicationRecord } from '@gadgets/workshop-shared/api';
+import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, RedactedAiModelConfig, SUGGESTED_MODELS, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, BlueprintOutput, OutputSummary, WorkpieceId, ListOutputsResult, AUTH_ERROR_CODES, createAuthError, SIGN_OUT_ERROR_CODES, createSignOutError, ConnectFlowStart, validateCommitEmail, OperateSessionUpdate, OPERATE_SESSION_ERROR_CODES, createOperateSessionError, getOperateSessionErrorCode, WorkspaceKind, createPublicationError, PUBLICATION_ERROR_CODES, PublicationDestination, PublicationRecord } from '@gadgets/workshop-shared/api';
 import {
   WIDGET_STATE_ERROR_CODES, WidgetStateError, applyWidgetTransition, recoverWidgetState, widgetEventsFrom,
   type WidgetStateMachine, type WidgetStateSnapshot, widgetStateKeyPlacement,
@@ -867,7 +867,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     let sessions = this.storage.sessions;
     let callback = ended.dup();  // keep the stub after return
     let done = false;
-    let watches = this.#watchedSessions;
+    let watches = this.sessionWatches.counts;
     let subscriber = {
       add() {},
       update() {},
@@ -904,28 +904,34 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     return new SessionWatch(() => finish(false));
   }
 
-  // The token ids of the sessions open connections watch, each with its number of watches, and the
-  // timer that re-checks them, armed only while there is at least one. A watch exists only while a
-  // connection holds it, so an idle user costs nothing; a reset drops both, and the connections
-  // watch again (AuthenticatedApiImpl), which arms the timer again.
-  #watchedSessions = new Map<string, number>();
-  #recheckTimer: ReturnType<typeof setTimeout> | undefined;
+  // The token ids of the sessions open connections watch, each with its number of watches, the
+  // timer that re-checks them, armed only while there is at least one, and its interval. A watch
+  // exists only while a connection holds it, so an idle user costs nothing; a reset drops all of
+  // it, and the connections watch again (AuthenticatedApiImpl), which arms the timer again. Not
+  // `#`-private, so a test can read it and shorten `intervalMs` (session-sign-in.test.ts); RPC
+  // exposes no instance property.
+  private sessionWatches: {
+    counts: Map<string, number>;
+    timer: ReturnType<typeof setTimeout> | undefined;
+    intervalMs: number;
+  } = { counts: new Map(), timer: undefined, intervalMs: SESSION_RECHECK_INTERVAL_MS };
 
   #startRechecks(): void {
-    if (this.#recheckTimer !== undefined) return;
-    this.#recheckTimer = setTimeout(() => {
-      this.#recheckTimer = undefined;
+    let watches = this.sessionWatches;
+    if (watches.timer !== undefined) return;
+    watches.timer = setTimeout(() => {
+      watches.timer = undefined;
       this.recheckWatchedSessions().catch((error: unknown) => {
         logger.warn("could not re-check watched sessions", { event: "session.recheck.failed", error });
       }).finally(() => {
-        if (this.#watchedSessions.size > 0) this.#startRechecks();
+        if (watches.counts.size > 0) this.#startRechecks();
       });
-    }, SESSION_RECHECK_INTERVAL_MS);
+    }, watches.intervalMs);
   }
 
   #stopRechecks(): void {
-    clearTimeout(this.#recheckTimer);
-    this.#recheckTimer = undefined;
+    clearTimeout(this.sessionWatches.timer);
+    this.sessionWatches.timer = undefined;
   }
 
   /**
@@ -934,7 +940,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
    * has ended, with the same interval, back-off and one-day limit. The re-check timer calls it.
    */
   async recheckWatchedSessions(): Promise<void> {
-    for (let tokenId of Array.from(this.#watchedSessions.keys())) {
+    for (let tokenId of Array.from(this.sessionWatches.counts.keys())) {
       let session = this.storage.sessions.get(tokenId);
       if (session) await this.#sessionLive(session);
     }
@@ -959,7 +965,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     if (!record) return;
     let asked = accountProvenance(this.storage, accountId);
     const account = record.account;
-    let failure: { error: unknown } | null = null;
+    let failed = false;
     try {
       // A stub has every method; this narrows the optional one GatekeeperUser declares.
       if (typeof account.endSignIn === "function") await account.endSignIn();
@@ -967,11 +973,12 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       logger.error("could not end the sign-in backing a session", {
         event: "session.sign_in.end.failed", accountId, error,
       });
-      failure = { error };
+      failed = true;
     }
     // Only the account as it was: one a fresh sign-in replaced meanwhile holds a live grant.
     if (sameAccount(asked, accountProvenance(this.storage, accountId))) await this.markCredentialsExpired(accountId);
-    if (failure) throw failure.error;
+    // Coded, so the person is told the provider's sign-out failed (the provider's own error is logged).
+    if (failed) throw createSignOutError(SIGN_OUT_ERROR_CODES.providerSignOutFailed);
   }
 
   /**
