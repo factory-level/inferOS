@@ -1237,12 +1237,6 @@
             "AuthoredWidgetBuildDurableObject"
           ],
           "tag": "v5"
-        },
-        {
-          "new_sqlite_classes": [
-            "ConsoleDurableObject"
-          ],
-          "tag": "v6"
         }
       ],
       "modules": [
