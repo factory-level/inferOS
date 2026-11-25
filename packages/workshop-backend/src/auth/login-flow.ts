@@ -33,6 +33,12 @@
 // keeps this callback for that account's lifetime. The PendingLogin DO therefore also records which
 // user and account the sign-in produced (`link`), outliving the login result, so expiry notices and
 // reconnects for the account reach its user DO.
+//
+// A vendor that declares `keepsSignIn` (InferLab, FAC-300) is asked to keep its provider sign-in
+// (`keepSignIn`). Its sign-in account is then not a connected account: the session the sign-in
+// mints is backed by it, and the user DO checks that sign-in on authenticate and ends it everywhere
+// on sign-out (UserDurableObject.authenticate / signOut). A sign-in that stops short of minting the
+// session revokes the account, so the provider session it kept is not left behind.
 
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import { ConnectHandoff, GatekeeperConnectCallback, GatekeeperUser } from "@gadgets/workshop-shared/gatekeeper";
@@ -178,9 +184,10 @@ export class PendingLogin extends DurableObject<Cloudflare.Env> {
 
 /**
  * `subject` is set when the vendor declares `providesSubject`: the account is then keyed on the
- * subject the account reports, and the email is display data only.
+ * subject the account reports, and the email is display data only. `keeps` is set when the vendor
+ * was asked to keep its provider sign-in (`keepsSignIn`): the account then backs the session.
  */
-type LoginCallbackProps = { pendingId: string; vendorId: string; subject?: boolean };
+type LoginCallbackProps = { pendingId: string; vendorId: string; subject?: boolean; keeps?: boolean };
 
 export class LoginConnectCallbackImpl
     extends WorkerEntrypoint<Cloudflare.Env, LoginCallbackProps>
@@ -269,6 +276,28 @@ export class LoginConnectCallbackImpl
    */
   async #deliverBySubject(account: Fetcher<GatekeeperUser>, ticketHash: string,
                           loginLogger: ReturnType<typeof logger.with>): Promise<void> {
+    const keeps = this.ctx.props.keeps === true;
+    // Until the session it backs is minted, a kept sign-in is held by nothing here, so a sign-in
+    // that stops short revokes it rather than leave its provider session behind.
+    let minted = false;
+    try {
+      minted = await this.#signInBySubject(account, ticketHash, keeps, loginLogger);
+    } finally {
+      if (keeps && !minted) {
+        try {
+          await account.revoke();
+        } catch (error) {
+          loginLogger.warn("failed to revoke an unused sign-in", {
+            event: "gatekeeper.login.revoke.failed", error,
+          });
+        }
+      }
+    }
+  }
+
+  // Signs in by subject; true once the session is minted (and, with `keeps`, backed by `account`).
+  async #signInBySubject(account: Fetcher<GatekeeperUser>, ticketHash: string, keeps: boolean,
+                         loginLogger: ReturnType<typeof logger.with>): Promise<boolean> {
     const pending = this.#pending();
     // The vendor declared `providesSubject`, which obliges its accounts to implement this method; one
     // that doesn't throws here and the sign-in fails.
@@ -279,7 +308,7 @@ export class LoginConnectCallbackImpl
         event: "gatekeeper.login.finished", outcome: "no_subject",
       });
       await pending.fail("This account has no stable identity, so it can't be used to sign in.");
-      return;
+      return false;
     }
     // The deployment, not the gatekeeper, says whose people a vendor may sign in.
     const trusted = getAuthGatekeeperIssuer(this.env, this.ctx.props.vendorId);
@@ -288,32 +317,34 @@ export class LoginConnectCallbackImpl
         event: "gatekeeper.login.finished", outcome: "issuer_not_configured",
       });
       await pending.fail(`Sign-in is off: ${trusted.error}`);
-      return;
+      return false;
     }
     if (subject.issuer !== trusted.issuer) {
       loginLogger.warn("gatekeeper login refused an untrusted issuer", {
         event: "gatekeeper.login.finished", outcome: "untrusted_issuer",
       });
       await pending.fail("This sign-in came from an identity provider this deployment doesn't trust.");
-      return;
+      return false;
     }
     const name = subjectAccountName(subject);
     const email = await account.getAuthenticatedEmail();
     const userStub = this.ctx.exports.UserDurableObject.get(
         this.ctx.exports.UserDurableObject.idFromName(name));
     const signupsEnabled = (await readAdminConfig(this.env)).signupsEnabled;
-    const secret = await userStub.loginOrCreateViaGatekeeper(name, signupsEnabled, email);
+    const secret = await userStub.loginOrCreateViaGatekeeper(name, signupsEnabled, email,
+        keeps ? { account, vendorId: this.ctx.props.vendorId } : undefined);
     if (secret === null) {
       loginLogger.info("gatekeeper login finished", {
         event: "gatekeeper.login.finished", outcome: "signups_disabled",
       });
       await pending.fail("New sign-ups are currently disabled on this deployment.");
-      return;
+      return false;
     }
     await pending.deliver(`${name}:${secret}`, ticketHash);
     loginLogger.info("gatekeeper login finished", {
       event: "gatekeeper.login.finished", outcome: "ok",
     });
+    return true;
   }
 
   // The user DO and account id a sign-in linked (Cloudflare), or null for a transient sign-in

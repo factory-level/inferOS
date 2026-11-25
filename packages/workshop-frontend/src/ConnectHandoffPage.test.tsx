@@ -19,7 +19,9 @@ vi.mock('./useAuth', () => ({
     authenticatedApi: testState.authenticatedApi,
     isLoading: testState.isLoading,
     login: vi.fn<(token: string) => void>(),
-    logout: vi.fn<() => void>(),
+    logout: vi.fn<() => Promise<void>>(async () => {}),
+    signOutWarning: null,
+    dismissSignOutWarning: vi.fn<() => void>(),
   })),
 }))
 

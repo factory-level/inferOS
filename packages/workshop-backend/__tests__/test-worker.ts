@@ -337,3 +337,75 @@ export class FakeSignInAccount extends WorkerEntrypoint<Cloudflare.Env, {
     return issuer !== undefined && subject !== undefined ? { issuer, subject } : null;
   }
 }
+
+/**
+ * What each FakeKeptSignInAccount answers `checkSignIn()`, the calls it took, and the hold its
+ * `checkSignIn()` and `endSignIn()` wait on, by its `key` prop.
+ */
+const keptAnswers = new Map<string, "live" | "ended" | "down">();
+const keptCalls = new Map<string, string[]>();
+const keptHolds = new Map<string, { held: Promise<void>; release: () => void }>();
+
+/**
+ * A sign-in account of a vendor that keeps its provider sign-in (`keepsSignIn`, FAC-300), as the
+ * InferLab gatekeeper hands one over: it yields a subject and an email like FakeSignInAccount, and
+ * answers `checkSignIn()` as its key's answer says (`setAnswer`, "live" until told otherwise);
+ * "down" is a provider that cannot be reached, for `endSignIn()` too. `hold()` keeps
+ * `checkSignIn()` and `endSignIn()` from answering until `release()`. Every call is recorded by
+ * `props.key` (`calls()`).
+ */
+export class FakeKeptSignInAccount extends WorkerEntrypoint<Cloudflare.Env, {
+  key: string; issuer: string; subject: string; email: string;
+}> {
+  #record(call: string) {
+    const calls = keptCalls.get(this.ctx.props.key) ?? [];
+    calls.push(call);
+    keptCalls.set(this.ctx.props.key, calls);
+  }
+
+  async getAuthenticatedEmail(): Promise<string | null> {
+    return this.ctx.props.email;
+  }
+
+  async getAuthenticatedSubject(): Promise<{ issuer: string; subject: string }> {
+    return { issuer: this.ctx.props.issuer, subject: this.ctx.props.subject };
+  }
+
+  async checkSignIn(): Promise<boolean> {
+    this.#record("checkSignIn");
+    await keptHolds.get(this.ctx.props.key)?.held;
+    const answer = keptAnswers.get(this.ctx.props.key) ?? "live";
+    if (answer === "down") throw new Error("InferLab could not be reached");
+    return answer === "live";
+  }
+
+  async endSignIn(): Promise<void> {
+    this.#record("endSignIn");
+    await keptHolds.get(this.ctx.props.key)?.held;
+    if (keptAnswers.get(this.ctx.props.key) === "down") throw new Error("InferLab refused to sign out (HTTP 503).");
+    keptAnswers.set(this.ctx.props.key, "ended");
+  }
+
+  async revoke(): Promise<void> {
+    this.#record("revoke");
+  }
+
+  async hold(): Promise<void> {
+    let release = () => {};
+    const held = new Promise<void>(resolve => { release = resolve; });
+    keptHolds.set(this.ctx.props.key, { held, release });
+  }
+
+  async release(): Promise<void> {
+    keptHolds.get(this.ctx.props.key)?.release();
+    keptHolds.delete(this.ctx.props.key);
+  }
+
+  async setAnswer(answer: "live" | "ended" | "down"): Promise<void> {
+    keptAnswers.set(this.ctx.props.key, answer);
+  }
+
+  async calls(): Promise<string[]> {
+    return keptCalls.get(this.ctx.props.key) ?? [];
+  }
+}

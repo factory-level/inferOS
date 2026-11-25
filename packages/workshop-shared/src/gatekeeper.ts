@@ -91,6 +91,30 @@ export type VendorDescription = {
   providesSubject?: boolean;
 
   /**
+   * True if this vendor can keep the provider sign-in behind a Workshop sign-in, so that it backs
+   * the Workshop session (FAC-300): the Workshop asks for that with
+   * `GatekeeperConnectOptions.keepSignIn`, checks the sign-in through `GatekeeperUser.checkSignIn()`
+   * and ends it everywhere through `GatekeeperUser.endSignIn()`, which such a vendor's sign-in
+   * accounts must implement, and `revoke()` ends a kept sign-in the Workshop did not use. A sign-in
+   * without `keepSignIn` stays transient, so a Workshop that predates this is never handed a
+   * provider session it would not hold. Only meaningful with `providesSubject`. Defaults to false.
+   */
+  keepsSignIn?: boolean;
+
+  /**
+   * The sign-in button's whole text, e.g. "Sign in with Google", for a vendor whose button should
+   * not read "Continue with <displayName>". Only meaningful with `providesAuth`.
+   */
+  signInLabel?: string;
+
+  /**
+   * When set, the vendor honours `GatekeeperConnectOptions.chooseAccount` on a sign-in, and the
+   * Workshop offers a second sign-in button with this text (e.g. "Use a different Google account")
+   * that asks the provider for its account chooser. Only meaningful with `providesAuth`.
+   */
+  chooseAccountLabel?: string;
+
+  /**
    * If set, this vendor can mint a connected account with no OAuth flow (see
    * GatekeeperVendor.createAccount) and recommends the Workshop auto-provision one account per user.
    * The account — not the vendor — declares whether it provides an agent singleton and/or a
@@ -630,6 +654,20 @@ export type ResourceConfiguratorFrame = GatekeeperUiFrame;
 export type GatekeeperConnectOptions = {
   scopes?: "auth" | "full";
   resourceUrlPatterns?: string[];
+  /**
+   * Only for a sign-in through a vendor that declares `chooseAccountLabel`. `true` asks the provider
+   * for its account chooser; `false` asks it to reuse a sign-in the browser already holds without
+   * showing a page, falling back to its normal sign-in when there is none. Unset leaves the
+   * vendor's default.
+   */
+  chooseAccount?: boolean;
+  /**
+   * Only for a sign-in (`scopes: "auth"`) through a vendor that declares
+   * `VendorDescription.keepsSignIn`: the provider sign-in is kept, and the account the sign-in hands
+   * the Workshop answers `checkSignIn()` and `endSignIn()` for it. Without it the sign-in is
+   * transient and keeps nothing.
+   */
+  keepSignIn?: boolean;
 };
 
 /**
@@ -951,6 +989,21 @@ export interface GatekeeperUser extends WorkerEntrypoint {
    * when the account has none, which fails the sign-in.
    */
   getAuthenticatedSubject?(): Promise<GatekeeperSubject | null>;
+
+  /**
+   * For a sign-in account of a vendor that declares `keepsSignIn`, handed over for a sign-in that
+   * asked for `keepSignIn`: whether the provider sign-in behind it is still live, asked of the
+   * provider now. False once the provider has confirmed it ended (signed out anywhere, expired,
+   * revoked); throws when the provider could not answer, which says nothing either way.
+   */
+  checkSignIn?(): Promise<boolean>;
+
+  /**
+   * For a sign-in account of a vendor that declares `keepsSignIn`: ends the person's provider
+   * sign-in everywhere it is live, not only the session this account keeps, so every app signed in
+   * through it is signed out. Idempotent; throws when the provider could not confirm it.
+   */
+  endSignIn?(): Promise<void>;
 
   /** Get a `GatekeeperUserVerifier` representing this user. */
   getVerifier(): Promise<Fetcher<GatekeeperUserVerifier>>;

@@ -1,15 +1,15 @@
 import { RpcStub } from "capnweb";
 import type { AttentionItem, AttentionPersonalState, ChatReadState, ChatTimelineHead, UnreadStateScope, UnreadStateSubscriber, UserUnreadState, UnreadThread, UserUnreadSummary, WorkspaceUnreadSummary } from "@gadgets/workshop-shared/api";
-import { WorkspaceMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, RedactedAiModelConfig, ModelKind, modelKind, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, WorkspaceMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, OutputSummary, ListOutputsResult, AUTH_ERROR_CODES, createAuthError, ConnectFlowStart, validateCommitEmail, NotificationSubscriber, NotificationMute, UserNotification, type DeviceSessionHandoffStart, type WebPushSubscription } from '@gadgets/workshop-shared/api';
+import { WorkspaceMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, RedactedAiModelConfig, ModelKind, modelKind, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, WorkspaceMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, OutputSummary, ListOutputsResult, AUTH_ERROR_CODES, createAuthError, SIGN_OUT_ERROR_CODES, createSignOutError, ConnectFlowStart, validateCommitEmail, NotificationSubscriber, NotificationMute, UserNotification, type DeviceSessionHandoffStart, type WebPushSubscription } from '@gadgets/workshop-shared/api';
 import { ActionDescription, Gatekeeper, GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor, AccountDescription, VendorDescription, GatekeeperConnectCallback, ConnectHandoff, SupportedResource, ResourceConfiguratorFrame, AppUiContext, GatekeeperUiFrame, GatekeeperUserSelection, GatekeeperUserSelectionExchange, RedeemedGatekeeperUserSelection } from "@gadgets/workshop-shared/gatekeeper";
 import { shouldAutoProvisionAccount, ambientGatekeeperMode } from "./provisioning-policy.js";
 import { CloudflareGatekeeperUser } from "@gadgets/workshop-shared/cloudflare-gatekeeper";
-import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
+import { DurableObject, WorkerEntrypoint, RpcStub as NativeRpcStub, RpcTarget as NativeRpcTarget } from "cloudflare:workers";
 import { skipRpcValidation, validateRpc } from "capnweb-validate";
 import type { Singleton } from "@gadgets/typed-storage";
 import {
   makeUserStorage, type BlueprintUserRecord, type CloudflareBilling, type ConnectedAccountRecord,
-  type GadgetRecord, type PendingConnectFlow, type PendingDeviceHandoffRecord,
+  type GadgetRecord, type LoginSessionRecord, type PendingConnectFlow, type PendingDeviceHandoffRecord,
   type PendingHandoffRecord, type UserAiModelRecord, type UserStorage, type WorkspaceOutputEntry,
   type ChatReadCursor,
 } from "./storage-schema/user-storage.js";
@@ -64,6 +64,71 @@ const NOTIFICATION_DEVICES_PER_KIND = 10;
 
 /** Server-enforced lifetime of a Workshop session issued to a native device. */
 export const DEVICE_SESSION_LIFETIME_MS = 30 * 24 * 60 * 60_000;
+
+/**
+ * How long a browser session lives (FAC-300): from its creation, or, for a session a provider
+ * sign-in backs, from the last time that sign-in was confirmed live. InferLab's refresh sessions
+ * live as long.
+ */
+export const SESSION_LIFETIME_MS = 30 * 24 * 60 * 60_000;
+
+/** How long a backing sign-in's last confirmation stands before `authenticate` asks again. */
+export const SIGN_IN_CHECK_INTERVAL_MS = 5 * 60_000;
+
+/** How long after a backing sign-in could not answer `authenticate` waits before asking again. */
+export const SIGN_IN_RETRY_INTERVAL_MS = 60_000;
+
+/** How long a session a sign-in backs stands without that sign-in confirmed live (fail closed). */
+export const SIGN_IN_UNCONFIRMED_LIMIT_MS = 24 * 60 * 60_000;
+
+/**
+ * How long `signOut` waits for a backing account's `endSignIn()` before treating the provider's
+ * sign-out as failed (`SIGN_OUT_ERROR_CODES.providerSignOutFailed`): a person is waiting on it. A
+ * little over the InferLab gatekeeper's own 5-second bound, so its answer wins when it has one, and
+ * inside the frontend's 8-second wait, so the person is told the provider's sign-out failed.
+ */
+export const SIGN_IN_END_TIMEOUT_MS = 6_000;
+
+/**
+ * How often the user DO re-checks the sessions open connections watch (watchSession), while at
+ * least one is watched. Each re-check is `authenticate`'s, so a backing sign-in is still asked at
+ * most every SIGN_IN_CHECK_INTERVAL_MS: a sign-out elsewhere closes an open connection within about
+ * that interval plus this one.
+ */
+export const SESSION_RECHECK_INTERVAL_MS = 60_000;
+
+/** The sign-in account a sign-in that keeps its provider sign-in hands over: it backs the session. */
+export type SignInBacking = { account: Fetcher<GatekeeperUser>, vendorId: string };
+
+/** The id a session token's record is stored under, or null for a token that is not Base64. */
+async function tokenIdOf(token: string): Promise<string | null> {
+  let tokenBytes: Uint8Array;
+  try {
+    tokenBytes = Uint8Array.fromBase64(token);
+  } catch {
+    return null;
+  }
+  return hashSecret(tokenBytes);
+}
+
+/** When `session` ends: its `expiresAt`, or SESSION_LIFETIME_MS after a pre-expiry record's creation. */
+function sessionExpiry(session: LoginSessionRecord): number {
+  return session.expiresAt?.getTime() ?? session.created.getTime() + SESSION_LIFETIME_MS;
+}
+
+/** A watch on a session (UserDurableObject.watchSession), which disposing stops. */
+class SessionWatch extends NativeRpcTarget {
+  #stop: () => void;
+
+  constructor(stop: () => void) {
+    super();
+    this.#stop = stop;
+  }
+
+  [Symbol.dispose](): void {
+    this.#stop();
+  }
+}
 
 /**
  * A workspace's update about one chat, sent to `messageArrived()`. It may cover several changes
@@ -405,30 +470,226 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   async authenticate(token: string): Promise<void> {
-    let tokenBytes: Uint8Array;
-    try {
-      tokenBytes = Uint8Array.fromBase64(token);
-    } catch {
-      // A corrupt (non-Base64) token must classify as an auth failure like any other bad token,
-      // not surface as the decoder's SyntaxError.
-      throw createAuthError(AUTH_ERROR_CODES.invalidSessionToken);
-    }
-    let hash = await crypto.subtle.digest('SHA-256', tokenBytes);
-    let tokenId = new Uint8Array(hash).toHex();
-    let session = this.storage.sessions.get(tokenId);
+    // A corrupt (non-Base64) token must classify as an auth failure like any other bad token,
+    // not surface as the decoder's SyntaxError.
+    let tokenId = await tokenIdOf(token);
+    let session = tokenId === null ? undefined : this.storage.sessions.get(tokenId);
     if (!session) {
       throw createAuthError(AUTH_ERROR_CODES.invalidSessionToken);
     }
-    const now = Date.now();
-    if ((session.expiresAt && session.expiresAt.getTime() <= now) ||
-        (session.pendingUntil && session.pendingUntil.getTime() <= now)) {
-      this.storage.sessions.delete(tokenId);
+    if (session.pendingUntil && session.pendingUntil.getTime() <= Date.now()) {
+      this.#deleteSession(session.tokenId);
       throw createAuthError(AUTH_ERROR_CODES.invalidSessionToken);
     }
-    if (session.pendingUntil) {
+    if (session.pendingUntil || !await this.#sessionLive(session)) {
       throw createAuthError(AUTH_ERROR_CODES.invalidSessionToken);
     }
     this.#syncDirectory();
+  }
+
+  // Whether `session` may still be used, ending it (deleting its record) when not: past its expiry,
+  // or backed by a sign-in that has ended (#checkSignIn). A backing sign-in is asked at most every
+  // SIGN_IN_CHECK_INTERVAL_MS. One that cannot answer leaves the session standing, and is asked
+  // again no sooner than SIGN_IN_RETRY_INTERVAL_MS later, until SIGN_IN_UNCONFIRMED_LIMIT_MS has
+  // passed since it was last confirmed live: the session ends then (fail closed). A session ended
+  // by anything else while its sign-in was asked (a sign-out) is not live either.
+  async #sessionLive(session: LoginSessionRecord): Promise<boolean> {
+    let now = Date.now();
+    let live = now < sessionExpiry(session);
+    let backing = session.backing;
+    if (live && backing && now - backing.checkedAt.getTime() >= SIGN_IN_CHECK_INTERVAL_MS) {
+      let retrying = backing.failedAt !== undefined &&
+          now - backing.failedAt.getTime() < SIGN_IN_RETRY_INTERVAL_MS;
+      let answer = retrying ? null : await this.#checkSignIn(backing.id);
+      // The provenance guard: the answer is about this session's own backing, so it is applied only
+      // while the record still exists with that backing. A sign-out that ran meanwhile stands, and a
+      // fresh sign-in (another session, another backing) is never touched by it.
+      let current = this.storage.sessions.get(session.tokenId);
+      if (!current || current.backing?.id !== backing.id) return false;
+      if (answer === true) {
+        this.storage.sessions.put({
+          ...current, expiresAt: new Date(now + SESSION_LIFETIME_MS),
+          backing: { id: backing.id, vendorId: backing.vendorId, checkedAt: new Date(now) },
+        });
+      } else if (answer === false || now - backing.checkedAt.getTime() >= SIGN_IN_UNCONFIRMED_LIMIT_MS) {
+        live = false;
+      } else if (!retrying) {
+        this.storage.sessions.put({ ...current, backing: { ...backing, failedAt: new Date(now) } });
+      }
+    }
+    if (!live) this.#deleteSession(session.tokenId);
+    return live;
+  }
+
+  // Asks whether the provider sign-in behind backing `backingId` is still live: false when it has
+  // ended or its record is gone, and null when the provider could not answer.
+  async #checkSignIn(backingId: string): Promise<boolean | null> {
+    let record = this.storage.signInBackings.get(backingId);
+    if (!record) return false;
+    const account = record.account;
+    // A stub has every method; this narrows the optional one GatekeeperUser declares.
+    if (typeof account.checkSignIn !== "function") return null;
+    try {
+      return await account.checkSignIn();
+    } catch (error) {
+      logger.warn("could not check the sign-in backing a session", {
+        event: "session.sign_in.check.failed", vendorId: record.vendorId, error,
+      });
+      return null;
+    }
+  }
+
+  // Ends session `tokenId` and forgets the sign-in account backing it, if any. Each connection
+  // authenticated with it is closed (watchSession).
+  #deleteSession(tokenId: string): void {
+    let session = this.storage.sessions.get(tokenId);
+    if (!session) return;
+    this.storage.sessions.delete(tokenId);
+    if (session.backing) this.storage.signInBackings.delete(session.backing.id);
+  }
+
+  /**
+   * Calls `ended` once the session `token` names has ended: signed out, or found expired or ended by
+   * `authenticate`, from any connection. Called at once when there is no such session. Disposing the
+   * returned handle stops watching without calling it. AuthenticatedApiImpl closes its connection
+   * when called, so a session ended anywhere stops working everywhere it is open. While any session
+   * is watched it is re-checked every SESSION_RECHECK_INTERVAL_MS (recheckWatchedSessions), so a
+   * sign-out in another app reaches an open connection though nobody authenticates again.
+   */
+  async watchSession(token: string, ended: NativeRpcStub<() => void>): Promise<SessionWatch> {
+    let tokenId = await tokenIdOf(token);
+    let sessions = this.storage.sessions;
+    let callback = ended.dup();  // keep the stub after return
+    let done = false;
+    this.sessionWatches.requested++;
+    let watches = this.sessionWatches.counts;
+    let subscriber = {
+      add() {},
+      update() {},
+      remove(record: LoginSessionRecord) {
+        if (record.tokenId === tokenId) finish(true);
+      },
+    };
+    // Runs inside the write that ended the session, so it must not throw.
+    let finish = (call: boolean) => {
+      if (done) return;
+      done = true;
+      sessions.unsubscribe(subscriber);
+      if (tokenId !== null) {
+        let count = (watches.get(tokenId) ?? 1) - 1;
+        if (count > 0) watches.set(tokenId, count);
+        else watches.delete(tokenId);
+      }
+      if (watches.size === 0) this.#stopRechecks();
+      if (!call) {
+        callback[Symbol.dispose]();
+        return;
+      }
+      callback().catch((error: unknown) => {
+        logger.warn("could not close a connection whose session ended", {
+          event: "session.watch.notify.failed", error,
+        });
+      }).finally(() => callback[Symbol.dispose]());
+    };
+    if (tokenId === null || !sessions.get(tokenId)) {
+      finish(true);
+    } else {
+      watches.set(tokenId, (watches.get(tokenId) ?? 0) + 1);
+      sessions.subscribe(subscriber);
+      this.#startRechecks();
+    }
+    return new SessionWatch(() => finish(false));
+  }
+
+  // The token ids of the sessions open connections watch, each with its number of watches, the
+  // timer that re-checks them, armed only while there is at least one, its interval, and how many
+  // watches have been asked for in all (`requested`). A watch exists only while a connection holds
+  // it, so an idle user costs nothing; a reset drops all of it, and the connections watch again
+  // (AuthenticatedApiImpl), which arms the timer again. Not `#`-private, so a test can read it and
+  // shorten `intervalMs` (the test seam, session-sign-in.test.ts); RPC exposes no instance property.
+  private sessionWatches: {
+    counts: Map<string, number>;
+    timer: ReturnType<typeof setTimeout> | undefined;
+    intervalMs: number;
+    requested: number;
+  } = { counts: new Map(), timer: undefined, intervalMs: SESSION_RECHECK_INTERVAL_MS, requested: 0 };
+
+  #startRechecks(): void {
+    let watches = this.sessionWatches;
+    if (watches.timer !== undefined) return;
+    watches.timer = setTimeout(() => {
+      watches.timer = undefined;
+      this.recheckWatchedSessions().catch((error: unknown) => {
+        logger.warn("could not re-check watched sessions", { event: "session.recheck.failed", error });
+      }).finally(() => {
+        if (watches.counts.size > 0) this.#startRechecks();
+      });
+    }, watches.intervalMs);
+  }
+
+  #stopRechecks(): void {
+    clearTimeout(this.sessionWatches.timer);
+    this.sessionWatches.timer = undefined;
+  }
+
+  /**
+   * Runs `authenticate`'s check on every session an open connection watches, ending (and so closing
+   * the connections of) each that is no longer live: past its expiry, or backed by a sign-in that
+   * has ended, with the same interval, back-off and one-day limit. The re-check timer calls it.
+   */
+  async recheckWatchedSessions(): Promise<void> {
+    for (let tokenId of Array.from(this.sessionWatches.counts.keys())) {
+      let session = this.storage.sessions.get(tokenId);
+      if (session && !session.pendingUntil) await this.#sessionLive(session);
+    }
+  }
+
+  /**
+   * Ends the session `token` names (see AuthenticatedApi.signOut). When a provider sign-in backs it,
+   * every other session of this account a sign-in through the same provider backs ends too, and the
+   * provider sign-in is ended everywhere through the backing account (`endSignIn`), which ends the
+   * person's sign-in there and so the sign-ins behind those sessions as well. The sessions are gone
+   * whether or not the provider could end it; when it could not, or did not answer within
+   * SIGN_IN_END_TIMEOUT_MS, this throws, so a sign-out that did not reach the provider never reads
+   * as done.
+   */
+  async signOut(token: string): Promise<void> {
+    let tokenId = await tokenIdOf(token);
+    let session = tokenId === null ? undefined : this.storage.sessions.get(tokenId);
+    if (!session) return;
+    let backing = session.backing;
+    // Read before the records go: the account is what ends the provider sign-in.
+    let record = backing ? this.storage.signInBackings.get(backing.id) : undefined;
+    this.#deleteSession(session.tokenId);
+    if (!backing) return;
+    for (let other of Array.from(this.storage.sessions.list())) {
+      if (other.backing?.vendorId === backing.vendorId) this.#deleteSession(other.tokenId);
+    }
+    if (!record) return;
+    const account = record.account;
+    let failed = false;
+    try {
+      // A stub has every method; this narrows the optional one GatekeeperUser declares.
+      if (typeof account.endSignIn === "function") {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        let timedOut = new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error("the provider's sign-out did not answer in time")),
+              SIGN_IN_END_TIMEOUT_MS);
+        });
+        try {
+          await Promise.race([account.endSignIn(), timedOut]);
+        } finally {
+          clearTimeout(timer);
+        }
+      }
+    } catch (error) {
+      logger.error("could not end the sign-in backing a session", {
+        event: "session.sign_in.end.failed", vendorId: backing.vendorId, error,
+      });
+      failed = true;
+    }
+    // Coded, so the person is told the provider's sign-out failed (the provider's own error is logged).
+    if (failed) throw createSignOutError(SIGN_OUT_ERROR_CODES.providerSignOutFailed);
   }
 
   /**
@@ -454,9 +715,19 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     return isNew;
   }
 
-  async #newSessionToken(options: { expiresAt?: Date; pendingUntil?: Date } = {}): Promise<string> {
+  // Every session expires (SESSION_LIFETIME_MS); `backing` names the provider sign-in that backs
+  // it, confirmed live just now by the sign-in that handed it over.
+  async #newSessionToken(backing?: SignInBacking): Promise<string> {
     let { secret, hash: tokenId } = await newSecretToken();
-    this.storage.sessions.put({ tokenId, created: new Date(), ...options });
+    let created = new Date();
+    let backingId = backing ? crypto.randomUUID() : undefined;
+    if (backing && backingId) {
+      this.storage.signInBackings.put({ id: backingId, vendorId: backing.vendorId, account: backing.account });
+    }
+    this.storage.sessions.put({
+      tokenId, created, expiresAt: new Date(created.getTime() + SESSION_LIFETIME_MS),
+      ...(backing && backingId ? { backing: { id: backingId, vendorId: backing.vendorId, checkedAt: created } } : {}),
+    });
     return secret.toBase64();
   }
 
@@ -609,9 +880,14 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
    *
    * When the account doesn't yet exist and `allowCreate` is false (deployment signups are closed),
    * returns null instead of creating one — existing users can still sign in.
+   *
+   * `backing`, for a sign-in that kept its provider sign-in (VendorDescription.keepsSignIn), is the
+   * sign-in account: the session is backed by it, checked through it and ended with it (see
+   * `authenticate` and `signOut`). Nothing is stored for it when null is returned.
    */
   async loginOrCreateViaGatekeeper(name: string, allowCreate: boolean,
-                                   email: string | null = name): Promise<string | null> {
+                                   email: string | null = name,
+                                   backing?: SignInBacking): Promise<string | null> {
     if (!this.storage.created.get()) {
       if (!allowCreate) return null;
       this.storage.created.put(true);
@@ -631,7 +907,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       user_id: this.ctx.id.toString(),
       source: "gatekeeper",
     });
-    return this.#newSessionToken();
+    return this.#newSessionToken(backing);
   }
 
   /** Whether this account has a password set (false for gatekeeper sign-in accounts). */
@@ -2969,9 +3245,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       if (pending.expiresAt.getTime() <= now) this.#dropPendingDeviceHandoff(pending);
     }
     for (let session of Array.from(this.storage.sessions.list())) {
-      if ((session.expiresAt?.getTime() ?? Infinity) <= now) {
-        this.storage.sessions.delete(session.tokenId);
-      }
+      if (sessionExpiry(session) <= now) this.#deleteSession(session.tokenId);
     }
     await this.#armExpirySweep();
     for (let result of await deliveries) if (result.status === "rejected") {

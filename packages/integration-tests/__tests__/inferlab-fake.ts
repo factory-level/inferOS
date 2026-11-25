@@ -3,6 +3,15 @@
 // connection (gatekeeper-inferlabops), and the reads they make with that person's token. A handler
 // module for the harness's NetworkInterceptor, with one company, one workspace, one Project and one
 // Location, and grants the test can revoke.
+//
+// Sessions are central auth's (FAC-300), for the one person and the one browser the fake models.
+// Signing in at `/authorize` (`authorize`) opens a root session for the browser, or reuses its live
+// one; each code exchange opens a child session under that root, and a refresh rotates the child.
+// `/authorize?prompt=none` answers with a code only while the browser holds a live root, and with
+// `error=login_required` otherwise; any other prompt signs the person in. `POST /auth/logout` ends
+// one child, and `POST /auth/sign-out` every root of the person and every child under them
+// (idempotent; 401 for a dead refresh token). A code the fake did not issue (`throughOAuth`'s) opens
+// a child under a root of its own.
 
 import { createHmac } from "node:crypto";
 import { existsSync } from "node:fs";
@@ -26,7 +35,7 @@ export const DESTINATION = "inferos-field-ops";
 const SECRET = "integration-secret-0123456789abcdef0123456789";
 export const SIGN_IN_WORKER = "gatekeeper-inferlab";
 export const OPS_WORKER = "gatekeeper-inferlabops";
-const SIGN_IN_BASE = "https://workshop.test/gatekeeper/inferlab";
+export const SIGN_IN_BASE = "https://workshop.test/gatekeeper/inferlab";
 export const OPS_BASE = "https://workshop.test/gatekeeper/inferlabops";
 
 const shared = { INFERLAB_AUTH_ORIGIN: ORIGIN, INFEROPS_COMPANY: COMPANY };
@@ -76,9 +85,24 @@ const json = (body: unknown, status = 200) => Response.json(body, { status });
 const notFound = () => json({ error: { code: "NOT_FOUND" } }, 404);
 const jwt = () => `h.${Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 900 })).toString("base64url")}.s`;
 
+/** A central-auth sign-in: the root every session it hands out is a child of. */
+type Root = { live: boolean };
+type Session = { root: Root; refresh: string; live: boolean };
+
 export class FakeInferOps {
   /** The owner's InferOps grant in the workspace; revoking it refuses their next read. */
   granted = true;
+  /** The `prompt` of every `/authorize` request `authorize` answered, in order (null for none). */
+  readonly prompts: (string | null)[] = [];
+  /** Refresh tokens InferLab was asked to end one session with (`/auth/logout`). */
+  readonly logouts: string[] = [];
+  /** Refresh tokens InferLab was asked to end the person's sign-in with (`/auth/sign-out`). */
+  readonly signOuts: string[] = [];
+  readonly #roots: Root[] = [];
+  /** The root the one modelled browser holds, if it has signed in. */
+  #browser: Root | null = null;
+  readonly #codes = new Map<string, Root>();
+  readonly #sessions: Session[] = [];
   /** Events InferOps committed, by id: what `verifyEvent` reads back. */
   readonly events = new Map<string, Record<string, unknown>>();
   /** Every request, as `METHOD path`. */
@@ -90,18 +114,37 @@ export class FakeInferOps {
     if (url.origin !== ORIGIN) return null;
     this.requests.push(`${method} ${url.pathname}`);
     if (url.pathname === "/auth/token" && method === "POST") {
-      await request.text();
-      const token = `${jwt()}.owner.${++this.#minted}`;
-      this.#tokens.add(token);
-      return json({ token, refreshToken: `iexr_owner_${this.#minted}`,
+      const { code } = JSON.parse(await request.text()) as { code?: string };
+      let root = this.#codes.get(code ?? "");
+      this.#codes.delete(code ?? "");
+      if (!root) this.#roots.push(root = { live: true });
+      if (!root.live) return json({ error: "invalid_grant" }, 400);
+      const { token, refresh } = this.#issue(root);
+      return json({ token, refreshToken: refresh,
         user: { id: OWNER, email: "owner@acme.example", emailVerified: true, tenantId: COMPANY } });
     }
     if (url.pathname === "/auth/refresh" && method === "POST") {
-      const token = `${jwt()}.owner.${++this.#minted}`;
-      this.#tokens.add(token);
-      return json({ token, refreshToken: `iexr_owner_${this.#minted}` });
+      const session = this.#live(await request.text());
+      if (!session) return json({ error: { code: "UNAUTHORIZED" } }, 401);
+      session.live = false;
+      const { token, refresh } = this.#issue(session.root);
+      return json({ token, refreshToken: refresh });
     }
-    if (url.pathname === "/auth/logout") return new Response(null, { status: 204 });
+    if (url.pathname === "/auth/logout") {
+      const { refreshToken } = JSON.parse(await request.text()) as { refreshToken: string };
+      this.logouts.push(refreshToken);
+      const session = this.#sessions.find(s => s.refresh === refreshToken);
+      if (session) session.live = false;
+      return new Response(null, { status: 204 });
+    }
+    if (url.pathname === "/auth/sign-out" && method === "POST") {
+      const body = await request.text();
+      this.signOuts.push((JSON.parse(body) as { refreshToken: string }).refreshToken);
+      if (!this.#live(body)) return json({ error: { code: "UNAUTHORIZED" } }, 401);
+      for (const root of this.#roots) root.live = false;
+      for (const session of this.#sessions) session.live = false;
+      return new Response(null, { status: 204 });
+    }
     const bearer = headers.get("authorization")?.replace(/^Bearer /, "") ?? "";
     if (!this.#tokens.has(bearer)) return json({ error: { code: "UNAUTHORIZED" } }, 401);
     if (url.pathname === "/auth/company") {
@@ -129,6 +172,50 @@ export class FakeInferOps {
     if (event) return this.events.has(event) ? json(this.events.get(event)) : notFound();
     return notFound();
   };
+
+  /** A child session under `root`: an access token InferOps accepts, and its refresh token. */
+  #issue(root: Root): { token: string; refresh: string } {
+    const token = `${jwt()}.owner.${++this.#minted}`;
+    this.#tokens.add(token);
+    const refresh = `iexr_owner_${this.#minted}`;
+    this.#sessions.push({ root, refresh, live: true });
+    return { token, refresh };
+  }
+
+  /** The live session a `{refreshToken}` body names, under a live root. */
+  #live(body: string): Session | null {
+    const { refreshToken } = JSON.parse(body) as { refreshToken?: string };
+    return this.#sessions.find(s => s.refresh === refreshToken && s.live && s.root.live) ?? null;
+  }
+
+  /**
+   * The browser opens InferLab's `/authorize`: returns the redirect back to the gatekeeper. With
+   * `prompt=none` the browser's live root answers with a code, and without one the redirect
+   * carries `error=login_required`; any other prompt (or none at all) signs the owner in, reusing
+   * the browser's live root.
+   */
+  authorize(authorizeUrl: string): string {
+    const url = new URL(authorizeUrl);
+    if (url.origin !== ORIGIN || url.pathname !== "/authorize") throw new Error(`Not an authorize URL: ${authorizeUrl}`);
+    const prompt = url.searchParams.get("prompt");
+    this.prompts.push(prompt);
+    const back = new URL(url.searchParams.get("redirect_uri")!);
+    back.searchParams.set("state", url.searchParams.get("state")!);
+    if (prompt === "none" && !this.#browser?.live) {
+      back.searchParams.set("error", "login_required");
+      return back.toString();
+    }
+    if (!this.#browser?.live) this.#roots.push(this.#browser = { live: true });
+    const code = `code-${++this.#minted}`;
+    this.#codes.set(code, this.#browser);
+    back.searchParams.set("code", code);
+    return back.toString();
+  }
+
+  /** Whether the modelled browser holds a live central-auth sign-in. */
+  browserSignedIn(): boolean {
+    return this.#browser?.live === true;
+  }
 
   /** Commit a review request on the Location, as InferOps would; returns the committed event. */
   commit(eventId: string): Record<string, unknown> {
@@ -164,7 +251,7 @@ export class FakeInferOps {
 }
 
 /** The handoff page's ticket, as the kit's `connectHandoffPageHtml` embeds it. */
-async function ticketOf(page: { status: number; text(): Promise<string> }): Promise<string> {
+export async function ticketOf(page: { status: number; text(): Promise<string> }): Promise<string> {
   const ticket = /var ticket = (".*?");\n/.exec(await page.text());
   if (!ticket) throw new Error(`The handoff page (HTTP ${page.status}) carried no ticket`);
   return JSON.parse(ticket[1]!) as string;

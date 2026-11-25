@@ -25,7 +25,7 @@ export type StageAuthMode =
    * Cloudflare Access gates the hostname at the edge only; the Workshop itself signs people in with
    * InferLab (`AUTH_GATEKEEPERS=inferlab`, password login off). The backend gets no `CF_ACCESS_*`,
    * because with `CF_ACCESS_AUD` set it takes the Access email as the identity and refuses every
-   * other login, which would make "Sign in with InferLab" unreachable.
+   * other login, which would make "Sign in with Google" (FAC-300) unreachable.
    */
   "inferlab";
 

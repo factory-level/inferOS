@@ -309,7 +309,7 @@ test("FAC-296 part 2: a malformed proxy origin or turn limit is refused before a
 
 test("FAC-296 part 2: the deploy ends with the smoke a person runs", () => {
   const steps = stageSmokeSteps(dev).join("\n");
-  for (const needle of [/Cloudflare Access/, /Sign in with InferLab/, /seat of the stage's company/,
+  for (const needle of [/Cloudflare Access/, /Use a different Google account/, /seat of the stage's company/,
     /auth\.dev-os\.factorylevel\.dev/, /board/, /model picker shows an agent/]) {
     assert.match(steps, needle);
   }

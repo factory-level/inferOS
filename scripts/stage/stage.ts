@@ -344,7 +344,7 @@ async function assertBehindAccess(stage: StageDefinition): Promise<void> {
 export function stageSmokeSteps(stage: StageDefinition): string[] {
   return [
     `Open https://${stage.hostname} and pass Cloudflare Access.`,
-    `Choose "Sign in with InferLab" and sign in as a seat of the stage's company` +
+    `Choose "Use a different Google account" and sign in as a seat of the stage's company` +
       (stage.inferops.authorizeOrigin
         ? ` (the sign-in page is served from ${new URL(stage.inferops.authorizeOrigin).hostname}).`
         : "."),

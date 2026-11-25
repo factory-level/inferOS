@@ -5,6 +5,7 @@ import { Button, Banner } from '@cloudflare/kumo'
 import { openDisownedPopup, uniquePopupName } from '../../connectHandoff'
 import type { AuthPopup } from '../../features/native-app/authPopup'
 import { nativeApp } from '../../features/native-app/nativeApp'
+import { chooseAccountNext, clearChooseAccountNext } from '../../features/auth/chooseAccount'
 
 interface OAuthButtonsProps {
   rpcStub: RpcStub<PublicApi>
@@ -35,6 +36,12 @@ const RECEIVE_POLL_MS = 1000
  * A newer attempt waits for the previous one's in-flight `receive()` before tearing it down: the
  * server releases the token exactly once, so a call cancelled mid-flight could discard a token
  * that had already been handed out, leaving the user to sign in twice.
+ *
+ * A vendor may name its button's text (`signInLabel`, e.g. "Sign in with Google"); otherwise it reads
+ * "Continue with <name>". A vendor that offers an account chooser (`chooseAccountLabel`) gets a
+ * second button asking for it. Its main button asks the provider to reuse a sign-in the browser
+ * already holds, unless the person signed out since their last sign-in (chooseAccount.ts), in which
+ * case it asks for the chooser too (FAC-300).
  */
 export default function OAuthButtons({ rpcStub, vendors, onSuccess }: OAuthButtonsProps) {
   const [error, setError] = useState<string | null>(null)
@@ -64,7 +71,8 @@ export default function OAuthButtons({ rpcStub, vendors, onSuccess }: OAuthButto
 
   if (vendors.length === 0) return null
 
-  const start = async (vendorId: string) => {
+  const start = async (vendor: AuthVendorInfo, chooseAccount: boolean) => {
+    const vendorId = vendor.vendorId
     // Disable the buttons at once, then let the previous attempt finish a receive() it may have in
     // flight: if that call releases the token, the previous attempt completes the login and this
     // one has nothing to do.
@@ -74,7 +82,8 @@ export default function OAuthButtons({ rpcStub, vendors, onSuccess }: OAuthButto
     setError(null)
     setPending(vendorId)
     try {
-      const { url, nonce, attempt } = await rpcStub.startGatekeeperLogin(vendorId)
+      const { url, nonce, attempt } = await rpcStub.startGatekeeperLogin(vendorId,
+        vendor.chooseAccountLabel ? { chooseAccount } : undefined)
       // `attempt` is the capability to receive the session token.
       const dispose = () => {
         try { (attempt as unknown as Disposable)[Symbol.dispose]() } catch { /* already disposed */ }
@@ -144,6 +153,7 @@ export default function OAuthButtons({ rpcStub, vendors, onSuccess }: OAuthButto
       })
       if (!mountedRef.current) return  // user navigated away mid-flow; drop the result
       localStorage.setItem('authToken', token)
+      clearChooseAccountNext()
       if (onSuccess) onSuccess()
       else window.location.reload()
     } catch (err) {
@@ -162,24 +172,36 @@ export default function OAuthButtons({ rpcStub, vendors, onSuccess }: OAuthButto
     <div className="space-y-3">
       {error && <Banner variant="error" title={error} />}
       {vendors.map((vendor) => (
-        <Button
-          key={vendor.vendorId}
-          variant="secondary"
-          onClick={() => start(vendor.vendorId)}
-          loading={pending === vendor.vendorId}
-          disabled={pending !== null}
-          className="w-full justify-center"
-        >
-          {vendor.logo && (
-            <img
-              src={vendor.logo.url}
-              alt=""
-              className="mr-1"
-              style={{ height: 18, width: 'auto' }}
-            />
+        <div key={vendor.vendorId} className="space-y-1">
+          <Button
+            variant="secondary"
+            onClick={() => start(vendor, chooseAccountNext())}
+            loading={pending === vendor.vendorId}
+            disabled={pending !== null}
+            className="w-full justify-center"
+          >
+            {vendor.logo && !vendor.signInLabel && (
+              <img
+                src={vendor.logo.url}
+                alt=""
+                className="mr-1"
+                style={{ height: 18, width: 'auto' }}
+              />
+            )}
+            {vendor.signInLabel ?? `Continue with ${vendor.displayName}`}
+          </Button>
+          {vendor.chooseAccountLabel && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => start(vendor, true)}
+              disabled={pending !== null}
+              className="w-full justify-center"
+            >
+              {vendor.chooseAccountLabel}
+            </Button>
           )}
-          Continue with {vendor.displayName}
-        </Button>
+        </div>
       ))}
       {pending !== null && cancellable && nativeApp()?.authentication && (
         <Button variant="ghost" className="w-full" onClick={cancel}>Cancel sign-in</Button>

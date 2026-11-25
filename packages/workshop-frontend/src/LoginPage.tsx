@@ -11,14 +11,18 @@ import { useConnectionLost } from './RpcContext'
 import OAuthButtons from './components/auth/OAuthButtons'
 import SiteLogo from './components/SiteLogo'
 import { deviceSessionSearch } from './features/native-app/DeviceSessionHandoff'
+import SignOutWarning, { type SignOutWarningKind } from './features/auth/SignOutWarning'
 
 
 interface LoginPageProps {
   rpcStub: RpcStub<PublicApi>
   onLoginSuccess?: () => void
+  /** Why the last sign-out may not have ended everything on the server (useAuth's `signOutWarning`). */
+  signOutWarning?: SignOutWarningKind | null
+  onDismissSignOutWarning?: () => void
 }
 
-export default function LoginPage({ rpcStub, onLoginSuccess }: LoginPageProps) {
+export default function LoginPage({ rpcStub, onLoginSuccess, signOutWarning, onDismissSignOutWarning }: LoginPageProps) {
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [loading, setLoading] = useState(false)
@@ -110,6 +114,8 @@ export default function LoginPage({ rpcStub, onLoginSuccess }: LoginPageProps) {
           <h1 className="text-xl font-semibold text-kumo-default">{siteName}</h1>
           <p className="text-sm text-kumo-subtle mt-1">Sign in to your account</p>
         </div>
+
+        {signOutWarning && <SignOutWarning kind={signOutWarning} onDismiss={() => onDismissSignOutWarning?.()} />}
 
         {passwordAuthEnabled && (
           <>

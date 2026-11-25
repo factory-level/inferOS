@@ -1,15 +1,16 @@
 // @vitest-environment jsdom
 /* eslint-disable react/react-in-jsx-scope */
 
-import { act } from 'react'
+import { act, useEffect } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { RpcStub } from 'capnweb'
-import type { PublicApi, AuthenticatedApi, AiChatAuthorInfo } from '@gadgets/workshop-shared/api'
+import { SIGN_OUT_ERROR_CODES, createSignOutError, type PublicApi, type AuthenticatedApi, type AiChatAuthorInfo } from '@gadgets/workshop-shared/api'
 import { setReportedUserId } from './errorReporting'
 import { useAuth } from './useAuth'
 import { nativeConnectCompletion } from './features/native-app/connectSession'
 import { disconnectNativeNotificationEnrollment } from './features/notifications/nativeNotificationEnrollment'
+import SignOutWarning, { SIGN_OUT_WARNINGS } from './features/auth/SignOutWarning'
 
 vi.mock('./errorReporting', () => ({
   setReportedUserId: vi.fn<(reportedUserId: string | undefined) => void>(),
@@ -63,7 +64,7 @@ function deferredPublicApi(): {
   }
 }
 
-type Controls = { login: (token: string) => void; logout: () => void }
+type Controls = { login: (token: string) => void; logout: () => Promise<void> }
 
 describe('useAuth error reporting identity', () => {
   const roots: Root[] = []
@@ -150,7 +151,7 @@ describe('useAuth error reporting identity', () => {
     localStorage.setItem('authToken', 'stored-token')
     const { controls } = await mount(stubPublicApi(person))
 
-    act(() => controls.logout())
+    act(() => { void controls.logout() })
 
     expect(setReportedUserId).toHaveBeenLastCalledWith(undefined)
   })
@@ -162,7 +163,7 @@ describe('useAuth error reporting identity', () => {
     })
     localStorage.setItem('authToken', 'stored-token')
     const { controls } = await mount(stubPublicApi(person))
-    act(() => controls.logout())
+    act(() => { void controls.logout() })
     expect(disconnectNativeNotificationEnrollment).toHaveBeenCalledOnce()
     expect(sessionEnded).toHaveBeenCalledOnce()
   })
@@ -177,7 +178,7 @@ describe('useAuth error reporting identity', () => {
     if (callback === 'disconnect') vi.mocked(disconnectNativeNotificationEnrollment)
       .mockImplementationOnce(() => { throw new Error('native bridge unavailable') })
     const { controls } = await mount(stubPublicApi(person))
-    act(() => controls.logout())
+    act(() => { void controls.logout() })
     expect(disconnectNativeNotificationEnrollment).toHaveBeenCalledOnce()
     expect(localStorage.getItem('authToken')).toBeNull()
     expect(setReportedUserId).toHaveBeenLastCalledWith(undefined)
@@ -188,7 +189,7 @@ describe('useAuth error reporting identity', () => {
     const { api, release } = deferredPublicApi()
     const { controls } = await mount(api)
 
-    act(() => controls.logout())
+    act(() => { void controls.logout() })
     expect(setReportedUserId).toHaveBeenLastCalledWith(undefined)
 
     // Disposing the stub is not a defence: capnweb does not guarantee that disposal rejects a call
@@ -254,5 +255,137 @@ describe('useAuth error reporting identity', () => {
     await complete('a'.repeat(64), new AbortController().signal)
     expect(first.completeConnectHandoff).not.toHaveBeenCalled()
     expect(next.completeConnectHandoff).toHaveBeenCalledExactlyOnceWith('a'.repeat(64), 'b'.repeat(64))
+  })
+})
+
+// FAC-300: signing out ends the session on the server, not only in this browser.
+
+/** A public API whose authenticated stub records `signOut` and disposal, in order. */
+function signOutApi(signOut: () => Promise<void>) {
+  const events: string[] = []
+  const authenticated = {
+    onRpcBroken: () => {},
+    whoami: async () => person,
+    signOut: () => { events.push('signOut'); return signOut() },
+    [Symbol.dispose]: () => { events.push('dispose') },
+  }
+  const api = { authenticate: () => authenticated } as unknown as RpcStub<PublicApi>
+  return { api, events }
+}
+
+describe('useAuth sign-out', () => {
+  const roots: Root[] = []
+  const PROVIDER = SIGN_OUT_WARNINGS.provider.title
+  const UNCONFIRMED = SIGN_OUT_WARNINGS.unconfirmed.title
+  type SignOutControls = { login: (token: string) => void; logout: () => Promise<void> }
+
+  afterEach(() => {
+    act(() => roots.forEach(root => root.unmount()))
+    roots.length = 0
+    document.body.replaceChildren()
+    localStorage.clear()
+    vi.useRealTimers()
+    vi.clearAllMocks()
+  })
+
+  /** Renders the warning as the sign-in page does, after the signed-in state. */
+  async function mountWith(api: RpcStub<PublicApi>): Promise<SignOutControls> {
+    const captured: { controls?: SignOutControls } = {}
+    function Consumer() {
+      const { login, logout, isAuthenticated, signOutWarning, dismissSignOutWarning } = useAuth(api)
+      useEffect(() => { captured.controls = { login, logout } })
+      return <>
+        <p>{isAuthenticated ? 'Signed in' : 'Signed out'}</p>
+        {signOutWarning && <SignOutWarning kind={signOutWarning} onDismiss={dismissSignOutWarning} />}
+      </>
+    }
+    const container = document.createElement('div')
+    document.body.append(container)
+    const root = createRoot(container)
+    roots.push(root)
+    await act(async () => root.render(<Consumer />))
+    return captured.controls!
+  }
+
+  it('ends the session on the server before disposing the stub, and asks for the chooser next time', async () => {
+    localStorage.setItem('authToken', 'stored-token')
+    const { api, events } = signOutApi(async () => {})
+    const controls = await mountWith(api)
+
+    await act(async () => controls.logout())
+
+    expect(events).toEqual(['signOut', 'dispose'])
+    expect(localStorage.getItem('authToken')).toBeNull()
+    expect(localStorage.getItem('auth.chooseAccountNext')).toBe('1')
+    expect(document.body.textContent).toBe('Signed out')
+    expect(document.querySelector('[role="status"]')).toBeNull()
+  })
+
+  it('signs out in the browser at once even when the server never answers, and disposes after a timeout', async () => {
+    vi.useFakeTimers()
+    localStorage.setItem('authToken', 'stored-token')
+    const { api, events } = signOutApi(() => new Promise<void>(() => {}))
+    const controls = await mountWith(api)
+
+    await act(async () => { void controls.logout() })
+    expect(document.body.textContent).toBe('Signed out')
+    expect(localStorage.getItem('authToken')).toBeNull()
+    expect(events).toEqual(['signOut'])
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(8000) })
+    expect(events).toEqual(['signOut', 'dispose'])
+    // Unanswered is not done: the sign-in page says so, naming no provider it knows nothing of.
+    expect(document.body.textContent).toContain(UNCONFIRMED)
+    expect(document.body.textContent).not.toContain('InferLab')
+  })
+
+  it('warns without naming InferLab when the sign-out failed for another reason', async () => {
+    localStorage.setItem('authToken', 'stored-token')
+    const { api } = signOutApi(async () => { throw new Error('Peer closed WebSocket') })
+    const controls = await mountWith(api)
+
+    await act(async () => controls.logout())
+
+    expect(document.body.textContent).toContain(UNCONFIRMED)
+    expect(document.body.textContent).not.toContain('InferLab')
+  })
+
+  it('signs out in the browser when InferLab could not sign out, and says InferLab may still be signed in', async () => {
+    localStorage.setItem('authToken', 'stored-token')
+    const { api, events } = signOutApi(async () => { throw createSignOutError(SIGN_OUT_ERROR_CODES.providerSignOutFailed) })
+    const controls = await mountWith(api)
+
+    await act(async () => controls.logout())
+
+    expect(events).toEqual(['signOut', 'dispose'])
+    expect(localStorage.getItem('authToken')).toBeNull()
+    expect(document.body.textContent).toContain('Signed out')
+    const warning = document.querySelector('[role="status"]')
+    expect(warning?.textContent).toContain(PROVIDER)
+    expect(warning?.textContent).toContain('sign out from another InferLab app')
+
+    // Non-blocking: it can be dismissed, and a new sign-in clears it too.
+    const dismiss = [...warning!.querySelectorAll('button')].find(b => b.textContent === 'Dismiss')!
+    await act(async () => dismiss.click())
+    expect(document.body.textContent).not.toContain(PROVIDER)
+
+    await act(async () => controls.login('stored-token'))
+    await act(async () => controls.logout())
+    expect(document.body.textContent).toContain(PROVIDER)
+    await act(async () => controls.login('fresh-token'))
+    expect(document.body.textContent).not.toContain(PROVIDER)
+  })
+
+  it('does not warn about a sign-out a newer sign-in has superseded', async () => {
+    let refuse!: (error: Error) => void
+    localStorage.setItem('authToken', 'stored-token')
+    const { api } = signOutApi(() => new Promise<void>((_, reject) => { refuse = reject }))
+    const controls = await mountWith(api)
+
+    await act(async () => { void controls.logout() })
+    await act(async () => controls.login('fresh-token'))
+    await act(async () => refuse(createSignOutError(SIGN_OUT_ERROR_CODES.providerSignOutFailed)))
+
+    expect(document.body.textContent).not.toContain(PROVIDER)
   })
 })
