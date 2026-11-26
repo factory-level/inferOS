@@ -235,13 +235,15 @@ export function locationPageOf(value: unknown): { items: LocationRecord[]; nextC
   return { items: page.items.map(locationOf), ...(nextCursor ? { nextCursor: nextCursor as string } : {}) };
 }
 
-/** The person's company and their InferOps workspaces with a live grant, by slug. */
+/** The person's company and the Spaces (InferLab's scope inside a company; the API still says
+ * "workspaces") they hold a live grant in, by slug. */
 export type Company = { tenantId: string; slug: string; workspaces: { id: string; slug: string }[] };
 
 /**
  * The person's trusted company context (`GET /auth/company`, resolved by InferOps from the
- * session alone) and the slugs of the workspaces they hold a live grant in. A workspace InferOps
- * lists without a grant of theirs is left out.
+ * session alone) and the slugs of the Spaces they hold a live grant in. A Space InferOps lists
+ * without a grant of theirs is left out. A live grant decides, never the legacy `product` label:
+ * one Space serves every InferLab app (inferops ADR 0027, ADR 0028).
  */
 export async function companyOf(origin: InferLabOriginLike, accessToken: string): Promise<Company> {
   const [context, listed] = await Promise.all([
@@ -251,12 +253,12 @@ export async function companyOf(origin: InferLabOriginLike, accessToken: string)
   const c = (context ?? {}) as { tenantId?: unknown; slug?: unknown; workspaces?: unknown };
   if (typeof c.tenantId !== "string" || !UUID.test(c.tenantId) || typeof c.slug !== "string" ||
       !Array.isArray(c.workspaces)) bad("company context");
-  const granted = new Set((c.workspaces as { workspaceId?: unknown; product?: unknown }[])
-    .filter(w => w.product === "inferops" && typeof w.workspaceId === "string")
+  const granted = new Set((c.workspaces as { workspaceId?: unknown }[])
+    .filter(w => typeof w.workspaceId === "string")
     .map(w => (w.workspaceId as string).toLowerCase()));
   const rows = Array.isArray(listed) ? listed : (listed as { workspaces?: unknown[] } | null)?.workspaces ?? [];
-  const workspaces = (rows as { id?: unknown; slug?: unknown; product?: unknown }[])
-    .filter(w => w.product === "inferops" && typeof w.id === "string" && typeof w.slug === "string" &&
+  const workspaces = (rows as { id?: unknown; slug?: unknown }[])
+    .filter(w => typeof w.id === "string" && typeof w.slug === "string" &&
       granted.has((w.id as string).toLowerCase()))
     .map(w => ({ id: (w.id as string).toLowerCase(), slug: w.slug as string }));
   return { tenantId: (c.tenantId as string).toLowerCase(), slug: c.slug as string, workspaces };

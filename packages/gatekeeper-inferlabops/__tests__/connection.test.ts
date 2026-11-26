@@ -122,11 +122,13 @@ function answer(method: string, path: string, query: URLSearchParams, who: Who |
   const member = who !== "nomember";
   if (path === "/auth/company") {
     return Response.json({ tenantId: companyAnswer ?? COMPANY, slug: "acme", principalId: PRINCIPAL[who],
-      workspaces: member ? [{ workspaceId: WS, workspaceName: "Operations", product: "inferops", role: who === "owner" ? "member" : "viewer" },
+      // The Space the tests bind carries the legacy `infermind` label on purpose: a live grant
+      // decides, never the label (inferops ADR 0027, ADR 0028).
+      workspaces: member ? [{ workspaceId: WS, workspaceName: "Operations", product: "infermind", role: who === "owner" ? "member" : "viewer" },
         ...(who === "owner" ? [{ workspaceId: WS2, workspaceName: "Field", product: "inferops", role: "member" }] : [])] : [] });
   }
   if (path === "/workspaces") {
-    return Response.json([{ id: WS, tenant_id: COMPANY, product: "inferops", name: "Operations", slug: "operations" },
+    return Response.json([{ id: WS, tenant_id: COMPANY, product: "infermind", name: "Operations", slug: "operations" },
       { id: WS2, tenant_id: COMPANY, product: "inferops", name: "Field", slug: "field" }]);
   }
   const ws = headers["x-workspace-id"];
