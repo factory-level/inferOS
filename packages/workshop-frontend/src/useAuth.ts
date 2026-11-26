@@ -1,6 +1,14 @@
 import { useState, useEffect, useRef } from 'react'
 import { RpcStub } from 'capnweb'
-import { PublicApi, AuthenticatedApi, SIGN_OUT_ERROR_CODES, getSignOutErrorCode } from '@gadgets/workshop-shared/api'
+import {
+  PublicApi,
+  AuthenticatedApi,
+  AUTH_ERROR_CODES,
+  AUTH_ERROR_MESSAGES,
+  SIGN_OUT_ERROR_CODES,
+  getAuthErrorCode,
+  getSignOutErrorCode,
+} from '@gadgets/workshop-shared/api'
 import { setReportedUserId } from './errorReporting'
 import { nativeApp } from './features/native-app/nativeApp'
 import { NativeConnectSession } from './features/native-app/connectSession'
@@ -16,6 +24,17 @@ const CF_ACCESS_MODE = import.meta.env.VITE_CF_ACCESS_MODE === 'true'
 // reporting that the sign-out was not confirmed (FAC-300). Past the server's own bound on the
 // provider's sign-out, so a provider failure is reported as one.
 const SIGN_OUT_TIMEOUT_MS = 8000
+
+/**
+ * True when the server refused a token because its session has ended: signed out here or in
+ * another app (a sign-out in any InferLab app ends this one too, FAC-300), expired, or backed by a
+ * provider sign-in that has ended. Matched on the code, or on the message when native RPC dropped it.
+ */
+function isEndedSession(error: unknown): boolean {
+  if (getAuthErrorCode(error) === AUTH_ERROR_CODES.invalidSessionToken) return true
+  const message = error instanceof Error ? error.message : String(error)
+  return message.includes(AUTH_ERROR_MESSAGES[AUTH_ERROR_CODES.invalidSessionToken])
+}
 
 interface AuthState {
   token: string | null
@@ -71,9 +90,31 @@ export function useAuth(publicApi: RpcStub<PublicApi>) {
     identity.then((info) => {
       // Only a real user account names a person: for a gadget author `id` is its owner's id.
       if (!cancelled && info.type === 'user') setReportedUserId(info.id)
-    }).catch(() => {})
+    }).catch((error: unknown) => {
+      // The stored token's session has ended (FAC-300): leave the signed-in view for the sign-in
+      // page rather than a shell whose every call is refused. Only this stub's own answer counts,
+      // and a Cloudflare Access session has no token to forget.
+      if (!cancelled && !CF_ACCESS_MODE && isEndedSession(error)) forgetEndedSession(authenticatedApi)
+    })
     return () => { cancelled = true; untrack() }
   }, [authState.authenticatedApi, nativeConnectSession])
+
+  /**
+   * Forgets a session the server has already ended: no `signOut` call (there is nothing left to
+   * end), no chooser request (this browser didn't sign out; another app or an expiry did), and no
+   * warning. The next sign-in starts from the sign-in page.
+   */
+  const forgetEndedSession = (ended: RpcStub<AuthenticatedApi>) => {
+    if (authenticatedApiRef.current !== ended) return
+    authGeneration.current++
+    setReportedUserId(undefined)
+    localStorage.removeItem('authToken')
+    setAuthState(prev => {
+      if (prev.authenticatedApi !== ended) return prev
+      ended[Symbol.dispose]()
+      return { token: null, authenticatedApi: null, isLoading: false, error: null }
+    })
+  }
 
   useEffect(() => {
     if (CF_ACCESS_MODE) {

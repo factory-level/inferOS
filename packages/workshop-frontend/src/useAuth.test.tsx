@@ -5,7 +5,7 @@ import { act, useEffect } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { RpcStub } from 'capnweb'
-import { SIGN_OUT_ERROR_CODES, createSignOutError, type PublicApi, type AuthenticatedApi, type AiChatAuthorInfo } from '@gadgets/workshop-shared/api'
+import { AUTH_ERROR_CODES, AUTH_ERROR_MESSAGES, SIGN_OUT_ERROR_CODES, createAuthError, createSignOutError, type PublicApi, type AuthenticatedApi, type AiChatAuthorInfo } from '@gadgets/workshop-shared/api'
 import { setReportedUserId } from './errorReporting'
 import { useAuth } from './useAuth'
 import { nativeConnectCompletion } from './features/native-app/connectSession'
@@ -387,5 +387,89 @@ describe('useAuth sign-out', () => {
     await act(async () => refuse(createSignOutError(SIGN_OUT_ERROR_CODES.providerSignOutFailed)))
 
     expect(document.body.textContent).not.toContain(PROVIDER)
+  })
+})
+
+/** A public API whose stub answers `whoami` by throwing `error`, counting disposals and sign-outs. */
+function refusingApi(error: unknown) {
+  const events: string[] = []
+  const authenticated = {
+    onRpcBroken: () => {},
+    whoami: async () => { throw error },
+    signOut: async () => { events.push('signOut') },
+    [Symbol.dispose]: () => { events.push('dispose') },
+  }
+  const api = {
+    authenticate: () => authenticated,
+    authenticateFromCfAccess: () => authenticated,
+  } as unknown as RpcStub<PublicApi>
+  return { api, events }
+}
+
+describe('useAuth with a session ended elsewhere (FAC-300)', () => {
+  const roots: Root[] = []
+
+  afterEach(() => {
+    act(() => roots.forEach(root => root.unmount()))
+    roots.length = 0
+    document.body.replaceChildren()
+    localStorage.clear()
+    vi.unstubAllEnvs()
+    vi.clearAllMocks()
+  })
+
+  async function mountWith(api: RpcStub<PublicApi>, hook: typeof useAuth = useAuth) {
+    function Consumer() {
+      const { isAuthenticated } = hook(api)
+      return <p>{isAuthenticated ? 'Signed in' : 'Signed out'}</p>
+    }
+    const container = document.createElement('div')
+    document.body.append(container)
+    const root = createRoot(container)
+    roots.push(root)
+    await act(async () => root.render(<Consumer />))
+  }
+
+  it('shows sign-in and forgets the stored token when the server says the session has ended', async () => {
+    localStorage.setItem('authToken', 'stored-token')
+    const { api, events } = refusingApi(createAuthError(AUTH_ERROR_CODES.invalidSessionToken))
+    await mountWith(api)
+
+    expect(document.body.textContent).toBe('Signed out')
+    expect(localStorage.getItem('authToken')).toBeNull()
+    // Nothing is left to end on the server, and this browser didn't sign out: no chooser next time.
+    expect(events).toEqual(['dispose'])
+    expect(localStorage.getItem('auth.chooseAccountNext')).toBeNull()
+    expect(setReportedUserId).toHaveBeenCalledWith(undefined)
+  })
+
+  it('recognises the refusal by its message when native RPC dropped the code', async () => {
+    localStorage.setItem('authToken', 'stored-token')
+    const message = AUTH_ERROR_MESSAGES[AUTH_ERROR_CODES.invalidSessionToken]
+    const { api } = refusingApi(new Error(message))
+    await mountWith(api)
+
+    expect(document.body.textContent).toBe('Signed out')
+    expect(localStorage.getItem('authToken')).toBeNull()
+  })
+
+  it('stays signed in on any other failure (a dropped connection is retried, not a sign-out)', async () => {
+    localStorage.setItem('authToken', 'stored-token')
+    const { api, events } = refusingApi(new Error('WebSocket closed'))
+    await mountWith(api)
+
+    expect(document.body.textContent).toBe('Signed in')
+    expect(localStorage.getItem('authToken')).toBe('stored-token')
+    expect(events).toEqual([])
+  })
+
+  it('never signs a Cloudflare Access session out on this path', async () => {
+    vi.stubEnv('VITE_CF_ACCESS_MODE', 'true')
+    vi.resetModules()
+    const { useAuth: cfAccessUseAuth } = await import('./useAuth')
+    const { api } = refusingApi(createAuthError(AUTH_ERROR_CODES.invalidSessionToken))
+    await mountWith(api, cfAccessUseAuth)
+
+    expect(document.body.textContent).toBe('Signed in')
   })
 })
