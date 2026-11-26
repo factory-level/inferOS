@@ -348,7 +348,9 @@ export function stageSmokeSteps(stage: StageDefinition): string[] {
       (stage.inferops.authorizeOrigin
         ? ` (the sign-in page is served from ${new URL(stage.inferops.authorizeOrigin).hostname}).`
         : "."),
-    "Open that company's board (inferops://<tenant>.<workspace>/project/board/<KEY>): it renders.",
+    // The clean line renders no InferOps board inside InferOS; a company's Project reaches it only
+    // through the InferLab operations Gatekeeper, read with the person's own InferOps access.
+    "On Gatekeepers, connect InferLab operations, then in a chat set up the InferOps Project connection the agent asks for with the company's address (inferops://<tenant>.<workspace>/project/project/<id>): the agent names that Project.",
     "Open a chat: the model picker shows an agent, and one message gets an answer.",
   ];
 }

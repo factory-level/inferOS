@@ -62,7 +62,7 @@ KV namespaces (`inferos-<stage>-<package>-<binding>`) are created when missing. 
 3. **Run the smoke by hand.** The deploy's last lines print it:
    1. Open the stage and pass Access.
    2. Choose **Use a different Google account** (the first time, or to change seat) and sign in as a seat of the stage's company. On `dev`, the sign-in page is served from `auth.dev-os.factorylevel.dev`. **Sign in with Google** reuses a live sign-in on that host without any page, and goes straight to Google when there is none.
-   3. Open that company's board.
+   3. On **Gatekeepers**, connect **InferLab operations**. In a chat, set up the **InferOps Project** connection the agent asks for, with the company's Project address (`inferops://<tenant>.<workspace>/project/project/<id>`). The agent should name that Project. (The clean line renders no InferOps board inside InferOS: a Project reaches it only through this Gatekeeper, with the person's own InferOps access.)
    4. Open a chat. The model picker should show an agent, and a message should get an answer.
 
    A config that validates is not acceptance.
