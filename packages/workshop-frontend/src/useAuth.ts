@@ -1,6 +1,14 @@
 import { useState, useEffect, useRef } from 'react'
 import { RpcStub } from 'capnweb'
-import { PublicApi, AuthenticatedApi, SIGN_OUT_ERROR_CODES, getSignOutErrorCode } from '@gadgets/workshop-shared/api'
+import {
+  PublicApi,
+  AuthenticatedApi,
+  AUTH_ERROR_CODES,
+  AUTH_ERROR_MESSAGES,
+  SIGN_OUT_ERROR_CODES,
+  getAuthErrorCode,
+  getSignOutErrorCode,
+} from '@gadgets/workshop-shared/api'
 import { setReportedUserId } from './errorReporting'
 import { nativeApp } from './features/native-app/nativeApp'
 import { NativeConnectSession } from './features/native-app/connectSession'
@@ -17,6 +25,17 @@ const CF_ACCESS_MODE = import.meta.env.VITE_CF_ACCESS_MODE === 'true'
 // provider's sign-out, so a provider failure is reported as one.
 const SIGN_OUT_TIMEOUT_MS = 8000
 
+/**
+ * True when the server refused a token because its session has ended: signed out here or in
+ * another app (a sign-out in any InferLab app ends this one too, FAC-300), expired, or backed by a
+ * provider sign-in that has ended. Matched on the code, or on the message when native RPC dropped it.
+ */
+function isEndedSession(error: unknown): boolean {
+  if (getAuthErrorCode(error) === AUTH_ERROR_CODES.invalidSessionToken) return true
+  const message = error instanceof Error ? error.message : String(error)
+  return message.includes(AUTH_ERROR_MESSAGES[AUTH_ERROR_CODES.invalidSessionToken])
+}
+
 interface AuthState {
   token: string | null
   authenticatedApi: RpcStub<AuthenticatedApi> | null
@@ -25,6 +44,24 @@ interface AuthState {
 }
 
 export { CF_ACCESS_MODE }
+
+/**
+ * Stops this device acting for a session that is over: the native shell's notification enrollment
+ * and session, and this browser's push subscription. On a shared computer this is what stops the
+ * browser showing the person's chats once they are signed out, here or in another InferLab app.
+ * Resolves once push is released; failures are logged, never thrown.
+ */
+function releaseThisDevice(): Promise<void> {
+  try {
+    disconnectNativeNotificationEnrollment()
+    nativeApp()?.sessionEnded?.()
+  } catch (error) {
+    console.error('Failed to disconnect native notifications:', error)
+  }
+  return browserPushSupport() === 'supported'
+    ? disableBrowserPush().catch(error => console.error('Failed to stop browser notifications:', error))
+    : Promise.resolve()
+}
 
 export function useAuth(publicApi: RpcStub<PublicApi>) {
   const [nativeConnectSession] = useState(() => new NativeConnectSession())
@@ -65,15 +102,47 @@ export function useAuth(publicApi: RpcStub<PublicApi>) {
   useEffect(() => {
     const authenticatedApi = authState.authenticatedApi
     if (!authenticatedApi) return
+    const endedToken = authState.token
     let cancelled = false
     const identity = authenticatedApi.whoami()
     const untrack = nativeConnectSession.track(authenticatedApi, identity)
     identity.then((info) => {
       // Only a real user account names a person: for a gadget author `id` is its owner's id.
       if (!cancelled && info.type === 'user') setReportedUserId(info.id)
-    }).catch(() => {})
+    }).catch((error: unknown) => {
+      // The stored token's session has ended (FAC-300): leave the signed-in view for the sign-in
+      // page rather than a shell whose every call is refused. Only this stub's own answer counts,
+      // and a Cloudflare Access session has no token to forget.
+      if (!cancelled && !CF_ACCESS_MODE && isEndedSession(error)) {
+        forgetEndedSession(authenticatedApi, endedToken)
+      }
+    })
     return () => { cancelled = true; untrack() }
+    // `authState.token` is read with the stub it was authenticated with; it changes only with it.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [authState.authenticatedApi, nativeConnectSession])
+
+  /**
+   * Forgets a session the server has already ended (a sign-out in any InferLab app, an expiry, or
+   * an ended provider sign-in): no `signOut` call (there is nothing left to end) and no warning. The
+   * device is released as on a sign-out, so a shared computer stops showing the person's chats. No
+   * chooser request: central auth's Google sign-in always offers the account chooser. The stored
+   * token goes only if it is still the ended one, never a newer sign-in's from another tab.
+   */
+  const forgetEndedSession = (ended: RpcStub<AuthenticatedApi>, endedToken: string | null) => {
+    if (authenticatedApiRef.current !== ended) return
+    authGeneration.current++
+    setReportedUserId(undefined)
+    void releaseThisDevice()
+    if (endedToken !== null && localStorage.getItem('authToken') === endedToken) {
+      localStorage.removeItem('authToken')
+    }
+    setAuthState(prev => {
+      if (prev.authenticatedApi !== ended) return prev
+      ended[Symbol.dispose]()
+      return { token: null, authenticatedApi: null, isLoading: false, error: null }
+    })
+  }
 
   useEffect(() => {
     if (CF_ACCESS_MODE) {
@@ -83,7 +152,11 @@ export function useAuth(publicApi: RpcStub<PublicApi>) {
       if (storedToken) {
         authenticateWithToken(storedToken)
       } else {
-        setAuthState(prev => ({ ...prev, isLoading: false }))
+        // No token (never signed in, or another instance forgot an ended session): any stub held
+        // from before is disposed below and must not keep this instance looking signed in.
+        setAuthState(prev => prev.authenticatedApi
+          ? { token: null, authenticatedApi: null, isLoading: false, error: null }
+          : { ...prev, isLoading: false })
       }
     }
     return () => {
@@ -156,18 +229,9 @@ export function useAuth(publicApi: RpcStub<PublicApi>) {
    */
   const logout = (): Promise<void> => {
     const generation = ++authGeneration.current
-    try {
-      disconnectNativeNotificationEnrollment()
-      nativeApp()?.sessionEnded?.()
-    } catch (error) {
-      console.error('Failed to disconnect native notifications:', error)
-    }
     setReportedUserId(undefined)
     // On a shared computer, signing out is how the user stops this browser showing their chats.
-    const releasePush = browserPushSupport() === 'supported'
-      ? disableBrowserPush().catch(error =>
-          console.error('Failed to stop browser notifications:', error))
-      : Promise.resolve()
+    const releasePush = releaseThisDevice()
 
     // A Cloudflare Access session has no token to end here: Access's own logout ends it.
     const signingOut = CF_ACCESS_MODE ? null : authenticatedApiRef.current
