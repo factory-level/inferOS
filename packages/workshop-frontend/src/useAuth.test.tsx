@@ -472,4 +472,57 @@ describe('useAuth with a session ended elsewhere (FAC-300)', () => {
 
     expect(document.body.textContent).toBe('Signed in')
   })
+
+  it('releases this device as a sign-out does, so a shared computer stops showing the chats', async () => {
+    localStorage.setItem('authToken', 'stored-token')
+    const { api } = refusingApi(createAuthError(AUTH_ERROR_CODES.invalidSessionToken))
+    await mountWith(api)
+
+    expect(disconnectNativeNotificationEnrollment).toHaveBeenCalledOnce()
+  })
+
+  it('keeps a newer token another tab stored while the ended one was being refused', async () => {
+    localStorage.setItem('authToken', 'ended-token')
+    let refuse: (error: unknown) => void = () => {}
+    const refused = new Promise<never>((_, reject) => { refuse = reject })
+    const authenticated = {
+      onRpcBroken: () => {},
+      whoami: () => refused,
+      [Symbol.dispose]: () => {},
+    }
+    const api = {
+      authenticate: () => authenticated,
+      authenticateFromCfAccess: () => authenticated,
+    } as unknown as RpcStub<PublicApi>
+    await mountWith(api)
+
+    localStorage.setItem('authToken', 'newer-token')
+    await act(async () => refuse(createAuthError(AUTH_ERROR_CODES.invalidSessionToken)))
+
+    expect(document.body.textContent).toBe('Signed out')
+    expect(localStorage.getItem('authToken')).toBe('newer-token')
+  })
+
+  it('a reconnect with no stored token drops the stub it held, rather than a dead signed-in shell', async () => {
+    // Two instances share the token (the blueprint page mounts its own): when one forgets an ended
+    // session, the other's next reconnect finds no token and must not keep its disposed stub.
+    localStorage.setItem('authToken', 'stored-token')
+    const before = stubPublicApi(person)
+    const after = stubPublicApi(person)
+    function Consumer({ api }: { api: RpcStub<PublicApi> }) {
+      const { isAuthenticated } = useAuth(api)
+      return <p>{isAuthenticated ? 'Signed in' : 'Signed out'}</p>
+    }
+    const container = document.createElement('div')
+    document.body.append(container)
+    const root = createRoot(container)
+    roots.push(root)
+    await act(async () => root.render(<Consumer api={before} />))
+    expect(container.textContent).toBe('Signed in')
+
+    localStorage.removeItem('authToken')
+    await act(async () => root.render(<Consumer api={after} />))
+
+    expect(container.textContent).toBe('Signed out')
+  })
 })
