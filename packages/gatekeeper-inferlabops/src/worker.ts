@@ -271,12 +271,12 @@ export class OperationsUser extends WorkerEntrypoint<Cloudflare.Env, UserProps> 
   async getGatekeeperClassFor(url: string)
       : Promise<{ class: DurableObjectClass<Gatekeeper<ProjectSession>>; resource: SupportedResource }> {
     const address = parseProjectAddress(url);
-    if (!address) throw new Error("That isn't an InferOps Project address (inferops://<company>.<workspace>/project/project/<id>).");
+    if (!address) throw new Error("That isn't an InferOps Project address (inferops://<company>.<space>/project/project/<id>).");
     const account = accountStub(this.ctx, this.ctx.props.accountId);
     const company = await account.company();
     if (company.slug !== address.tenantSlug) throw named("NotFound", "That Project isn't in your company.");
     const workspace = company.workspaces.find(w => w.slug === address.workspaceSlug);
-    if (!workspace) throw named("NotFound", "You don't hold that InferOps workspace.");
+    if (!workspace) throw named("NotFound", "You don't hold that Space.");
     if (!await account.canRead(`/project/projects/${address.projectId}`, workspace.id)) {
       throw named("NotFound", "You can't see that Project.");
     }
@@ -441,7 +441,7 @@ export class ProjectGatekeeper extends DurableObject<Cloudflare.Env, ProjectProp
     return {
       url: `inferops://${p.tenantSlug}.${p.workspaceSlug}/project/project/${p.projectId}`,
       title: "InferOps Project",
-      snippet: `Project ${p.projectId} in ${p.workspaceSlug}`,
+      snippet: `Project ${p.projectId} in Space ${p.workspaceSlug}`,
       suggestedBindingName: "INFEROPS_PROJECT",
       tsType: "ProjectSession",
       hookTsType: "ProjectEventHook",
